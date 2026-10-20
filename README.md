@@ -18,7 +18,9 @@ GitHubリポジトリは非公開にします。GitHub PagesはサイトURLが�
 
 ## Android版
 
-Kotlin版の初期ソースも含みます。Android Studioでプロジェクトを開き、Android SDK 36を設定してPixel 10へ実行します。Android版にはカメラ撮影、複数ページPDF、日本語OCRの土台があります。
+Kotlin版の初期ソースも含みます。GitHub ActionsがAPKをビルドします。GitHubの「Actions」→「Android APK」→最新の実行→「Artifacts」から `scanlite-debug-apk` をダウンロードし、Pixel 10でAPKを開いてインストールします。Android版にはカメラ撮影、複数ページPDF、日本語OCRの土台があります。
+
+初回インストール時は、Pixelの設定画面でダウンロードに使ったアプリ（Chromeなど）に「不明なアプリのインストール」を一時的に許可してください。
 
 ## 今後の候補
 
