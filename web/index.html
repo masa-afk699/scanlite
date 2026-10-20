@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#142720">
+  <meta name="description" content="本や書類をスマートフォンで撮影してPDFにする個人用スキャナー">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <title>ScanLite — 本と書類のスキャン</title>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div><p class="eyebrow">PERSONAL SCANNER</p><h1>ScanLite</h1><p class="sub">本も書類も、Pixelでかんたんスキャン</p></div>
+      <span class="local-badge">端末内に保存</span>
+    </header>
+    <section class="controls" aria-label="スキャン設定">
+      <div class="mode-switch" role="group" aria-label="スキャンモード">
+        <button class="mode active" data-mode="book">本</button><button class="mode" data-mode="document">書類</button>
+      </div>
+      <span id="count">0 ページ</span>
+    </section>
+    <section class="capture-card">
+      <div class="camera-mark" aria-hidden="true">▧</div>
+      <h2 id="mode-title">本をスキャン</h2>
+      <p id="mode-help">見開きを撮影して、あとからPDFにまとめられます。</p>
+      <label class="primary-button" for="camera-input">カメラで撮影</label>
+      <label class="secondary-button" for="file-input">写真を選ぶ</label>
+      <input id="camera-input" type="file" accept="image/*" capture="environment" hidden>
+      <input id="file-input" type="file" accept="image/*" multiple hidden>
+    </section>
+    <section class="actions">
+      <button id="pdf-button" class="dark-button" disabled>PDFに書き出す</button>
+      <button id="clear-button" class="text-button" disabled>すべて削除</button>
+    </section>
+    <section id="pages" class="pages" aria-live="polite"></section>
+    <p class="privacy-note">写真と認識テキストはこのブラウザー内に保存します。サーバーには送信しません。</p>
+    <dialog id="text-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2>日本語OCR</h2><p id="ocr-status">文字を認識しています…</p><textarea id="ocr-result" readonly></textarea></dialog>
+  </main>
+  <script src="app.js" type="module"></script>
+</body>
+</html>
