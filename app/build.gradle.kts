@@ -8,6 +8,15 @@ android {
     namespace = "jp.masato.scanlite"
     compileSdk = 36
 
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
+    }
+
+    kotlinOptions {
+        jvmTarget = "21"
+    }
+
     defaultConfig {
         applicationId = "jp.masato.scanlite"
         minSdk = 26
