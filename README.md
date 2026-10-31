@@ -24,7 +24,17 @@
 - Service Workerがアプリ一式（OCRデータ含む約10MB）をキャッシュするため、初回以降は通信なしで使えます。
 - PDFの「他のアプリで開く」を選んだ場合だけ、選んだアプリにPDFが渡ります。
 
-配信先にはアプリのプログラムしか置かれないため、どこで配信しても撮影データは外に出ません。アプリ自体も非公開にしたい場合は、Cloudflare Pagesなどに配信し、Cloudflare Accessで自分のメールアドレスだけを許可してください。PagesはGitHubの非公開リポジトリからもデプロイできます。
+配信先にはアプリのプログラムしか置かれないため、どこで配信しても撮影データは外に出ません。
+
+### 公開（GitHub Pages）
+
+`main` に `web/` の変更が入ると、GitHub Actions（`.github/workflows/pages.yml`）が自動でGitHub Pagesに公開します。初回だけ次の設定が必要です。
+
+1. リポジトリを公開にする（無料プランで非公開リポジトリのPagesを使うにはGitHub Proが必要）
+2. Settings → Pages の Source を「GitHub Actions」にする
+3. Actions → 「Web app (GitHub Pages)」→ Run workflow（初回のみ。以降は自動）
+
+公開先: https://masa-afk699.github.io/scanlite/ 。スマホのChromeで開き、「ホーム画面に追加」します。
 
 ローカルで試すには `web/` で `python3 -m http.server` を実行し、`http://localhost:8000/` を開きます（カメラとService WorkerはHTTPSかlocalhostでのみ動作します）。
 
