@@ -1,54 +1,88 @@
 // ScanLite: すべての処理をブラウザー内で行う。撮影画像・PDF・OCR結果はネットワークに送らない。
-import { processImage, decode, drawRotated, detectPage, FULL_FRAME } from './scan.js';
+import { processImage, decode, drawRotated, detectPage, FULL_FRAME, recompress } from './scan.js';
+import * as db from './db.js';
+import { buildPdf } from './pdf.js';
+import { recognize } from './ocr.js';
+import { createCamera } from './camera.js';
 
-const DB_NAME = 'scanlite-local', STORE = 'pages';
 // 新しく取り込んだページの標準設定
-const DEFAULTS = { rotation: 0, filter: 'color', crop: 'auto', deskew: true, fingers: true, denoise: true };
+const DEFAULTS = { rotation: 0, filter: 'color', crop: 'auto', half: null, deskew: true, fingers: true, denoise: true };
 const FILTERS = { color: 'カラー補正', bw: '白黒', none: '補正なし' };
+const QUALITY = { high: { side: 2400, q: 0.86 }, normal: { side: 1600, q: 0.75 }, small: { side: 1100, q: 0.6 } };
 const MODE_TEXT = {
-  book: { title: '本をスキャン', help: '影や明るさのムラを補正して、紙を白く整えます。' },
-  document: { title: '書類をスキャン', help: '複数枚を撮影して、1つのPDFにまとめられます。' },
+  book: { title: '本をスキャン', help: 'ページをめくって手を止めると、自動で撮影します。' },
+  document: { title: '書類をスキャン', help: '紙を置き換えて手を止めると、自動で撮影します。' },
 };
 
-let mode = 'book', pages = [], thumbUrls = [];
 const $ = s => document.querySelector(s);
+let docs = [], docId = null, pages = [], thumbUrls = [];
 
-// ---------- IndexedDB ----------
-const dbPromise = new Promise((resolve, reject) => {
-  const req = indexedDB.open(DB_NAME, 1);
-  req.onupgradeneeded = () => req.result.createObjectStore(STORE, { keyPath: 'id', autoIncrement: true });
-  req.onsuccess = () => resolve(req.result);
-  req.onerror = () => reject(req.error);
-});
-async function tx(kind, fn) {
-  const db = await dbPromise;
-  return new Promise((resolve, reject) => {
-    const r = fn(db.transaction(STORE, kind).objectStore(STORE));
-    r.onsuccess = () => resolve(r.result);
-    r.onerror = () => reject(r.error);
-  });
-}
-// 並び順は created（同値ならid）で決める。旧形式（blobのみ）のデータもそのまま読める
-const allPages = async () => (await tx('readonly', s => s.getAll())).sort((a, b) => (a.created - b.created) || (a.id - b.id));
-const putPage = p => tx('readwrite', s => s.put(p));
-const addPage = p => tx('readwrite', s => s.add(p));
-const removePage = id => tx('readwrite', s => s.delete(id));
-const clearPages = () => tx('readwrite', s => s.clear());
+// ---------- ちょっとした設定の記憶（この端末のブラウザー内だけ） ----------
+const prefs = {
+  get(k, d) { try { const v = localStorage.getItem('scanlite.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('scanlite.' + k, JSON.stringify(v)); } catch {} },
+};
+let mode = prefs.get('mode', 'book');
 
-// ---------- 画面 ----------
+// ---------- 処理待ちの表示 ----------
+let pending = 0;
 function setBusy(text) {
   const el = $('#busy');
   el.hidden = !text;
   el.textContent = text || '';
 }
+const showPending = () => setBusy(pending ? `画像を補正しています…（残り ${pending} 枚）` : '');
 
+// ---------- 文書 ----------
+async function loadDocs() {
+  docs = await db.allDocs();
+  if (!docs.length) {
+    await db.addDoc({ name: defaultDocName(), created: Date.now() });
+    docs = await db.allDocs();
+  }
+  if (!docs.some(d => d.id === docId)) docId = prefs.get('doc', null);
+  if (!docs.some(d => d.id === docId)) docId = docs[docs.length - 1].id;
+  prefs.set('doc', docId);
+  const sel = $('#doc-select');
+  sel.replaceChildren(...docs.map(d => new Option(d.name, d.id, false, d.id === docId)));
+}
+const currentDoc = () => docs.find(d => d.id === docId);
+function defaultDocName() {
+  const d = new Date();
+  return `スキャン ${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+$('#doc-select').onchange = async e => { docId = Number(e.target.value); prefs.set('doc', docId); await refresh(); };
+$('#doc-new').onclick = async () => {
+  const name = prompt('新しい文書の名前', defaultDocName());
+  if (name === null) return;
+  docId = await db.addDoc({ name: name.trim() || defaultDocName(), created: Date.now() });
+  await refresh();
+};
+$('#doc-rename').onclick = async () => {
+  const doc = currentDoc();
+  const name = prompt('文書の名前', doc.name);
+  if (!name || !name.trim()) return;
+  doc.name = name.trim();
+  await db.putDoc(doc);
+  await refresh();
+};
+$('#doc-delete').onclick = async () => {
+  const doc = currentDoc();
+  if (!confirm(`「${doc.name}」とそのページ（${pages.length}枚）を削除しますか？`)) return;
+  await db.removeDoc(doc.id);
+  docId = null;
+  await refresh();
+};
+
+// ---------- ページ一覧 ----------
 async function refresh() {
-  pages = await allPages();
+  await loadDocs();
+  pages = await db.pagesOf(docId);
   thumbUrls.forEach(u => URL.revokeObjectURL(u));
   thumbUrls = [];
   $('#count').textContent = `${pages.length} ページ`;
   $('#pdf-button').disabled = !pages.length;
-  $('#clear-button').disabled = !pages.length;
   const root = $('#pages');
   root.replaceChildren();
   pages.forEach((p, index) => {
@@ -62,7 +96,7 @@ async function refresh() {
     const meta = document.createElement('div');
     meta.className = 'page-meta';
     const label = document.createElement('span');
-    label.textContent = `${index + 1}　${p.mode === 'book' ? '本' : '書類'}`;
+    label.textContent = `${index + 1}` + (p.half ? (p.half === 'right' ? '　右' : '　左') : '') + (p.ocr ? '　文字あり' : '');
     const select = document.createElement('select');
     select.setAttribute('aria-label', '補正');
     for (const [value, text] of Object.entries(FILTERS)) select.add(new Option(text, value, false, value === (p.filter || 'none')));
@@ -74,8 +108,8 @@ async function refresh() {
     tools.append(
       button('範囲・補正', () => openEditor(p)),
       button('◀ 前へ', () => move(index, -1)),
-      button('OCR', () => recognize(p)),
-      button('削除', async () => { await removePage(p.id); await refresh(); }, 'danger'),
+      button('OCR', () => showOcr(p)),
+      button('削除', async () => { await db.removePage(p.id); await refresh(); }, 'danger'),
     );
     card.append(img, meta, tools);
     root.append(card);
@@ -83,7 +117,7 @@ async function refresh() {
 }
 
 const optionsOf = p => ({
-  rotation: p.rotation || 0, filter: p.filter || 'none', crop: p.crop || 'none',
+  rotation: p.rotation || 0, filter: p.filter || 'none', crop: p.crop || 'none', half: p.half || null,
   deskew: !!p.deskew, fingers: !!p.fingers, denoise: p.denoise !== false,
 });
 
@@ -93,8 +127,9 @@ async function reprocess(page, change) {
   setBusy('画像を補正しています…');
   try {
     Object.assign(page, await processImage(page.original, optionsOf(page)));
-    await putPage(page);
-  } finally { setBusy(''); }
+    delete page.ocr; // 画像が変わったのでOCR結果は作り直す
+    await db.putPage(page);
+  } finally { showPending(); }
   await refresh();
 }
 
@@ -104,35 +139,65 @@ async function move(index, delta) {
   if (j < 0 || j >= pages.length) return;
   const a = pages[index], b = pages[j];
   [a.created, b.created] = [b.created, a.created];
-  await putPage(a); await putPage(b);
+  await db.putPage(a); await db.putPage(b);
   await refresh();
 }
 
-async function ingest(files) {
-  const list = [...files].filter(f => f.type.startsWith('image/'));
-  for (let i = 0; i < list.length; i++) {
-    setBusy(`画像を補正しています… ${i + 1}/${list.length}`);
-    try {
-      const result = await processImage(list[i], DEFAULTS);
-      await addPage({ original: list[i], ...DEFAULTS, ...result, mode, created: Date.now() + i });
-    } catch (e) {
-      alert('画像を読み込めませんでした');
-    }
+// ---------- 取り込み（撮影・写真選択） ----------
+// 撮影中も次々に追加できるよう、補正は順番待ちで1枚ずつ行う
+let queue = Promise.resolve();
+function enqueue(blobs) {
+  const target = docId, split = mode === 'book' && $('#opt-split').checked;
+  const halves = split ? ($('#opt-order').value === 'rtl' ? ['right', 'left'] : ['left', 'right']) : [null];
+  for (const blob of blobs) {
+    if (blob.type && !blob.type.startsWith('image/')) continue;
+    pending++;
+    showPending();
+    const created = Date.now();
+    queue = queue.then(async () => {
+      try {
+        for (let i = 0; i < halves.length; i++) {
+          const opts = { ...DEFAULTS, half: halves[i] };
+          const result = await processImage(blob, opts);
+          await db.addPage({ original: blob, ...opts, ...result, mode, docId: target, created: created + i / 10 });
+        }
+      } catch (e) {
+        console.error(e);
+        alert('画像を読み込めませんでした');
+      }
+      pending--;
+      showPending();
+      await refresh();
+    });
   }
-  setBusy('');
-  await refresh();
 }
 
-$('#camera-input').addEventListener('change', e => { ingest(e.target.files); e.target.value = ''; });
-$('#file-input').addEventListener('change', e => { ingest(e.target.files); e.target.value = ''; });
-document.querySelectorAll('.mode').forEach(b => b.addEventListener('click', () => {
-  mode = b.dataset.mode;
-  document.querySelectorAll('.mode').forEach(x => x.classList.toggle('active', x === b));
+$('#camera-input').addEventListener('change', e => { enqueue([...e.target.files]); e.target.value = ''; });
+$('#file-input').addEventListener('change', e => { enqueue([...e.target.files]); e.target.value = ''; });
+
+function applyMode() {
+  document.querySelectorAll('.mode').forEach(x => x.classList.toggle('active', x.dataset.mode === mode));
   $('#mode-title').textContent = MODE_TEXT[mode].title;
   $('#mode-help').textContent = MODE_TEXT[mode].help;
-}));
-$('#clear-button').onclick = async () => {
-  if (confirm('保存したページをすべて削除しますか？')) { await clearPages(); await refresh(); }
+  $('#spread-options').hidden = mode !== 'book';
+}
+document.querySelectorAll('.mode').forEach(b => b.addEventListener('click', () => { mode = b.dataset.mode; prefs.set('mode', mode); applyMode(); }));
+$('#opt-split').checked = prefs.get('split', false);
+$('#opt-order').value = prefs.get('order', 'rtl');
+$('#opt-split').onchange = e => prefs.set('split', e.target.checked);
+$('#opt-order').onchange = e => prefs.set('order', e.target.value);
+
+// ---------- 連続撮影 ----------
+const camera = createCamera({
+  dialog: $('#camera-dialog'), video: $('#camera-video'), status: $('#camera-status'),
+  shutter: $('#camera-shutter'), autoToggle: $('#camera-auto'), counter: $('#camera-count'),
+  onCapture: blob => enqueue([blob]),
+});
+$('#camera-auto').checked = prefs.get('autoShutter', true);
+$('#camera-auto').addEventListener('change', e => prefs.set('autoShutter', e.target.checked));
+$('#camera-button').onclick = () => {
+  if (!navigator.mediaDevices?.getUserMedia) { $('#camera-input').click(); return; }
+  camera.open();
 };
 
 // ---------- 範囲・補正の調整画面 ----------
@@ -146,6 +211,7 @@ async function openEditor(page) {
   $('#opt-deskew').checked = !!page.deskew;
   $('#opt-fingers').checked = !!page.fingers;
   $('#opt-denoise').checked = page.denoise !== false;
+  $('#opt-half').value = page.half || '';
   const sel = $('#opt-filter');
   sel.replaceChildren(...Object.entries(FILTERS).map(([v, t]) => new Option(t, v, false, v === (page.filter || 'none'))));
   renderEditBase();
@@ -219,120 +285,112 @@ $('#edit-apply').onclick = async () => {
   edit = null;
   const full = corners.every((c, i) => Math.abs(c[0] - FULL_FRAME[i][0]) < 0.002 && Math.abs(c[1] - FULL_FRAME[i][1]) < 0.002);
   await reprocess(page, {
-    rotation, crop: full ? 'none' : corners,
+    rotation, crop: full ? 'none' : corners, half: $('#opt-half').value || null,
     deskew: $('#opt-deskew').checked, fingers: $('#opt-fingers').checked, denoise: $('#opt-denoise').checked,
     filter: $('#opt-filter').value,
   });
 };
 $('#edit-dialog').addEventListener('close', () => { if (edit) { edit.bitmap.close?.(); edit = null; } });
 
-// ---------- PDF生成（ライブラリなし・端末内） ----------
-async function buildPdf(list) {
-  const enc = new TextEncoder();
-  const parts = [], offsets = [];
-  let offset = 0;
-  const push = d => { const b = typeof d === 'string' ? enc.encode(d) : d; parts.push(b); offset += b.length; };
-  const obj = (id, write) => { offsets[id] = offset; push(`${id} 0 obj\n`); write(); push('\nendobj\n'); };
-  push('%PDF-1.4\n%âãÏÓ\n');
-  const pageIds = list.map((_, i) => 3 + i * 3);
-  obj(1, () => push('<< /Type /Catalog /Pages 2 0 R >>'));
-  obj(2, () => push(`<< /Type /Pages /Count ${list.length} /Kids [${pageIds.map(id => `${id} 0 R`).join(' ')}] >>`));
-  for (let i = 0; i < list.length; i++) {
-    const p = list[i], id = pageIds[i];
-    const bytes = new Uint8Array(await p.blob.arrayBuffer());
-    const k = 842 / Math.max(p.width, p.height); // 長辺をA4長辺（842pt）に合わせる
-    const W = (p.width * k).toFixed(2), H = (p.height * k).toFixed(2);
-    const content = `q ${W} 0 0 ${H} 0 0 cm /Im0 Do Q`;
-    obj(id, () => push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${W} ${H}] /Resources << /XObject << /Im0 ${id + 2} 0 R >> >> /Contents ${id + 1} 0 R >>`));
-    obj(id + 1, () => push(`<< /Length ${content.length} >>\nstream\n${content}\nendstream`));
-    obj(id + 2, () => {
-      push(`<< /Type /XObject /Subtype /Image /Width ${p.width} /Height ${p.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${bytes.length} >>\nstream\n`);
-      push(bytes);
-      push('\nendstream');
-    });
-  }
-  const size = 3 + list.length * 3;
-  const xref = offset;
-  let table = `xref\n0 ${size}\n0000000000 65535 f \n`;
-  for (let id = 1; id < size; id++) table += `${String(offsets[id]).padStart(10, '0')} 00000 n \n`;
-  push(table);
-  push(`trailer\n<< /Size ${size} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
-  return new Blob(parts, { type: 'application/pdf' });
+// ---------- OCR ----------
+// 結果はページに保存して、PDFの文字検索にも使い回す
+async function ocrPage(page, onProgress) {
+  if (page.ocr && page.ocr.width === page.width) return page.ocr;
+  const r = await recognize(page.blob, onProgress);
+  page.ocr = { text: r.text, lines: r.lines, width: page.width, height: page.height };
+  await db.putPage(page);
+  return page.ocr;
 }
 
-let pdfUrl = null;
-$('#pdf-button').onclick = async () => {
-  if (!pages.length) return;
-  setBusy('PDFを作成しています…');
-  try {
-    const blob = await buildPdf(pages);
-    const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '');
-    const name = `ScanLite_${stamp}.pdf`;
-    if (pdfUrl) URL.revokeObjectURL(pdfUrl);
-    pdfUrl = URL.createObjectURL(blob);
-    const link = $('#pdf-download');
-    link.href = pdfUrl;
-    link.download = name;
-    $('#pdf-info').textContent = `${pages.length}ページ・${(blob.size / 1024 / 1024).toFixed(1)}MB`;
-    const file = new File([blob], name, { type: 'application/pdf' });
-    const share = $('#pdf-share');
-    share.hidden = !(navigator.canShare && navigator.canShare({ files: [file] }));
-    share.onclick = () => navigator.share({ files: [file], title: name }).catch(() => {});
-    $('#pdf-dialog').showModal();
-  } catch (e) {
-    alert('PDFを作成できませんでした');
-  } finally { setBusy(''); }
-};
-
-// ---------- 日本語OCR（tesseract.jsを同梱し、端末内で実行） ----------
-let ocrWorker = null;
-async function getOcrWorker(onProgress) {
-  if (ocrWorker) return ocrWorker;
-  const base = new URL('vendor/tesseract/', location.href).href;
-  const { createWorker } = (await import('./vendor/tesseract/tesseract.esm.min.js')).default;
-  ocrWorker = await createWorker('jpn', 1, {
-    workerPath: base + 'worker.min.js',
-    corePath: base + 'core/',
-    langPath: base + 'lang',
-    workerBlobURL: false,
-    gzip: true,
-    logger: m => onProgress(m),
-  });
-  return ocrWorker;
-}
-
-let ocrProgress = () => {};
-async function recognize(page) {
+async function showOcr(page) {
   $('#text-dialog').showModal();
   $('#ocr-status').textContent = '日本語OCRを準備しています（端末内で処理します）';
   $('#ocr-result').value = '';
-  ocrProgress = m => {
-    if (m.status === 'recognizing text') $('#ocr-status').textContent = `文字を認識しています… ${Math.round((m.progress || 0) * 100)}%`;
-  };
   try {
-    const worker = await getOcrWorker(m => ocrProgress(m));
-    const result = await worker.recognize(page.blob);
-    // 日本語の文字間に入る余分な空白を取り除く
-    $('#ocr-result').value = result.data.text.replace(/(?<=[\u3000-\u9fff\uff00-\uffef]) +(?=[\u3000-\u9fff\uff00-\uffef])/g, '');
+    const r = await ocrPage(page, p => { $('#ocr-status').textContent = `文字を認識しています… ${Math.round(p * 100)}%`; });
+    $('#ocr-result').value = r.text;
     $('#ocr-status').textContent = '認識しました';
+    await refresh();
   } catch (e) {
     console.error(e);
-    ocrWorker = null;
     $('#ocr-status').textContent = 'OCRを開始できませんでした。';
   }
 }
 $('#ocr-copy').onclick = () => navigator.clipboard?.writeText($('#ocr-result').value).catch(() => {});
 
+// ---------- PDF ----------
+let pdfUrl = null;
+$('#pdf-button').onclick = () => {
+  if (!pages.length) return;
+  const q = prefs.get('quality', 'high');
+  document.querySelectorAll('input[name=quality]').forEach(r => { r.checked = r.value === q; });
+  $('#pdf-ocr').checked = prefs.get('searchable', false);
+  $('#pdf-setup').hidden = false;
+  $('#pdf-result').hidden = true;
+  $('#pdf-make').disabled = false;
+  $('#pdf-make').textContent = '作成する';
+  $('#pdf-dialog').showModal();
+};
+
+$('#pdf-make').onclick = async () => {
+  const quality = document.querySelector('input[name=quality]:checked').value;
+  const searchable = $('#pdf-ocr').checked;
+  prefs.set('quality', quality); prefs.set('searchable', searchable);
+  const btn = $('#pdf-make');
+  btn.disabled = true;
+  try {
+    const list = [];
+    for (let i = 0; i < pages.length; i++) {
+      const p = pages[i];
+      let ocr = null;
+      if (searchable) {
+        btn.textContent = `文字を認識しています… ${i + 1}/${pages.length}`;
+        try { ocr = await ocrPage(p, () => {}); } catch (e) { console.error(e); }
+      }
+      btn.textContent = `PDFを作成しています… ${i + 1}/${pages.length}`;
+      const { side, q } = QUALITY[quality];
+      const img = quality === 'high' ? { blob: p.blob, width: p.width, height: p.height } : await recompress(p.blob, side, q);
+      list.push({ ...img, ocr });
+    }
+    const doc = currentDoc();
+    const blob = await buildPdf(list, doc.name);
+    const name = `${doc.name.replace(/[\\/:*?"<>|]/g, '_')}.pdf`;
+    if (pdfUrl) URL.revokeObjectURL(pdfUrl);
+    pdfUrl = URL.createObjectURL(blob);
+    const link = $('#pdf-download');
+    link.href = pdfUrl;
+    link.download = name;
+    $('#pdf-info').textContent = `${name}　${pages.length}ページ・${(blob.size / 1024 / 1024).toFixed(1)}MB` + (searchable ? '・文字検索できます' : '');
+    const file = new File([blob], name, { type: 'application/pdf' });
+    const share = $('#pdf-share');
+    share.hidden = !(navigator.canShare && navigator.canShare({ files: [file] }));
+    share.onclick = () => navigator.share({ files: [file], title: name }).catch(() => {});
+    $('#pdf-setup').hidden = true;
+    $('#pdf-result').hidden = false;
+    await refresh();
+  } catch (e) {
+    console.error(e);
+    alert('PDFを作成できませんでした');
+    btn.disabled = false;
+    btn.textContent = '作成する';
+  }
+};
+
 // ---------- 起動 ----------
 async function start() {
-  // 旧バージョンで保存したページ（サイズ情報なし）を補正なしで変換しておく
-  for (const p of await allPages()) {
-    if (p.width) continue;
+  applyMode();
+  await loadDocs();
+  // 以前のバージョンのページ: 文書に入れ、サイズ情報がなければ補正なしで変換する
+  for (const p of await db.allPages()) {
+    if (p.docId && p.width) continue;
     try {
-      p.original = p.blob;
-      Object.assign(p, { rotation: 0, filter: 'none', crop: 'none', deskew: false, fingers: false, denoise: false });
-      Object.assign(p, await processImage(p.original, optionsOf(p)));
-      await putPage(p);
+      if (!p.docId) p.docId = docId;
+      if (!p.width) {
+        p.original = p.blob;
+        Object.assign(p, { rotation: 0, filter: 'none', crop: 'none', deskew: false, fingers: false, denoise: false });
+        Object.assign(p, await processImage(p.original, optionsOf(p)));
+      }
+      await db.putPage(p);
     } catch {}
   }
   await refresh();

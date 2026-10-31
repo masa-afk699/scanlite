@@ -386,8 +386,50 @@ export function rotateBy(canvas, deg, fill = '#fff') {
   return out;
 }
 
+// ---------- 見開き分割 ----------
+// 中央付近で最も暗い縦の帯（のど）を探し、そのx座標を返す
+export function findGutter(canvas) {
+  const img = shrink(canvas, 600), { width: w, height: h, data: d } = img;
+  const col = new Float64Array(w);
+  for (let y = Math.floor(h * 0.1); y < h * 0.9; y++) for (let x = 0; x < w; x++) {
+    const i = (y * w + x) * 4;
+    col[x] += d[i] + d[i + 1] + d[i + 2];
+  }
+  let best = Math.round(w / 2), bestV = Infinity;
+  for (let x = Math.floor(w * 0.35); x < w * 0.65; x++) {
+    let v = 0;
+    for (let k = -3; k <= 3; k++) v += col[Math.min(w - 1, Math.max(0, x + k))];
+    // 中央から離れるほど少し不利にする
+    v *= 1 + Math.abs(x - w / 2) / w;
+    if (v < bestV) { bestV = v; best = x; }
+  }
+  return Math.round(best * canvas.width / w);
+}
+
+export function cropHalf(canvas, half) {
+  const gx = findGutter(canvas), W = canvas.width, H = canvas.height;
+  // のどの影を少し切り落とす
+  const trim = Math.round(W * 0.02);
+  const x0 = half === 'left' ? 0 : Math.min(W - 8, gx + trim), x1 = half === 'left' ? Math.max(8, gx - trim) : W;
+  const out = makeCanvas(Math.max(8, x1 - x0), H);
+  ctx2d(out).drawImage(canvas, x0, 0, x1 - x0, H, 0, 0, x1 - x0, H);
+  return out;
+}
+
+// PDF用に画質と大きさを変える
+export async function recompress(blob, maxSide, quality) {
+  const bitmap = await decode(blob);
+  const k = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
+  const c = makeCanvas(Math.round(bitmap.width * k), Math.round(bitmap.height * k)), x = ctx2d(c);
+  x.imageSmoothingQuality = 'high';
+  x.drawImage(bitmap, 0, 0, c.width, c.height);
+  bitmap.close?.();
+  const out = await new Promise(r => c.toBlob(r, 'image/jpeg', quality));
+  return { blob: out, width: c.width, height: c.height };
+}
+
 // ---------- まとめ ----------
-// opts: { rotation, filter, crop: 'auto' | 'none' | corners, deskew, fingers, denoise }
+// opts: { rotation, filter, crop: 'auto' | 'none' | corners, half: 'left' | 'right' | null, deskew, fingers, denoise }
 export async function processImage(original, opts) {
   const bitmap = await decode(original);
   let canvas = drawRotated(bitmap, opts.rotation || 0);
@@ -397,6 +439,7 @@ export async function processImage(original, opts) {
   if (opts.crop === 'auto') corners = detectPage(canvas);
   else if (Array.isArray(opts.crop)) corners = opts.crop;
   if (corners) { canvas = warp(canvas, corners); await tick(); }
+  if (opts.half === 'left' || opts.half === 'right') canvas = cropHalf(canvas, opts.half);
   enhance(canvas, { filter: opts.filter || 'none', fingers: !!opts.fingers, denoise: opts.denoise !== false });
   await tick();
   let skew = 0;
