@@ -3,6 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <!-- 撮影データを端末外へ出さないため、通信先を自サイトのみに制限する -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; worker-src 'self'; font-src 'self'; manifest-src 'self'; media-src 'self' blob:; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
   <meta name="theme-color" content="#142720">
   <meta name="description" content="本や書類をスマートフォンで撮影してPDFにする個人用スキャナー">
   <link rel="manifest" href="manifest.webmanifest">
@@ -13,31 +16,86 @@
 <body>
   <main class="shell">
     <header>
-      <div><p class="eyebrow">PERSONAL SCANNER</p><h1>ScanLite</h1><p class="sub">本も書類も、Pixelでかんたんスキャン</p></div>
-      <span class="local-badge">端末内に保存</span>
+      <div><p class="eyebrow">PERSONAL SCANNER</p><h1>ScanLite</h1><p class="sub">本も書類も、スマホの中だけでスキャン</p></div>
+      <span class="local-badge">端末内で処理</span>
     </header>
+
+    <section class="docbar" aria-label="文書">
+      <select id="doc-select" aria-label="文書を選ぶ"></select>
+      <button id="doc-new" type="button">＋ 新規</button>
+      <button id="doc-rename" type="button">名前</button>
+      <button id="doc-delete" type="button" class="danger">削除</button>
+    </section>
+
     <section class="controls" aria-label="スキャン設定">
       <div class="mode-switch" role="group" aria-label="スキャンモード">
         <button class="mode active" data-mode="book">本</button><button class="mode" data-mode="document">書類</button>
       </div>
       <span id="count">0 ページ</span>
     </section>
+
     <section class="capture-card">
       <div class="camera-mark" aria-hidden="true">▧</div>
       <h2 id="mode-title">本をスキャン</h2>
-      <p id="mode-help">見開きを撮影して、あとからPDFにまとめられます。</p>
-      <label class="primary-button" for="camera-input">カメラで撮影</label>
-      <label class="secondary-button" for="file-input">写真を選ぶ</label>
+      <p id="mode-help">ページをめくって手を止めると、自動で撮影します。</p>
+      <div id="spread-options" class="spread-options">
+        <label><input type="checkbox" id="opt-split"> 見開きを2ページに分ける</label>
+        <select id="opt-order" aria-label="ページの順番">
+          <option value="rtl">右ページから（縦書きの本）</option>
+          <option value="ltr">左ページから（横書きの本）</option>
+        </select>
+      </div>
+      <button id="camera-button" class="primary-button" type="button">連続撮影をはじめる</button>
+      <div class="secondary-row">
+        <label class="secondary-button" for="camera-input">カメラアプリで撮影</label>
+        <label class="secondary-button" for="file-input">写真を選ぶ</label>
+      </div>
       <input id="camera-input" type="file" accept="image/*" capture="environment" hidden>
       <input id="file-input" type="file" accept="image/*" multiple hidden>
+      <p id="busy" class="busy" hidden></p>
     </section>
+
     <section class="actions">
-      <button id="pdf-button" class="dark-button" disabled>PDFに書き出す</button>
-      <button id="clear-button" class="text-button" disabled>すべて削除</button>
+      <button id="pdf-button" class="dark-button" disabled>PDFを作成</button>
     </section>
     <section id="pages" class="pages" aria-live="polite"></section>
-    <p class="privacy-note">写真と認識テキストはこのブラウザー内に保存します。サーバーには送信しません。</p>
-    <dialog id="text-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2>日本語OCR</h2><p id="ocr-status">文字を認識しています…</p><textarea id="ocr-result" readonly></textarea></dialog>
+    <p class="privacy-note">写真・PDF・認識テキストはすべてこのスマホの中で処理・保存します。<br>サーバーや外部サービスには送信しません（文字認識も端末内で動作）。</p>
+
+    <dialog id="camera-dialog" class="camera-dialog">
+      <video id="camera-video" playsinline muted></video>
+      <div class="camera-top"><span id="camera-count">0枚</span><label class="auto-toggle"><input type="checkbox" id="camera-auto" checked> 自動撮影</label></div>
+      <p id="camera-status" class="camera-status"></p>
+      <div class="camera-bottom">
+        <span></span>
+        <button id="camera-shutter" class="shutter" type="button" aria-label="撮影"></button>
+        <form method="dialog"><button class="camera-done">完了</button></form>
+      </div>
+    </dialog>
+
+    <dialog id="text-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2>日本語OCR</h2><p id="ocr-status">文字を認識しています…</p><textarea id="ocr-result" readonly></textarea><button id="ocr-copy" class="dark-button" type="button">テキストをコピー</button></dialog>
+
+    <dialog id="pdf-dialog">
+      <form method="dialog"><button class="close" aria-label="閉じる">×</button></form>
+      <h2>PDFを作成</h2>
+      <div id="pdf-setup">
+        <fieldset class="quality">
+          <legend>画質とサイズ</legend>
+          <label><input type="radio" name="quality" value="high" checked> 高画質<small>印刷・保存向け</small></label>
+          <label><input type="radio" name="quality" value="normal"> 標準<small>画面で読む向け</small></label>
+          <label><input type="radio" name="quality" value="small"> 軽量<small>メール添付向け</small></label>
+        </fieldset>
+        <label class="check"><input type="checkbox" id="pdf-ocr"> 文字で検索できるPDFにする<small>各ページを端末内でOCRします（1ページ数秒）</small></label>
+        <button id="pdf-make" class="dark-button" type="button">作成する</button>
+      </div>
+      <div id="pdf-result" hidden>
+        <p id="pdf-info"></p>
+        <a id="pdf-download" class="dark-button link-button" download>スマホに保存</a>
+        <button id="pdf-share" class="text-button" type="button" hidden>他のアプリで開く…</button>
+        <p class="dialog-note">「スマホに保存」はダウンロードフォルダに保存します。共有を選んだ場合だけ、選んだアプリにPDFが渡ります。</p>
+      </div>
+    </dialog>
+
+    <dialog id="edit-dialog" class="edit-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2>範囲と補正</h2><p class="dialog-note">四隅の丸をドラッグして、ページの範囲に合わせます。</p><div class="edit-stage"><canvas id="edit-canvas"></canvas></div><div class="edit-row"><button id="edit-rotate" type="button">↺ 回転</button><button id="edit-auto" type="button">自動検出</button><button id="edit-full" type="button">切り抜かない</button></div><div class="edit-options"><label><input type="checkbox" id="opt-deskew"> 傾きを補正</label><label><input type="checkbox" id="opt-fingers"> 指を消す</label><label><input type="checkbox" id="opt-denoise"> ノイズを除去</label><label>色 <select id="opt-filter"></select></label><label class="wide">見開き <select id="opt-half"><option value="">分けない</option><option value="right">右ページだけ</option><option value="left">左ページだけ</option></select></label></div><button id="edit-apply" class="dark-button" type="button">この設定で補正</button></dialog>
   </main>
   <script src="app.js" type="module"></script>
 </body>
