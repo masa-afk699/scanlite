@@ -1,7 +1,9 @@
 // ScanLite: すべての処理をブラウザー内で行う。撮影画像・PDF・OCR結果はネットワークに送らない。
+import { processImage, decode, drawRotated, detectPage, FULL_FRAME } from './scan.js';
+
 const DB_NAME = 'scanlite-local', STORE = 'pages';
-const MAX_SIDE = 2400;          // 保存・PDF用の最大辺（px）
-const JPEG_QUALITY = 0.86;
+// 新しく取り込んだページの標準設定
+const DEFAULTS = { rotation: 0, filter: 'color', crop: 'auto', deskew: true, fingers: true, denoise: true };
 const FILTERS = { color: 'カラー補正', bw: '白黒', none: '補正なし' };
 const MODE_TEXT = {
   book: { title: '本をスキャン', help: '影や明るさのムラを補正して、紙を白く整えます。' },
@@ -32,95 +34,6 @@ const putPage = p => tx('readwrite', s => s.put(p));
 const addPage = p => tx('readwrite', s => s.add(p));
 const removePage = id => tx('readwrite', s => s.delete(id));
 const clearPages = () => tx('readwrite', s => s.clear());
-
-// ---------- 画像補正（vFlat風の照明ムラ補正） ----------
-async function decode(blob) {
-  try { return await createImageBitmap(blob, { imageOrientation: 'from-image' }); }
-  catch { return await createImageBitmap(blob); }
-}
-
-function drawRotated(bitmap, rotation) {
-  const scale = Math.min(1, MAX_SIDE / Math.max(bitmap.width, bitmap.height));
-  const w = Math.round(bitmap.width * scale), h = Math.round(bitmap.height * scale);
-  const swap = rotation % 180 !== 0;
-  const canvas = document.createElement('canvas');
-  canvas.width = swap ? h : w; canvas.height = swap ? w : h;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  ctx.translate(canvas.width / 2, canvas.height / 2);
-  ctx.rotate(rotation * Math.PI / 180);
-  ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(bitmap, -w / 2, -h / 2, w, h);
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  return { canvas, ctx };
-}
-
-// 紙の明るさ（背景）を推定する。縮小→最大値フィルターで文字を消す→ぼかし→拡大。
-function estimateBackground(canvas) {
-  const W = canvas.width, H = canvas.height;
-  const k = 64 / Math.max(W, H);
-  const sw = Math.max(4, Math.round(W * k)), sh = Math.max(4, Math.round(H * k));
-  const small = document.createElement('canvas');
-  small.width = sw; small.height = sh;
-  const sctx = small.getContext('2d', { willReadFrequently: true });
-  sctx.imageSmoothingQuality = 'high';
-  sctx.drawImage(canvas, 0, 0, sw, sh);
-  let img = sctx.getImageData(0, 0, sw, sh);
-  const filter = (src, radius, op) => {
-    const out = new Uint8ClampedArray(src.length);
-    for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) for (let c = 0; c < 3; c++) {
-      let acc = 0, n = 0;
-      for (let dy = -radius; dy <= radius; dy++) for (let dx = -radius; dx <= radius; dx++) {
-        const yy = Math.min(sh - 1, Math.max(0, y + dy)), xx = Math.min(sw - 1, Math.max(0, x + dx));
-        const v = src[(yy * sw + xx) * 4 + c];
-        if (op === 'max') { if (v > acc) acc = v; } else { acc += v; n++; }
-      }
-      out[(y * sw + x) * 4 + c] = op === 'max' ? acc : acc / n;
-      out[(y * sw + x) * 4 + 3] = 255;
-    }
-    return out;
-  };
-  let data = filter(img.data, 2, 'max');
-  data = filter(data, 2, 'mean');
-  img = new ImageData(data, sw, sh);
-  sctx.putImageData(img, 0, 0);
-  const big = document.createElement('canvas');
-  big.width = W; big.height = H;
-  const bctx = big.getContext('2d', { willReadFrequently: true });
-  bctx.imageSmoothingQuality = 'high';
-  bctx.drawImage(small, 0, 0, W, H);
-  return bctx.getImageData(0, 0, W, H).data;
-}
-
-function enhance(canvas, ctx, filter) {
-  if (filter === 'none') return;
-  const W = canvas.width, H = canvas.height;
-  const bg = estimateBackground(canvas);
-  const img = ctx.getImageData(0, 0, W, H), d = img.data;
-  const lut = new Uint8ClampedArray(256);
-  const gamma = filter === 'bw' ? 1.8 : 1.35;
-  for (let i = 0; i < 256; i++) lut[i] = 255 * Math.pow(i / 255, gamma);
-  for (let i = 0; i < d.length; i += 4) {
-    let r = Math.min(255, d[i] * 250 / Math.max(bg[i], 1));
-    let g = Math.min(255, d[i + 1] * 250 / Math.max(bg[i + 1], 1));
-    let b = Math.min(255, d[i + 2] * 250 / Math.max(bg[i + 2], 1));
-    if (filter === 'bw') {
-      const y = lut[Math.round(0.299 * r + 0.587 * g + 0.114 * b)];
-      d[i] = d[i + 1] = d[i + 2] = y;
-    } else {
-      d[i] = lut[r | 0]; d[i + 1] = lut[g | 0]; d[i + 2] = lut[b | 0];
-    }
-  }
-  ctx.putImageData(img, 0, 0);
-}
-
-async function processImage(original, rotation, filter) {
-  const bitmap = await decode(original);
-  const { canvas, ctx } = drawRotated(bitmap, rotation);
-  bitmap.close?.();
-  enhance(canvas, ctx, filter);
-  const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', JPEG_QUALITY));
-  return { blob, width: canvas.width, height: canvas.height };
-}
 
 // ---------- 画面 ----------
 function setBusy(text) {
@@ -159,7 +72,7 @@ async function refresh() {
     tools.className = 'page-tools';
     const button = (text, fn, cls) => { const b = document.createElement('button'); b.textContent = text; b.onclick = fn; if (cls) b.className = cls; return b; };
     tools.append(
-      button('↺ 回転', () => reprocess(p, { rotation: ((p.rotation || 0) + 270) % 360 })),
+      button('範囲・補正', () => openEditor(p)),
       button('◀ 前へ', () => move(index, -1)),
       button('OCR', () => recognize(p)),
       button('削除', async () => { await removePage(p.id); await refresh(); }, 'danger'),
@@ -169,12 +82,17 @@ async function refresh() {
   });
 }
 
+const optionsOf = p => ({
+  rotation: p.rotation || 0, filter: p.filter || 'none', crop: p.crop || 'none',
+  deskew: !!p.deskew, fingers: !!p.fingers, denoise: p.denoise !== false,
+});
+
 async function reprocess(page, change) {
+  if (!page.original) page.original = page.blob;
   Object.assign(page, change);
   setBusy('画像を補正しています…');
   try {
-    Object.assign(page, await processImage(page.original || page.blob, page.rotation || 0, page.filter || 'none'));
-    if (!page.original) page.original = page.blob;
+    Object.assign(page, await processImage(page.original, optionsOf(page)));
     await putPage(page);
   } finally { setBusy(''); }
   await refresh();
@@ -194,10 +112,9 @@ async function ingest(files) {
   const list = [...files].filter(f => f.type.startsWith('image/'));
   for (let i = 0; i < list.length; i++) {
     setBusy(`画像を補正しています… ${i + 1}/${list.length}`);
-    const filter = 'color';
     try {
-      const result = await processImage(list[i], 0, filter);
-      await addPage({ original: list[i], ...result, rotation: 0, filter, mode, created: Date.now() + i });
+      const result = await processImage(list[i], DEFAULTS);
+      await addPage({ original: list[i], ...DEFAULTS, ...result, mode, created: Date.now() + i });
     } catch (e) {
       alert('画像を読み込めませんでした');
     }
@@ -217,6 +134,97 @@ document.querySelectorAll('.mode').forEach(b => b.addEventListener('click', () =
 $('#clear-button').onclick = async () => {
   if (confirm('保存したページをすべて削除しますか？')) { await clearPages(); await refresh(); }
 };
+
+// ---------- 範囲・補正の調整画面 ----------
+let edit = null;
+const editCanvas = $('#edit-canvas');
+
+async function openEditor(page) {
+  const bitmap = await decode(page.original || page.blob);
+  const corners = Array.isArray(page.crop) ? page.crop : page.crop === 'auto' ? (page.corners || FULL_FRAME) : FULL_FRAME;
+  edit = { page, bitmap, rotation: page.rotation || 0, corners: corners.map(c => [...c]), drag: -1 };
+  $('#opt-deskew').checked = !!page.deskew;
+  $('#opt-fingers').checked = !!page.fingers;
+  $('#opt-denoise').checked = page.denoise !== false;
+  const sel = $('#opt-filter');
+  sel.replaceChildren(...Object.entries(FILTERS).map(([v, t]) => new Option(t, v, false, v === (page.filter || 'none'))));
+  renderEditBase();
+  $('#edit-dialog').showModal();
+}
+
+function renderEditBase() {
+  edit.base = drawRotated(edit.bitmap, edit.rotation, 1200);
+  editCanvas.width = edit.base.width;
+  editCanvas.height = edit.base.height;
+  drawEditor();
+}
+
+function drawEditor() {
+  const c = editCanvas.getContext('2d'), W = editCanvas.width, H = editCanvas.height;
+  const q = edit.corners.map(([x, y]) => [x * W, y * H]);
+  c.drawImage(edit.base, 0, 0);
+  c.save();
+  c.beginPath(); c.rect(0, 0, W, H);
+  c.moveTo(...q[0]); q.slice(1).forEach(p => c.lineTo(...p)); c.closePath();
+  c.fillStyle = 'rgba(10,20,16,.55)'; c.fill('evenodd');
+  c.beginPath(); c.moveTo(...q[0]); q.slice(1).forEach(p => c.lineTo(...p)); c.closePath();
+  c.lineWidth = Math.max(2, W / 250); c.strokeStyle = '#b8ed71'; c.stroke();
+  const r = Math.max(10, Math.min(W, H) / 28);
+  q.forEach(([x, y], i) => {
+    c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2);
+    c.fillStyle = i === edit.drag ? '#b8ed71' : 'rgba(184,237,113,.35)'; c.fill();
+    c.lineWidth = Math.max(2, W / 300); c.strokeStyle = '#fff'; c.stroke();
+  });
+  c.restore();
+}
+
+function canvasPoint(e) {
+  const rect = editCanvas.getBoundingClientRect();
+  return [Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)), Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height))];
+}
+editCanvas.addEventListener('pointerdown', e => {
+  if (!edit) return;
+  const [x, y] = canvasPoint(e), rect = editCanvas.getBoundingClientRect();
+  let best = -1, bestD = Infinity;
+  edit.corners.forEach(([cx, cy], i) => {
+    const d = Math.hypot((cx - x) * rect.width, (cy - y) * rect.height);
+    if (d < bestD) { bestD = d; best = i; }
+  });
+  if (bestD > 60) return;
+  edit.drag = best;
+  editCanvas.setPointerCapture(e.pointerId);
+  drawEditor();
+});
+editCanvas.addEventListener('pointermove', e => {
+  if (!edit || edit.drag < 0) return;
+  edit.corners[edit.drag] = canvasPoint(e);
+  drawEditor();
+});
+const endDrag = () => { if (edit && edit.drag >= 0) { edit.drag = -1; drawEditor(); } };
+editCanvas.addEventListener('pointerup', endDrag);
+editCanvas.addEventListener('pointercancel', endDrag);
+
+$('#edit-rotate').onclick = () => {
+  edit.rotation = (edit.rotation + 270) % 360;
+  edit.base = drawRotated(edit.bitmap, edit.rotation, 1200);
+  edit.corners = detectPage(edit.base) || FULL_FRAME;
+  renderEditBase();
+};
+$('#edit-auto').onclick = () => { edit.corners = detectPage(edit.base) || FULL_FRAME; drawEditor(); };
+$('#edit-full').onclick = () => { edit.corners = FULL_FRAME.map(c => [...c]); drawEditor(); };
+$('#edit-apply').onclick = async () => {
+  const { page, rotation, corners, bitmap } = edit;
+  $('#edit-dialog').close();
+  bitmap.close?.();
+  edit = null;
+  const full = corners.every((c, i) => Math.abs(c[0] - FULL_FRAME[i][0]) < 0.002 && Math.abs(c[1] - FULL_FRAME[i][1]) < 0.002);
+  await reprocess(page, {
+    rotation, crop: full ? 'none' : corners,
+    deskew: $('#opt-deskew').checked, fingers: $('#opt-fingers').checked, denoise: $('#opt-denoise').checked,
+    filter: $('#opt-filter').value,
+  });
+};
+$('#edit-dialog').addEventListener('close', () => { if (edit) { edit.bitmap.close?.(); edit = null; } });
 
 // ---------- PDF生成（ライブラリなし・端末内） ----------
 async function buildPdf(list) {
@@ -320,7 +328,12 @@ async function start() {
   // 旧バージョンで保存したページ（サイズ情報なし）を補正なしで変換しておく
   for (const p of await allPages()) {
     if (p.width) continue;
-    try { p.original = p.blob; Object.assign(p, await processImage(p.blob, 0, 'none'), { rotation: 0, filter: 'none' }); await putPage(p); } catch {}
+    try {
+      p.original = p.blob;
+      Object.assign(p, { rotation: 0, filter: 'none', crop: 'none', deskew: false, fingers: false, denoise: false });
+      Object.assign(p, await processImage(p.original, optionsOf(p)));
+      await putPage(p);
+    } catch {}
   }
   await refresh();
   // ブラウザーが空き容量不足でデータを消さないよう永続化を依頼

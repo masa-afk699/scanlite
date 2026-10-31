@@ -28,7 +28,7 @@
     <section class="capture-card">
       <div class="camera-mark" aria-hidden="true">▧</div>
       <h2 id="mode-title">本をスキャン</h2>
-      <p id="mode-help">影や明るさのムラを補正して、紙を白く整えます。</p>
+      <p id="mode-help">ページ端を見つけて台形・傾き・影・指を自動で補正します。</p>
       <label class="primary-button" for="camera-input">カメラで撮影</label>
       <label class="secondary-button" for="file-input">写真を選ぶ</label>
       <input id="camera-input" type="file" accept="image/*" capture="environment" hidden>
@@ -43,6 +43,7 @@
     <p class="privacy-note">写真・PDF・認識テキストはすべてこのスマホの中で処理・保存します。<br>サーバーや外部サービスには送信しません（文字認識も端末内で動作）。</p>
     <dialog id="text-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2>日本語OCR</h2><p id="ocr-status">文字を認識しています…</p><textarea id="ocr-result" readonly></textarea><button id="ocr-copy" class="dark-button" type="button">テキストをコピー</button></dialog>
     <dialog id="pdf-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2>PDFができました</h2><p id="pdf-info"></p><a id="pdf-download" class="dark-button link-button" download>スマホに保存</a><button id="pdf-share" class="text-button" type="button" hidden>他のアプリで開く…</button><p class="dialog-note">「スマホに保存」はダウンロードフォルダに保存します。共有を選んだ場合だけ、選んだアプリにPDFが渡ります。</p></dialog>
+    <dialog id="edit-dialog" class="edit-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2>範囲と補正</h2><p class="dialog-note">四隅の丸をドラッグして、ページの範囲に合わせます。</p><div class="edit-stage"><canvas id="edit-canvas"></canvas></div><div class="edit-row"><button id="edit-rotate" type="button">↺ 回転</button><button id="edit-auto" type="button">自動検出</button><button id="edit-full" type="button">切り抜かない</button></div><div class="edit-options"><label><input type="checkbox" id="opt-deskew"> 傾きを補正</label><label><input type="checkbox" id="opt-fingers"> 指を消す</label><label><input type="checkbox" id="opt-denoise"> ノイズを除去</label><label>色 <select id="opt-filter"></select></label></div><button id="edit-apply" class="dark-button" type="button">この設定で補正</button></dialog>
   </main>
   <script src="app.js" type="module"></script>
 </body>
