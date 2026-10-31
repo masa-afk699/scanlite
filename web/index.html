@@ -3,6 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <!-- 撮影データを端末外へ出さないため、通信先を自サイトのみに制限する -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; worker-src 'self'; font-src 'self'; manifest-src 'self'; media-src 'self' blob:; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
   <meta name="theme-color" content="#142720">
   <meta name="description" content="本や書類をスマートフォンで撮影してPDFにする個人用スキャナー">
   <link rel="manifest" href="manifest.webmanifest">
@@ -13,8 +16,8 @@
 <body>
   <main class="shell">
     <header>
-      <div><p class="eyebrow">PERSONAL SCANNER</p><h1>ScanLite</h1><p class="sub">本も書類も、Pixelでかんたんスキャン</p></div>
-      <span class="local-badge">端末内に保存</span>
+      <div><p class="eyebrow">PERSONAL SCANNER</p><h1>ScanLite</h1><p class="sub">本も書類も、スマホの中だけでスキャン</p></div>
+      <span class="local-badge" id="local-badge">端末内で処理</span>
     </header>
     <section class="controls" aria-label="スキャン設定">
       <div class="mode-switch" role="group" aria-label="スキャンモード">
@@ -25,19 +28,21 @@
     <section class="capture-card">
       <div class="camera-mark" aria-hidden="true">▧</div>
       <h2 id="mode-title">本をスキャン</h2>
-      <p id="mode-help">見開きを撮影して、あとからPDFにまとめられます。</p>
+      <p id="mode-help">影や明るさのムラを補正して、紙を白く整えます。</p>
       <label class="primary-button" for="camera-input">カメラで撮影</label>
       <label class="secondary-button" for="file-input">写真を選ぶ</label>
       <input id="camera-input" type="file" accept="image/*" capture="environment" hidden>
       <input id="file-input" type="file" accept="image/*" multiple hidden>
+      <p id="busy" class="busy" hidden>画像を補正しています…</p>
     </section>
     <section class="actions">
-      <button id="pdf-button" class="dark-button" disabled>PDFに書き出す</button>
+      <button id="pdf-button" class="dark-button" disabled>PDFを作成</button>
       <button id="clear-button" class="text-button" disabled>すべて削除</button>
     </section>
     <section id="pages" class="pages" aria-live="polite"></section>
-    <p class="privacy-note">写真と認識テキストはこのブラウザー内に保存します。サーバーには送信しません。</p>
-    <dialog id="text-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2>日本語OCR</h2><p id="ocr-status">文字を認識しています…</p><textarea id="ocr-result" readonly></textarea></dialog>
+    <p class="privacy-note">写真・PDF・認識テキストはすべてこのスマホの中で処理・保存します。<br>サーバーや外部サービスには送信しません（文字認識も端末内で動作）。</p>
+    <dialog id="text-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2>日本語OCR</h2><p id="ocr-status">文字を認識しています…</p><textarea id="ocr-result" readonly></textarea><button id="ocr-copy" class="dark-button" type="button">テキストをコピー</button></dialog>
+    <dialog id="pdf-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2>PDFができました</h2><p id="pdf-info"></p><a id="pdf-download" class="dark-button link-button" download>スマホに保存</a><button id="pdf-share" class="text-button" type="button" hidden>他のアプリで開く…</button><p class="dialog-note">「スマホに保存」はダウンロードフォルダに保存します。共有を選んだ場合だけ、選んだアプリにPDFが渡ります。</p></dialog>
   </main>
   <script src="app.js" type="module"></script>
 </body>
