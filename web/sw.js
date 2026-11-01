@@ -1,5 +1,5 @@
 // オフライン動作用。自サイトのファイルだけをキャッシュし、外部への通信は行わない。
-const CACHE = 'scanlite-shell-v5';
+const CACHE = 'scanlite-shell-v7';
 const FILES = [
   './', './index.html', './style.css', './app.js', './scan.js', './db.js', './pdf.js', './ocr.js', './camera.js', './save.js', './manifest.webmanifest', './icon.svg', './icon-192.png', './icon-512.png',
   './vendor/tesseract/tesseract.esm.min.js',

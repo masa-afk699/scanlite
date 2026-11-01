@@ -71,11 +71,16 @@ function textLayer(ocr, k, pageH) {
 export async function buildPdf(list, title = '') {
   const parts = [], offsets = [];
   let offset = 0;
-  const push = d => { const b = typeof d === 'string' ? enc.encode(d) : d; parts.push(b); offset += b.length; };
+  // 画像はBlobのまま並べる（大量ページでもメモリに読み込まない）
+  const push = d => {
+    const b = typeof d === 'string' ? enc.encode(d) : d;
+    parts.push(b); offset += b instanceof Blob ? b.size : b.length;
+  };
   const obj = (id, write) => { offsets[id] = offset; push(`${id} 0 obj\n`); write(); push('\nendobj\n'); };
   const stream = (dict, data) => {
     const bytes = typeof data === 'string' ? enc.encode(data) : data;
-    push(`<< ${dict} /Length ${bytes.length} >>\nstream\n`); push(bytes); push('\nendstream');
+    const len = bytes instanceof Blob ? bytes.size : bytes.length;
+    push(`<< ${dict} /Length ${len} >>\nstream\n`); push(bytes); push('\nendstream');
   };
 
   // 1:カタログ 2:ページ一覧 3:フォント 4:CIDフォント 5:ToUnicode 6:フォント記述 7:情報  8〜:各ページ(3つずつ)
@@ -95,7 +100,7 @@ export async function buildPdf(list, title = '') {
 
   for (let i = 0; i < list.length; i++) {
     const p = list[i], id = pageIds[i];
-    const bytes = new Uint8Array(await p.blob.arrayBuffer());
+    const bytes = p.blob;
     const k = 842 / Math.max(p.width, p.height); // 長辺をA4長辺（842pt）に合わせる
     const W = p.width * k, H = p.height * k;
     const ocrK = p.ocr ? W / p.ocr.width : 0;
