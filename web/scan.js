@@ -262,6 +262,9 @@ export function demoire(canvas) {
     x.drawImage(src, 0, 0, w, h);
     return c;
   };
+  const src0 = ctx2d(canvas).getImageData(0, 0, W, H).data;
+  // 書類なら明るさはぼかさない（文字が太らないように）。明るさの縞は補正の段階で紙の明るさで割って消す
+  const doc = looksLikeDocument(src0, 150);
   const b1 = ctx2d(blurred(canvas, r)).getImageData(0, 0, W, H).data;
   const b2 = ctx2d(blurred(canvas, r * 3)).getImageData(0, 0, W, H).data;
   // 色成分用: 縮小して強くぼかしてから元の大きさへ
@@ -276,7 +279,7 @@ export function demoire(canvas) {
     // 明るさ: 細かい縞をぼかし、輪郭を強調し直す
     const y1 = 0.299 * b1[i] + 0.587 * b1[i + 1] + 0.114 * b1[i + 2];
     const y2 = 0.299 * b2[i] + 0.587 * b2[i + 1] + 0.114 * b2[i + 2];
-    const Y = y1 + 0.9 * (y1 - y2);
+    const Y = doc ? 0.299 * src0[i] + 0.587 * src0[i + 1] + 0.114 * src0[i + 2] : y1 + 0.9 * (y1 - y2);
     // 色: 広い範囲でならした色を使う
     const cb = -0.168736 * c[i] - 0.331264 * c[i + 1] + 0.5 * c[i + 2];
     const cr = 0.5 * c[i] - 0.418688 * c[i + 1] - 0.081312 * c[i + 2];
@@ -322,19 +325,74 @@ function luma(d, W, H) {
 }
 
 // 白っぽい背景に文字が載った画像か（画面に表示した書類など）
-function looksLikeDocument(d) {
+function looksLikeDocument(d, brightLevel = 170) {
   let bright = 0, sat = 0, n = 0;
   for (let i = 0; i < d.length; i += 4 * 13) {
     const mx = Math.max(d[i], d[i + 1], d[i + 2]), mn = Math.min(d[i], d[i + 1], d[i + 2]);
-    if (mx > 170) bright++;
+    if (mx > brightLevel) bright++;
     sat += mx - mn; n++;
   }
   return bright / n > 0.6 && sat / n < 28;
 }
 
+// 細かい縞（モアレ）を消す: 文字以外の画素から、すぐ近くの紙の明るさを求めて割る。
+// 文字の部分は少し広い範囲の紙から補う。縞の周期より狭い範囲で追うので、縞そのものが打ち消される
+function flattenFine(d, W, H) {
+  const Y = luma(d, W, H), paper = new Float32Array(W * H);
+  const isText = new Uint8Array(W * H);
+  for (let p = 0; p < Y.length; p++) if (Y[p] < 200) isText[p] = 1;
+  // 文字の縁のにじみも紙に含めないよう、1画素ふくらませる
+  const mask = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const p = y * W + x;
+    if (isText[p] || (x > 0 && isText[p - 1]) || (x < W - 1 && isText[p + 1]) || (y > 0 && isText[p - W]) || (y < H - 1 && isText[p + W])) mask[p] = 1;
+  }
+  // 積分画像で、紙の画素だけの平均を求める
+  const S = new Float64Array((W + 1) * (H + 1)), N = new Float64Array((W + 1) * (H + 1));
+  for (let y = 0; y < H; y++) {
+    let rs = 0, rn = 0;
+    for (let x = 0; x < W; x++) {
+      const p = y * W + x;
+      if (!mask[p]) { rs += Y[p]; rn++; }
+      const q = (y + 1) * (W + 1) + x + 1;
+      S[q] = S[q - W - 1] + rs; N[q] = N[q - W - 1] + rn;
+    }
+  }
+  const box = (x, y, r) => {
+    const x0 = Math.max(0, x - r), y0 = Math.max(0, y - r), x1 = Math.min(W, x + r + 1), y1 = Math.min(H, y + r + 1);
+    const a = y0 * (W + 1) + x0, b = y0 * (W + 1) + x1, c = y1 * (W + 1) + x0, e = y1 * (W + 1) + x1;
+    return [S[e] - S[b] - S[c] + S[a], N[e] - N[b] - N[c] + N[a]];
+  };
+  const r1 = Math.max(1, Math.round(Math.max(W, H) / 1200)), r2 = r1 * 6, r3 = r1 * 24;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    let [s, n] = box(x, y, r1);
+    if (n < (2 * r1 + 1) ** 2 * 0.3) { [s, n] = box(x, y, r2); if (n < 8) [s, n] = box(x, y, r3); }
+    paper[y * W + x] = n ? s / n : 250;
+  }
+  for (let p = 0, i = 0; p < paper.length; p++, i += 4) {
+    const k = 250 / Math.max(150, paper[p]);
+    d[i] = d[i] * k; d[i + 1] = d[i + 1] * k; d[i + 2] = d[i + 2] * k;
+  }
+}
+
+// 紙を白・文字の芯を黒にする直線の濃度補正。曲線をかけないので、文字が太らず輪郭もなめらかなまま
+function documentTone(d, Y) {
+  const hist = new Uint32Array(256);
+  for (let p = 0; p < Y.length; p += 3) hist[Y[p]]++;
+  const total = hist.reduce((a, b) => a + b, 0);
+  const pct = q => { let acc = 0; for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= total * q) return v; } return 255; };
+  const paper = pct(0.6), black = Math.min(pct(0.004), paper - 90);
+  const white = Math.max(black + 60, paper - 16), k = 255 / (white - black);
+  const lut = new Uint8ClampedArray(256);
+  // 芯は真っ黒にせず濃いグレーに、中間調は少し明るく（印刷物のような細い線に見せる）
+  for (let v = 0; v < 256; v++) { const t = Math.min(1, Math.max(0, (v - black) * k / 255)); lut[v] = 24 + 231 * Math.pow(t, 0.85); }
+  for (let i = 0; i < d.length; i += 4) { d[i] = lut[d[i]]; d[i + 1] = lut[d[i + 1]]; d[i + 2] = lut[d[i + 2]]; }
+}
+
 // 背景のまだら・縞・薄い汚れを白にし、点状のゴミとページ端の線を消す。
 // binarize: 文字を黒・背景を白にくっきり分ける（白黒）
 function cleanDocument(d, W, H, { binarize }) {
+  flattenFine(d, W, H);
   const Y = luma(d, W, H);
   // 3x3平均で判定する（細かい縞やJPEGのざらつきに引っぱられないように）
   const S = new Uint8ClampedArray(W * H);
@@ -349,15 +407,21 @@ function cleanDocument(d, W, H, { binarize }) {
   const sample = [];
   for (let p = 0; p < S.length; p += 7) sample.push(S[p]);
   const t = Math.min(200, Math.max(90, otsu(sample)));
-  const lo = t - 20, hi = Math.min(245, t + 40);
-  for (let p = 0, i = 0; p < Y.length; p++, i += 4) {
-    if (binarize) {
-      const v = Math.max(0, Math.min(255, (Y[p] - lo) * 255 / (hi - lo)));
+  if (binarize) {
+    // 境目を文字側に寄せて、白黒でも文字が太らないようにする
+    const lo = t - 45, hi = Math.min(245, t + 15);
+    for (let p = 0, i = 0; p < Y.length; p++, i += 4) {
+      const sharp = Y[p] + 0.9 * (Y[p] - S[p]);
+      const v = Math.max(0, Math.min(255, (sharp - lo) * 255 / (hi - lo)));
       d[i] = d[i + 1] = d[i + 2] = S[p] >= hi ? 255 : v;
-    } else if (S[p] > t) {
-      const k = Math.min(1, (S[p] - t) / (hi - t));
-      d[i] += (255 - d[i]) * k; d[i + 1] += (255 - d[i + 1]) * k; d[i + 2] += (255 - d[i + 2]) * k;
     }
+  } else {
+    // 輪郭を少し締めて、にじんだ文字を細く・くっきりさせる
+    for (let p = 0, i = 0; p < Y.length; p++, i += 4) {
+      const dv = 0.9 * (Y[p] - S[p]);
+      if (dv) { d[i] += dv; d[i + 1] += dv; d[i + 2] += dv; }
+    }
+    documentTone(d, Y);
   }
   // 点状のゴミ（文字にしては小さすぎる暗い点）を消す
   const Y2 = luma(d, W, H), dark = new Uint8Array(W * H);
@@ -367,7 +431,7 @@ function cleanDocument(d, W, H, { binarize }) {
     // 小さすぎる点、または濃い芯のない薄いまだら（画面の縞・ざらつき）は文字ではない
     let core = 255;
     if (c.px.length > maxArea) for (const p of c.px) if (Y2[p] < core) core = Y2[p];
-    if (c.px.length > maxArea && core < 150) continue;
+    if (c.px.length > maxArea && (core < 150 || c.px.length > maxArea * 40)) continue;
     for (const p of c.px) d[p * 4] = d[p * 4 + 1] = d[p * 4 + 2] = 255;
   }
   // 線の判定は薄いグレーも含める（かすれた縁の線も消せるように）
@@ -485,31 +549,36 @@ export function enhance(canvas, { filter, fingers, denoise, evenColor = true }) 
   }
 
   if (filter === 'screen') {
-    screenLevels(d);
-    // 背景（白い画面やタイトルバーの地の色）に近い部分をその色にそろえ、明るさの縞を消す
-    x.putImageData(img, 0, 0);
+    // 画面に表示した書類（白っぽい背景に文字）なら、明るさの縞と色かぶりを背景で割って消し、紙のように仕上げる
     const bg = estimateBackground(canvas);
+    const flat = new Uint8ClampedArray(d.length);
     for (let i = 0; i < d.length; i += 4) {
-      const yy = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-      const yb = Math.max(1, 0.299 * bg[i] + 0.587 * bg[i + 1] + 0.114 * bg[i + 2]);
-      const k = Math.min(1, Math.max(0, (yy / yb - 0.78) / 0.12));
-      if (k > 0) { d[i] += (bg[i] - d[i]) * k; d[i + 1] += (bg[i + 1] - d[i + 1]) * k; d[i + 2] += (bg[i + 2] - d[i + 2]) * k; }
+      flat[i] = d[i] * 250 / Math.max(bg[i], 1);
+      flat[i + 1] = d[i + 1] * 250 / Math.max(bg[i + 1], 1);
+      flat[i + 2] = d[i + 2] * 250 / Math.max(bg[i + 2], 1);
+      flat[i + 3] = 255;
     }
-    // 画面に表示した書類（白っぽい背景に文字）なら、背景のまだら・縞を白にそろえる
-    if (looksLikeDocument(d)) {
-      for (let i = 0; i < d.length; i += 4) {
-        d[i] = Math.min(255, d[i] * 250 / Math.max(bg[i], 1));
-        d[i + 1] = Math.min(255, d[i + 1] * 250 / Math.max(bg[i + 1], 1));
-        d[i + 2] = Math.min(255, d[i + 2] * 250 / Math.max(bg[i + 2], 1));
-      }
+    if (looksLikeDocument(flat)) {
+      d.set(flat);
       cleanDocument(d, W, H, { binarize: false });
+    } else {
+      screenLevels(d);
+      // 背景（白い画面やタイトルバーの地の色）に近い部分をその色にそろえ、明るさの縞を消す
+      x.putImageData(img, 0, 0);
+      const bg2 = estimateBackground(canvas);
+      for (let i = 0; i < d.length; i += 4) {
+        const yy = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        const yb = Math.max(1, 0.299 * bg2[i] + 0.587 * bg2[i + 1] + 0.114 * bg2[i + 2]);
+        const k = Math.min(1, Math.max(0, (yy / yb - 0.78) / 0.12));
+        if (k > 0) { d[i] += (bg2[i] - d[i]) * k; d[i + 1] += (bg2[i + 1] - d[i + 1]) * k; d[i + 2] += (bg2[i + 2] - d[i + 2]) * k; }
+      }
     }
   } else if (filter !== 'none') {
     const bg = estimateBackground(canvas);
     // gray/color はなめらかに、bw は文字をくっきり（ほぼ2値）にする
     const gamma = filter === 'gray' ? 1.6 : 1.35, lut = new Uint8ClampedArray(256);
     for (let i = 0; i < 256; i++) {
-      lut[i] = filter === 'bw' ? i : 255 * Math.pow(i / 255, gamma);
+      lut[i] = filter === 'color' ? 255 * Math.pow(i / 255, gamma) : i;
     }
     for (let i = 0; i < d.length; i += 4) {
       const r = Math.min(255, d[i] * 250 / Math.max(bg[i], 1));
