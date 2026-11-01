@@ -101,14 +101,16 @@ function otsu(values) {
 // ---------- ページ端の検出 ----------
 // 紙は「明るく、色みが少ない」。その最大の領域を探し、四隅を推定する。
 // 返り値は画像サイズに対する0〜1の座標 [左上, 右上, 右下, 左下]。見つからなければ null。
-export function detectPage(canvas) {
+// subject: 'paper'（紙） | 'screen'（PCなどの画面。光っていて色があるので明るさだけで判定）
+export function detectPage(canvas, subject = 'paper') {
   const img = shrink(canvas, 360), { width: w, height: h, data: d } = img;
   const score = new Uint8Array(w * h);
   for (let i = 0, p = 0; p < score.length; i += 4, p++) {
     const mx = Math.max(d[i], d[i + 1], d[i + 2]), mn = Math.min(d[i], d[i + 1], d[i + 2]);
-    score[p] = Math.max(0, Math.min(255, mx - 1.5 * (mx - mn)));
+    score[p] = subject === 'screen' ? (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8 : Math.max(0, Math.min(255, mx - 1.5 * (mx - mn)));
   }
-  const t = otsu(score);
+  // 画面: 暗い枠・部屋と、光っている画面（色の濃いタイトルバーなども含む）を分ける
+  const t = subject === 'screen' ? Math.max(45, Math.min(otsu(score), 70)) : otsu(score);
   let mask = new Uint8Array(w * h);
   for (let p = 0; p < mask.length; p++) mask[p] = score[p] > t ? 1 : 0;
   // 文字の穴を埋め、細いつながりを切る
@@ -248,6 +250,70 @@ function median9(a) {
   return a[4];
 }
 
+// ---------- 画面（モニター）撮影向け ----------
+// モアレ除去: 画素の格子とカメラが干渉してできる縞を消す。
+// 縞の多くは「色」の波なので色成分は大きくならし、明るさは細かい縞だけぼかして文字の輪郭を戻す
+export function demoire(canvas) {
+  const W = canvas.width, H = canvas.height;
+  const r = Math.max(0.8, Math.max(W, H) / 1600);
+  const blurred = (src, radius, w = W, h = H) => {
+    const c = makeCanvas(w, h), x = ctx2d(c);
+    x.filter = `blur(${radius.toFixed(2)}px)`;
+    x.drawImage(src, 0, 0, w, h);
+    return c;
+  };
+  const b1 = ctx2d(blurred(canvas, r)).getImageData(0, 0, W, H).data;
+  const b2 = ctx2d(blurred(canvas, r * 3)).getImageData(0, 0, W, H).data;
+  // 色成分用: 縮小して強くぼかしてから元の大きさへ
+  const sw = Math.max(8, Math.round(W / 6)), sh = Math.max(8, Math.round(H / 6));
+  const small = blurred(canvas, Math.max(2, Math.max(sw, sh) / 90), sw, sh);
+  const big = makeCanvas(W, H), bx = ctx2d(big);
+  bx.imageSmoothingQuality = 'high';
+  bx.drawImage(small, 0, 0, W, H);
+  const c = bx.getImageData(0, 0, W, H).data;
+  const x = ctx2d(canvas), img = x.createImageData(W, H), o = img.data;
+  for (let i = 0; i < o.length; i += 4) {
+    // 明るさ: 細かい縞をぼかし、輪郭を強調し直す
+    const y1 = 0.299 * b1[i] + 0.587 * b1[i + 1] + 0.114 * b1[i + 2];
+    const y2 = 0.299 * b2[i] + 0.587 * b2[i + 1] + 0.114 * b2[i + 2];
+    const Y = y1 + 0.9 * (y1 - y2);
+    // 色: 広い範囲でならした色を使う
+    const cb = -0.168736 * c[i] - 0.331264 * c[i + 1] + 0.5 * c[i + 2];
+    const cr = 0.5 * c[i] - 0.418688 * c[i + 1] - 0.081312 * c[i + 2];
+    o[i] = Y + 1.402 * cr;
+    o[i + 1] = Y - 0.344136 * cb - 0.714136 * cr;
+    o[i + 2] = Y + 1.772 * cb;
+    o[i + 3] = 255;
+  }
+  x.putImageData(img, 0, 0);
+}
+
+// 画面向けの色補正: チャンネルごとに暗部と明部を伸ばし、白を白に戻す（青っぽさ・黄ばみを取る）
+function screenLevels(d) {
+  const hist = [new Uint32Array(256), new Uint32Array(256), new Uint32Array(256)];
+  let n = 0;
+  for (let i = 0; i < d.length; i += 16) { hist[0][d[i]]++; hist[1][d[i + 1]]++; hist[2][d[i + 2]]++; n++; }
+  const lut = hist.map(hc => {
+    let acc = 0, lo = 0, hi = 255;
+    for (let v = 0; v < 256; v++) { acc += hc[v]; if (acc >= n * 0.005) { lo = v; break; } }
+    acc = 0;
+    for (let v = 255; v >= 0; v--) { acc += hc[v]; if (acc >= n * 0.01) { hi = v; break; } }
+    if (hi - lo < 40) { lo = 0; hi = 255; }
+    const t = new Uint8ClampedArray(256);
+    for (let v = 0; v < 256; v++) t[v] = 255 * Math.pow(Math.min(1, Math.max(0, (v - lo) / (hi - lo))), 1.1);
+    return t;
+  });
+  for (let i = 0; i < d.length; i += 4) {
+    d[i] = lut[0][d[i]]; d[i + 1] = lut[1][d[i + 1]]; d[i + 2] = lut[2][d[i + 2]];
+    // 白に近い背景は白にそろえ、薄い縞やにじみを消す
+    const mn = Math.min(d[i], d[i + 1], d[i + 2]);
+    if (mn > 205) {
+      const k = Math.min(1, (mn - 205) / 30);
+      d[i] += (255 - d[i]) * k; d[i + 1] += (255 - d[i + 1]) * k; d[i + 2] += (255 - d[i + 2]) * k;
+    }
+  }
+}
+
 // 色ムラ補正: 紙や文字に出る薄い色かぶり・まだらな色を消し、はっきりした色（印鑑・図・写真）は残す
 function removeColorBlotches(d, W, H) {
   const S = 8, gw = Math.ceil(W / S), gh = Math.ceil(H / S);
@@ -339,7 +405,18 @@ export function enhance(canvas, { filter, fingers, denoise, evenColor = true }) 
     }
   }
 
-  if (filter !== 'none') {
+  if (filter === 'screen') {
+    screenLevels(d);
+    // 背景（白い画面やタイトルバーの地の色）に近い部分をその色にそろえ、明るさの縞を消す
+    x.putImageData(img, 0, 0);
+    const bg = estimateBackground(canvas);
+    for (let i = 0; i < d.length; i += 4) {
+      const yy = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      const yb = Math.max(1, 0.299 * bg[i] + 0.587 * bg[i + 1] + 0.114 * bg[i + 2]);
+      const k = Math.min(1, Math.max(0, (yy / yb - 0.78) / 0.12));
+      if (k > 0) { d[i] += (bg[i] - d[i]) * k; d[i + 1] += (bg[i + 1] - d[i + 1]) * k; d[i + 2] += (bg[i + 2] - d[i + 2]) * k; }
+    }
+  } else if (filter !== 'none') {
     const bg = estimateBackground(canvas);
     // gray/color はなめらかに、bw は文字をくっきり（ほぼ2値）にする
     const gamma = filter === 'gray' ? 1.6 : 1.35, lut = new Uint8ClampedArray(256);
@@ -360,7 +437,7 @@ export function enhance(canvas, { filter, fingers, denoise, evenColor = true }) 
     if (fingerMask) for (let p = 0; p < W * H; p++) if (fingerMask[p]) d[p * 4] = d[p * 4 + 1] = d[p * 4 + 2] = 255;
   }
 
-  if (denoise && filter !== 'none') {
+  if (denoise && filter !== 'none' && filter !== 'screen') {
     // 紙のざらつき・薄い汚れを白に寄せる
     for (let i = 0; i < d.length; i += 4) {
       const mn = Math.min(d[i], d[i + 1], d[i + 2]);
@@ -487,14 +564,46 @@ export async function processImage(original, opts) {
   bitmap.close?.();
   await tick();
   let corners = null;
-  if (opts.crop === 'auto') corners = detectPage(canvas);
+  if (opts.crop === 'auto') corners = detectPage(canvas, opts.subject);
   else if (Array.isArray(opts.crop)) corners = opts.crop;
   if (corners) { canvas = warp(canvas, corners); await tick(); }
   if (opts.half === 'left' || opts.half === 'right') canvas = cropHalf(canvas, opts.half);
+  if (opts.moire) { demoire(canvas); await tick(); }
   enhance(canvas, { filter: opts.filter || 'none', fingers: !!opts.fingers, denoise: opts.denoise !== false, evenColor: opts.evenColor !== false });
   await tick();
   let skew = 0;
   if (opts.deskew) { skew = detectSkew(canvas); canvas = rotateBy(canvas, skew); }
   const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.86));
-  return { blob, width: canvas.width, height: canvas.height, corners: corners || FULL_FRAME, skew };
+  // 一覧表示用の小さな画像（大量のページでも一覧が重くならないように）
+  const tk = Math.min(1, 420 / Math.max(canvas.width, canvas.height));
+  const tc = makeCanvas(Math.max(1, Math.round(canvas.width * tk)), Math.max(1, Math.round(canvas.height * tk))), tx = ctx2d(tc);
+  tx.imageSmoothingQuality = 'high';
+  tx.drawImage(canvas, 0, 0, tc.width, tc.height);
+  const thumb = await new Promise(r => tc.toBlob(r, 'image/jpeg', 0.7));
+  return { blob, thumb, width: canvas.width, height: canvas.height, corners: corners || FULL_FRAME, skew };
+}
+
+// 画像の上の方だけを切り出す（題名の読み取り用。小さい画像の方がOCRが速い）
+export async function cropTop(blob, frac = 0.4, maxSide = 1600) {
+  const bitmap = await decode(blob);
+  const k = Math.min(1, maxSide / bitmap.width);
+  const h = Math.round(bitmap.height * frac);
+  const c = makeCanvas(Math.round(bitmap.width * k), Math.round(h * k)), x = ctx2d(c);
+  x.imageSmoothingQuality = 'high';
+  x.drawImage(bitmap, 0, 0, bitmap.width, h, 0, 0, c.width, c.height);
+  bitmap.close?.();
+  return { blob: await new Promise(r => c.toBlob(r, 'image/jpeg', 0.9)), width: c.width, height: c.height / frac };
+}
+
+// 元画像を保存用に整える。大きすぎる写真は長辺3200pxに縮めて容量を抑える（向きはここで確定）
+export async function limitOriginal(blob, maxSide = 3200) {
+  const bitmap = await decode(blob);
+  const big = Math.max(bitmap.width, bitmap.height);
+  if (big <= maxSide && blob.size < 2.5e6) { bitmap.close?.(); return blob; }
+  const k = Math.min(1, maxSide / big);
+  const c = makeCanvas(Math.round(bitmap.width * k), Math.round(bitmap.height * k)), x = ctx2d(c);
+  x.imageSmoothingQuality = 'high';
+  x.drawImage(bitmap, 0, 0, c.width, c.height);
+  bitmap.close?.();
+  return await new Promise(r => c.toBlob(r, 'image/jpeg', 0.9));
 }

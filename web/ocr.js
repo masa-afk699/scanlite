@@ -34,7 +34,10 @@ function release(w) {
 
 // 日本語の文字間に入る余分な空白を取り除く
 const CJK = '[\\u3000-\\u30ff\\u3400-\\u9fff\\uff00-\\uffef]';
-export const tidy = t => t.replace(new RegExp(`(?<=${CJK}) +(?=${CJK})`, 'g'), '');
+export const tidy = t => t
+  .replace(new RegExp(`(?<=${CJK}) +(?=${CJK})`, 'g'), '')
+  // 「第 3 回」のように数字の前後に入る空白も取る
+  .replace(new RegExp(`(?<=${CJK}) +(?=[0-9０-９])|(?<=[0-9０-９]) +(?=${CJK})`, 'g'), '');
 
 // 返り値: { text, lines: [{ text, bbox: {x0,y0,x1,y1} }] }（座標は入力画像のピクセル）
 export async function recognize(blob, onProgress = () => {}) {

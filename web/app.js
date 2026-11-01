@@ -1,5 +1,5 @@
 // ScanLite: すべての処理をブラウザー内で行う。撮影画像・PDF・OCR結果はネットワークに送らない。
-import { processImage, decode, drawRotated, detectPage, FULL_FRAME, recompress } from './scan.js';
+import { processImage, decode, drawRotated, detectPage, FULL_FRAME, recompress, limitOriginal, cropTop } from './scan.js';
 import * as db from './db.js';
 import { buildPdf } from './pdf.js';
 import { recognize } from './ocr.js';
@@ -7,12 +7,18 @@ import { createCamera } from './camera.js';
 import * as save from './save.js';
 
 // 新しく取り込んだページの標準設定
-const DEFAULTS = { rotation: 0, filter: 'color', crop: 'auto', half: null, deskew: true, fingers: true, denoise: true, evenColor: true };
-const FILTERS = { color: 'カラー', gray: 'グレースケール', bw: '白黒', none: '補正なし' };
+const DEFAULTS = { rotation: 0, filter: 'color', crop: 'auto', half: null, deskew: true, fingers: true, denoise: true, evenColor: true, moire: false };
+// PC・スマホの画面を撮るとき: 紙向けの補正は使わず、モアレ除去と画面向けの色補正にする
+const SCREEN_DEFAULTS = { ...DEFAULTS, filter: 'screen', deskew: false, fingers: false, denoise: false, evenColor: false, moire: true };
+const FILTERS = { color: 'カラー', gray: 'グレースケール', bw: '白黒', screen: '画面向け', none: '補正なし' };
+const defaultsFor = m => m === 'screen'
+  ? { ...SCREEN_DEFAULTS, ...prefs.get('defaults.screen', {}) }
+  : { ...DEFAULTS, ...prefs.get('defaults', {}) };
 const QUALITY = { high: { side: 2400, q: 0.86 }, normal: { side: 1600, q: 0.75 }, small: { side: 1100, q: 0.6 } };
 const MODE_TEXT = {
   book: { title: '本をスキャン', help: 'ページをめくって手を止めると、自動で撮影します。' },
   document: { title: '書類をスキャン', help: '紙を置き換えて手を止めると、自動で撮影します。' },
+  screen: { title: '画面をスキャン', help: 'PCやスマホの画面の四隅を見つけて、縞模様（モアレ）と色かぶりを抑えます。' },
 };
 
 const $ = s => document.querySelector(s);
@@ -77,23 +83,41 @@ $('#doc-delete').onclick = async () => {
 };
 
 // ---------- ページ一覧 ----------
+const ready = p => !p.waiting && !p.failed;
+
 async function refresh() {
   await loadDocs();
   pages = await db.pagesOf(docId);
   thumbUrls.forEach(u => URL.revokeObjectURL(u));
   thumbUrls = [];
-  $('#count').textContent = `${pages.length} ページ`;
-  $('#pdf-button').disabled = !pages.length;
-  $('#batch-button').disabled = !pages.length;
+  const done = pages.filter(ready).length;
+  $('#count').textContent = `${done} ページ` + (done < pages.length ? `（処理中 ${pages.length - done}）` : '');
+  $('#pdf-button').disabled = !done;
+  $('#batch-button').disabled = !done;
   const root = $('#pages');
-  root.replaceChildren();
+  const frag = document.createDocumentFragment();
+  const button = (text, fn, cls) => { const b = document.createElement('button'); b.textContent = text; b.onclick = fn; if (cls) b.className = cls; return b; };
   pages.forEach((p, index) => {
     const card = document.createElement('article');
     card.className = 'page-card';
+    const del = button('削除', async () => { await db.removePage(p.id); await refresh(); }, 'danger');
+    if (!ready(p)) {
+      const ph = document.createElement('div');
+      ph.className = 'page-placeholder';
+      ph.textContent = p.failed ? '読み込めませんでした' : '補正待ち…';
+      const tools = document.createElement('div');
+      tools.className = 'page-tools';
+      tools.append(del);
+      card.append(ph, tools);
+      frag.append(card);
+      return;
+    }
     const img = document.createElement('img');
-    const url = URL.createObjectURL(p.blob);
+    const url = URL.createObjectURL(p.thumb || p.blob);
     thumbUrls.push(url);
     img.src = url;
+    img.loading = 'lazy';
+    img.decoding = 'async';
     img.alt = `${index + 1}ページ目`;
     const meta = document.createElement('div');
     meta.className = 'page-meta';
@@ -106,21 +130,41 @@ async function refresh() {
     meta.append(label, select);
     const tools = document.createElement('div');
     tools.className = 'page-tools';
-    const button = (text, fn, cls) => { const b = document.createElement('button'); b.textContent = text; b.onclick = fn; if (cls) b.className = cls; return b; };
     tools.append(
       button('範囲・補正', () => openEditor(p)),
       button('◀ 前へ', () => move(index, -1)),
       button('OCR', () => showOcr(p)),
-      button('削除', async () => { await db.removePage(p.id); await refresh(); }, 'danger'),
+      del,
     );
     card.append(img, meta, tools);
-    root.append(card);
+    frag.append(card);
   });
+  root.replaceChildren(frag);
+  showStorage();
+}
+
+// 処理中は一覧の作り直しを間引く（大量撮影でも重くならないように）
+let refreshTimer = null;
+function scheduleRefresh() {
+  if (refreshTimer) return;
+  refreshTimer = setTimeout(async () => { refreshTimer = null; await refresh(); }, 600);
+}
+
+// 端末の保存容量の目安
+async function showStorage() {
+  const el = $('#storage');
+  try {
+    const { usage = 0, quota = 0 } = await navigator.storage.estimate();
+    const mb = v => v > 1e9 ? `${(v / 1e9).toFixed(1)}GB` : `${Math.round(v / 1e6)}MB`;
+    el.textContent = `この端末に保存中 ${mb(usage)}（使える目安 あと ${mb(Math.max(0, quota - usage))}）`;
+    el.hidden = false;
+  } catch { el.hidden = true; }
 }
 
 const optionsOf = p => ({
   rotation: p.rotation || 0, filter: p.filter || 'none', crop: p.crop || 'none', half: p.half || null,
   deskew: !!p.deskew, fingers: !!p.fingers, denoise: p.denoise !== false, evenColor: p.evenColor !== false,
+  moire: !!p.moire, subject: p.mode === 'screen' ? 'screen' : 'paper',
 });
 
 async function reprocess(page, change, { quiet = false } = {}) {
@@ -148,31 +192,57 @@ async function move(index, delta) {
 
 // ---------- 取り込み（撮影・写真選択） ----------
 // 撮影中も次々に追加できるよう、補正は順番待ちで1枚ずつ行う
-let queue = Promise.resolve();
-function enqueue(blobs) {
+// 撮った写真はまず「補正待ち」としてすぐ端末に保存し、順番に補正する。
+// 大量に撮ってもメモリに溜めず、アプリを閉じても次回の起動で続きから処理する
+let seq = 0;
+async function enqueue(blobs) {
   const target = docId, split = mode === 'book' && $('#opt-split').checked;
   const halves = split ? ($('#opt-order').value === 'rtl' ? ['right', 'left'] : ['left', 'right']) : [null];
   for (const blob of blobs) {
     if (blob.type && !blob.type.startsWith('image/')) continue;
+    const created = Date.now() + (seq++ % 1000) / 1000;
+    for (let i = 0; i < halves.length; i++) {
+      await db.addPage({
+        original: blob, ...defaultsFor(mode), half: halves[i], wantOcr: prefs.get('autoOcr', false),
+        mode, docId: target, created: created + i / 10000, waiting: true,
+      });
+    }
     pending++;
     showPending();
-    const created = Date.now();
-    queue = queue.then(async () => {
+  }
+  scheduleRefresh();
+  processWaiting();
+}
+
+let working = false;
+async function processWaiting() {
+  if (working) return;
+  working = true;
+  try {
+    for (;;) {
+      const waiting = (await db.allPages()).filter(p => p.waiting);
+      pending = waiting.length;
+      showPending();
+      if (!waiting.length) break;
+      const p = waiting[0];
       try {
-        for (let i = 0; i < halves.length; i++) {
-          const opts = { ...DEFAULTS, ...prefs.get('defaults', {}), half: halves[i] };
-          const result = await processImage(blob, opts);
-          await db.addPage({ original: blob, ...opts, ...result, wantOcr: prefs.get('autoOcr', false), mode, docId: target, created: created + i / 10 });
-        }
+        if (!p.sized) { p.original = await limitOriginal(p.original); p.sized = true; }
+        Object.assign(p, await processImage(p.original, optionsOf(p)));
       } catch (e) {
         console.error(e);
-        alert('画像を読み込めませんでした');
+        p.failed = true;
       }
-      pending--;
-      showPending();
-      await refresh();
-      if (!pending) runBackgroundOcr();
-    });
+      p.waiting = false;
+      // 処理中に削除されたページは保存し直さない
+      if (await db.getPage(p.id)) await db.putPage(p);
+      scheduleRefresh();
+    }
+  } finally {
+    working = false;
+    pending = 0;
+    showPending();
+    scheduleRefresh();
+    runBackgroundOcr();
   }
 }
 
@@ -216,6 +286,7 @@ async function openEditor(page) {
   $('#opt-fingers').checked = !!page.fingers;
   $('#opt-denoise').checked = page.denoise !== false;
   $('#opt-even').checked = page.evenColor !== false;
+  $('#opt-moire').checked = !!page.moire;
   $('#opt-half').value = page.half || '';
   const sel = $('#opt-filter');
   sel.replaceChildren(...Object.entries(FILTERS).map(([v, t]) => new Option(t, v, false, v === (page.filter || 'none'))));
@@ -278,10 +349,10 @@ editCanvas.addEventListener('pointercancel', endDrag);
 $('#edit-rotate').onclick = () => {
   edit.rotation = (edit.rotation + 270) % 360;
   edit.base = drawRotated(edit.bitmap, edit.rotation, 1200);
-  edit.corners = detectPage(edit.base) || FULL_FRAME;
+  edit.corners = detectPage(edit.base, optionsOf(edit.page).subject) || FULL_FRAME;
   renderEditBase();
 };
-$('#edit-auto').onclick = () => { edit.corners = detectPage(edit.base) || FULL_FRAME; drawEditor(); };
+$('#edit-auto').onclick = () => { edit.corners = detectPage(edit.base, optionsOf(edit.page).subject) || FULL_FRAME; drawEditor(); };
 $('#edit-full').onclick = () => { edit.corners = FULL_FRAME.map(c => [...c]); drawEditor(); };
 $('#edit-apply').onclick = async () => {
   const { page, rotation, corners, bitmap } = edit;
@@ -292,7 +363,7 @@ $('#edit-apply').onclick = async () => {
   await reprocess(page, {
     rotation, crop: full ? 'none' : corners, half: $('#opt-half').value || null,
     deskew: $('#opt-deskew').checked, fingers: $('#opt-fingers').checked, denoise: $('#opt-denoise').checked,
-    evenColor: $('#opt-even').checked, filter: $('#opt-filter').value,
+    evenColor: $('#opt-even').checked, moire: $('#opt-moire').checked, filter: $('#opt-filter').value,
   });
 };
 $('#edit-dialog').addEventListener('close', () => { if (edit) { edit.bitmap.close?.(); edit = null; } });
@@ -311,19 +382,20 @@ $('#batch-apply').onclick = async () => {
   const tri = id => ({ '': undefined, '1': true, '0': false })[$(id).value];
   const change = {};
   if ($('#batch-filter').value) change.filter = $('#batch-filter').value;
-  for (const [id, key] of [['#batch-even', 'evenColor'], ['#batch-deskew', 'deskew'], ['#batch-denoise', 'denoise'], ['#batch-fingers', 'fingers']]) {
+  for (const [id, key] of [['#batch-even', 'evenColor'], ['#batch-deskew', 'deskew'], ['#batch-denoise', 'denoise'], ['#batch-fingers', 'fingers'], ['#batch-moire', 'moire']]) {
     const v = tri(id); if (v !== undefined) change[key] = v;
   }
   const crop = tri('#batch-crop');
   if (crop !== undefined) change.crop = crop ? 'auto' : 'none';
   const ocr = tri('#batch-ocr');
   // 次から撮るページにも同じ設定を使う
-  prefs.set('defaults', { ...prefs.get('defaults', {}), ...change });
+  const key = mode === 'screen' ? 'defaults.screen' : 'defaults';
+  prefs.set(key, { ...prefs.get(key, {}), ...change });
   if (ocr !== undefined) prefs.set('autoOcr', ocr);
   const btn = $('#batch-apply');
   btn.disabled = true;
   const needImage = Object.keys(change).length > 0;
-  const list = [...pages];
+  const list = pages.filter(ready);
   for (let i = 0; i < list.length; i++) {
     const p = list[i];
     if (ocr !== undefined) p.wantOcr = ocr;
@@ -346,7 +418,7 @@ async function runBackgroundOcr() {
   ocrRunning = true;
   try {
     for (;;) {
-      const todo = (await db.allPages()).filter(p => p.wantOcr && !(p.ocr && p.ocr.width === p.width));
+      const todo = (await db.allPages()).filter(p => ready(p) && p.wantOcr && !(p.ocr && p.ocr.width === p.width));
       if (!todo.length || pending) break;
       setBusy(`文字認識を裏で進めています…（残り ${todo.length} ページ）`);
       // ワーカーの数だけ並行して処理する
@@ -391,8 +463,46 @@ $('#ocr-copy').onclick = () => navigator.clipboard?.writeText($('#ocr-result').v
 
 // ---------- PDF ----------
 let pdfUrl = null;
+// ファイル名に使えない文字を除く
+const cleanName = t => t.replace(/[\\/:*?"<>|\u0000-\u001f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
+
+// 1ページ目の題名らしい行（上の方にある、いちばん大きな文字の行）を探す
+async function guessTitle(page) {
+  let lines, H;
+  if (page.ocr && page.ocr.width === page.width) { lines = page.ocr.lines; H = page.height; }
+  else {
+    const top = await cropTop(page.blob, 0.4);
+    lines = (await recognize(top.blob)).lines;
+    H = top.height;
+  }
+  let best = null, bestScore = 0;
+  for (const l of lines) {
+    const text = cleanName(l.text);
+    const letters = (text.match(/[\p{L}\p{N}]/gu) || []).length;
+    if (letters < 2 || l.bbox.y0 > H * 0.4) continue;
+    const h = l.bbox.y1 - l.bbox.y0;
+    const score = h * (1 - (l.bbox.y0 / H) * 0.8) * Math.min(1, letters / 4);
+    if (score > bestScore) { bestScore = score; best = text; }
+  }
+  return best;
+}
+
+let nameEdited = false, titleJob = 0;
+$('#pdf-name').addEventListener('input', () => { nameEdited = true; $('#pdf-name-note').textContent = ''; });
+
 $('#pdf-button').onclick = () => {
-  if (!pages.length) return;
+  const usable = pages.filter(ready);
+  if (!usable.length) return;
+  const doc = currentDoc();
+  nameEdited = false;
+  $('#pdf-name').value = doc.name;
+  $('#pdf-name-note').textContent = '1ページ目の題名を読み取っています…';
+  const job = ++titleJob;
+  guessTitle(usable[0]).then(title => {
+    if (job !== titleJob || nameEdited) return;
+    if (title) { $('#pdf-name').value = title; $('#pdf-name-note').textContent = '1ページ目の題名から付けました。自由に変えられます。'; }
+    else $('#pdf-name-note').textContent = '題名を読み取れなかったので、文書名にしました。';
+  }).catch(() => { if (job === titleJob) $('#pdf-name-note').textContent = ''; });
   const q = prefs.get('quality', 'high');
   document.querySelectorAll('input[name=quality]').forEach(r => { r.checked = r.value === q; });
   $('#pdf-ocr').checked = prefs.get('searchable', false);
@@ -400,8 +510,8 @@ $('#pdf-button').onclick = () => {
   $('#pdf-result').hidden = true;
   $('#pdf-make').disabled = false;
   $('#pdf-make').textContent = '作成する';
-  const ready = pages.filter(p => p.ocr && p.ocr.width === p.width).length;
-  $('#pdf-ocr-note').textContent = ready === pages.length ? '全ページの文字認識が済んでいます' : `未処理の ${pages.length - ready} ページを端末内でOCRします（並行処理）`;
+  const ocrDone = usable.filter(p => p.ocr && p.ocr.width === p.width).length;
+  $('#pdf-ocr-note').textContent = ocrDone === usable.length ? '全ページの文字認識が済んでいます' : `未処理の ${usable.length - ocrDone} ページを端末内でOCRします（並行処理）`;
   showSaveTarget();
   $('#pdf-dialog').showModal();
 };
@@ -414,7 +524,8 @@ $('#pdf-make').onclick = async () => {
   btn.disabled = true;
   const t0 = performance.now();
   try {
-    const list = [...pages];
+    titleJob++; // 題名の読み取りが後から名前を書き換えないように
+    const list = pages.filter(ready);
     // 1) OCR（済んでいるページは保存済みの結果を使う。残りは並行処理）
     if (searchable) {
       let done = list.filter(p => p.ocr && p.ocr.width === p.width).length;
@@ -438,8 +549,11 @@ $('#pdf-make').onclick = async () => {
       }
     }));
     const doc = currentDoc();
-    const blob = await buildPdf(images.map((img, i) => ({ ...img, ocr: searchable ? list[i].ocr : null })), doc.name);
-    const name = `${doc.name.replace(/[\\/:*?"<>|]/g, '_')}.pdf`;
+    const title = cleanName($('#pdf-name').value.replace(/\.pdf$/i, '')) || doc.name;
+    // 文書名が自動の名前のままなら、PDFの名前に合わせる
+    if (/^スキャン \d/.test(doc.name) && title !== doc.name) { doc.name = title; await db.putDoc(doc); }
+    const blob = await buildPdf(images.map((img, i) => ({ ...img, ocr: searchable ? list[i].ocr : null })), title);
+    const name = `${title}.pdf`;
     console.log('pdf ms', Math.round(performance.now() - t0));
     await showPdfResult(blob, name, searchable);
     await refresh();
@@ -459,7 +573,7 @@ async function showPdfResult(blob, name, searchable) {
   const link = $('#pdf-download');
   link.href = pdfUrl;
   link.download = name;
-  $('#pdf-info').textContent = `${name}　${pages.length}ページ・${(blob.size / 1024 / 1024).toFixed(1)}MB` + (searchable ? '・文字検索できます' : '');
+  $('#pdf-info').textContent = `${name}　${pages.filter(ready).length}ページ・${(blob.size / 1024 / 1024).toFixed(1)}MB` + (searchable ? '・文字検索できます' : '');
   const folder = await save.getFolder();
   $('#pdf-save-folder').hidden = !folder;
   $('#pdf-save-folder').textContent = folder ? `「${folder.name}」に保存` : '';
@@ -516,6 +630,7 @@ async function start() {
     } catch {}
   }
   await refresh();
+  processWaiting(); // 前回の続き（補正待ちのページ）があれば処理する
   runBackgroundOcr();
   // ブラウザーが空き容量不足でデータを消さないよう永続化を依頼
   navigator.storage?.persist?.().catch(() => {});
