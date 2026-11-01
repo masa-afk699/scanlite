@@ -59,13 +59,19 @@
       <button id="pdf-button" class="dark-button" disabled>PDFを作成</button>
       <button id="batch-button" class="light-button" disabled>まとめて設定</button>
     </section>
+    <section class="tools-row">
+      <input id="search" type="search" placeholder="文字でページを探す" autocomplete="off" aria-label="文字でページを探す">
+      <button id="text-export" type="button" disabled>文字を書き出す</button>
+    </section>
+    <p id="search-note" class="search-note" hidden></p>
     <section id="pages" class="pages" aria-live="polite"></section>
     <p id="storage" class="privacy-note storage" hidden></p>
     <p class="privacy-note">写真・PDF・認識テキストはすべてこのスマホの中で処理・保存します。<br>サーバーや外部サービスには送信しません（文字認識も端末内で動作）。</p>
 
     <dialog id="camera-dialog" class="camera-dialog">
       <video id="camera-video" playsinline muted></video>
-      <div class="camera-top"><span id="camera-count">0枚</span><label class="auto-toggle"><input type="checkbox" id="camera-auto" checked> 自動撮影</label></div>
+      <canvas id="camera-guide" class="camera-guide" aria-hidden="true"></canvas>
+      <div class="camera-top"><span id="camera-count">0枚</span><span class="camera-switches"><button id="camera-torch" class="auto-toggle" type="button" hidden aria-pressed="false">ライト</button><label class="auto-toggle"><input type="checkbox" id="camera-auto" checked> 自動撮影</label></span></div>
       <p id="camera-status" class="camera-status"></p>
       <div class="camera-bottom">
         <span></span>
@@ -96,7 +102,8 @@
         </div>
         <p class="dialog-note">誤りは直接書き換えて保存できます。行の数を変えずに直すと、PDFの文字検索にも反映されます。</p>
       </div>
-      <div class="view-foot"><button id="view-edit" type="button">範囲・補正</button></div>
+      <div class="view-foot"><button id="view-edit" type="button">範囲・補正</button><button id="view-retake" type="button">撮り直す</button><button id="view-rotate" type="button">↻ 回転</button></div>
+      <input id="retake-input" type="file" accept="image/*" capture="environment" hidden>
     </dialog>
 
     <dialog id="pdf-dialog">

@@ -1,5 +1,5 @@
 // オフライン動作用。自サイトのファイルだけをキャッシュし、外部への通信は行わない。
-const CACHE = 'scanlite-shell-v11';
+const CACHE = 'scanlite-shell-v12';
 // OCRモデルなど大きなファイルは別に保存し、アプリを更新しても消さない（毎回ダウンロードし直さないため）
 const MODELS = 'scanlite-models-v1';
 const FILES = [

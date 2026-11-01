@@ -5,7 +5,9 @@ const MOTION = 10;     // これ以上の変化で「動いた」とみなす（
 const STILL = 3.2;     // これ以下で「止まっている」とみなす
 const HOLD_MS = 900;   // 止まってから撮影するまでの時間
 
-export function createCamera({ dialog, video, status, shutter, autoToggle, counter, onCapture }) {
+import { detectPage } from './scan.js';
+
+export function createCamera({ dialog, video, status, shutter, autoToggle, counter, onCapture, guide, torch, subject = () => 'paper' }) {
   let stream = null, timer = null, prev = null, stillSince = 0, needMotion = false, busy = false, shots = 0;
   const probe = document.createElement('canvas');
   probe.width = 80; probe.height = 60;
@@ -28,6 +30,7 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
     }
     video.srcObject = stream;
     await video.play().catch(() => {});
+    setupTorch();
     prev = null; stillSince = 0; needMotion = false;
     say(autoToggle.checked ? 'ページを枠に入れて、手を止めると自動で撮影します' : 'シャッターを押して撮影します');
     timer = setInterval(watch, 180);
@@ -35,14 +38,58 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
 
   function close() {
     clearInterval(timer); timer = null;
+    clearGuide();
+    torchOn = false; torch.hidden = true; torch.setAttribute('aria-pressed', 'false');
     stream?.getTracks().forEach(t => t.stop());
     stream = null; video.srcObject = null;
     if (dialog.open) dialog.close();
   }
 
+  // ---------- ライト（対応している端末だけ） ----------
+  let torchOn = false;
+  function setupTorch() {
+    const track = stream?.getVideoTracks()[0];
+    const caps = track?.getCapabilities ? track.getCapabilities() : {};
+    torch.hidden = !caps.torch;
+  }
+  torch.onclick = async () => {
+    const track = stream?.getVideoTracks()[0];
+    if (!track) return;
+    torchOn = !torchOn;
+    try { await track.applyConstraints({ advanced: [{ torch: torchOn }] }); } catch { torchOn = false; }
+    torch.setAttribute('aria-pressed', String(torchOn));
+  };
+
+  // ---------- ページの枠をプレビューに重ねて表示 ----------
+  const small = document.createElement('canvas');
+  let tickCount = 0;
+  function clearGuide() { guide.getContext('2d').clearRect(0, 0, guide.width, guide.height); }
+  function drawGuide() {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw) return;
+    const k = 360 / Math.max(vw, vh);
+    small.width = Math.round(vw * k); small.height = Math.round(vh * k);
+    small.getContext('2d').drawImage(video, 0, 0, small.width, small.height);
+    let corners = null;
+    try { corners = detectPage(small, subject()); } catch {}
+    const r = guide.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+    if (guide.width !== Math.round(r.width * dpr)) { guide.width = Math.round(r.width * dpr); guide.height = Math.round(r.height * dpr); }
+    const g = guide.getContext('2d');
+    g.clearRect(0, 0, guide.width, guide.height);
+    if (!corners) return;
+    // 映像は object-fit: contain で表示しているので、その位置に合わせる
+    const s = Math.min(guide.width / vw, guide.height / vh), ox = (guide.width - vw * s) / 2, oy = (guide.height - vh * s) / 2;
+    g.beginPath();
+    corners.forEach(([x, y], i) => { const px = ox + x * vw * s, py = oy + y * vh * s; i ? g.lineTo(px, py) : g.moveTo(px, py); });
+    g.closePath();
+    g.fillStyle = 'rgba(184,237,113,0.16)'; g.fill();
+    g.lineWidth = 3 * dpr; g.strokeStyle = '#b8ed71'; g.stroke();
+  }
+
   // 小さく縮小した映像の前回との差で、動きと静止を判定する
   function watch() {
     if (!video.videoWidth || busy) return;
+    if (++tickCount % 2 === 0) drawGuide();
     pctx.drawImage(video, 0, 0, 80, 60);
     const d = pctx.getImageData(0, 0, 80, 60).data, cur = new Uint8Array(80 * 60);
     for (let i = 0, p = 0; p < cur.length; i += 4, p++) cur[p] = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8;
