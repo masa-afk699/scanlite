@@ -314,6 +314,85 @@ function screenLevels(d) {
   }
 }
 
+// ---------- 書類の背景を整える ----------
+function luma(d, W, H) {
+  const Y = new Uint8ClampedArray(W * H);
+  for (let p = 0, i = 0; p < Y.length; p++, i += 4) Y[p] = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8;
+  return Y;
+}
+
+// 白っぽい背景に文字が載った画像か（画面に表示した書類など）
+function looksLikeDocument(d) {
+  let bright = 0, sat = 0, n = 0;
+  for (let i = 0; i < d.length; i += 4 * 13) {
+    const mx = Math.max(d[i], d[i + 1], d[i + 2]), mn = Math.min(d[i], d[i + 1], d[i + 2]);
+    if (mx > 170) bright++;
+    sat += mx - mn; n++;
+  }
+  return bright / n > 0.6 && sat / n < 28;
+}
+
+// 背景のまだら・縞・薄い汚れを白にし、点状のゴミとページ端の線を消す。
+// binarize: 文字を黒・背景を白にくっきり分ける（白黒）
+function cleanDocument(d, W, H, { binarize }) {
+  const Y = luma(d, W, H);
+  // 3x3平均で判定する（細かい縞やJPEGのざらつきに引っぱられないように）
+  const S = new Uint8ClampedArray(W * H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    let s = 0, n = 0;
+    for (let dy = -1; dy <= 1; dy++) {
+      const yy = y + dy; if (yy < 0 || yy >= H) continue;
+      for (let dx = -1; dx <= 1; dx++) { const xx = x + dx; if (xx < 0 || xx >= W) continue; s += Y[yy * W + xx]; n++; }
+    }
+    S[y * W + x] = s / n;
+  }
+  const sample = [];
+  for (let p = 0; p < S.length; p += 7) sample.push(S[p]);
+  const t = Math.min(200, Math.max(90, otsu(sample)));
+  const lo = t - 20, hi = Math.min(245, t + 40);
+  for (let p = 0, i = 0; p < Y.length; p++, i += 4) {
+    if (binarize) {
+      const v = Math.max(0, Math.min(255, (Y[p] - lo) * 255 / (hi - lo)));
+      d[i] = d[i + 1] = d[i + 2] = S[p] >= hi ? 255 : v;
+    } else if (S[p] > t) {
+      const k = Math.min(1, (S[p] - t) / (hi - t));
+      d[i] += (255 - d[i]) * k; d[i + 1] += (255 - d[i + 1]) * k; d[i + 2] += (255 - d[i + 2]) * k;
+    }
+  }
+  // 点状のゴミ（文字にしては小さすぎる暗い点）を消す
+  const Y2 = luma(d, W, H), dark = new Uint8Array(W * H);
+  for (let p = 0; p < dark.length; p++) dark[p] = Y2[p] < 215 ? 1 : 0;
+  const maxArea = Math.max(4, Math.round((Math.max(W, H) / 1400) ** 2 * 9));
+  for (const c of components(dark, W, H)) {
+    // 小さすぎる点、または濃い芯のない薄いまだら（画面の縞・ざらつき）は文字ではない
+    let core = 255;
+    if (c.px.length > maxArea) for (const p of c.px) if (Y2[p] < core) core = Y2[p];
+    if (c.px.length > maxArea && core < 150) continue;
+    for (const p of c.px) d[p * 4] = d[p * 4 + 1] = d[p * 4 + 2] = 255;
+  }
+  // 線の判定は薄いグレーも含める（かすれた縁の線も消せるように）
+  for (let p = 0; p < dark.length; p++) dark[p] = d[p * 4] < 235 || d[p * 4 + 1] < 235 || d[p * 4 + 2] < 235 ? 1 : 0;
+  removeEdgeLines(d, W, H, dark);
+}
+
+// ページの縁に沿った長い線（元の紙の端・とじ目・画面の枠）を消す
+function removeEdgeLines(d, W, H, dark) {
+  const whiten = p => { d[p * 4] = d[p * 4 + 1] = d[p * 4 + 2] = 255; };
+  const mx = Math.round(W * 0.07), my = Math.round(H * 0.07);
+  const isDark = (x, y) => dark[y * W + x] || (x > 0 && dark[y * W + x - 1]) || (x < W - 1 && dark[y * W + x + 1]);
+  const isDarkV = (x, y) => dark[y * W + x] || (y > 0 && dark[(y - 1) * W + x]) || (y < H - 1 && dark[(y + 1) * W + x]);
+  for (const x of [...Array(mx).keys(), ...Array.from({ length: mx }, (_, i) => W - 1 - i)]) {
+    let run = 0, best = 0;
+    for (let y = 0; y < H; y++) { run = isDark(x, y) ? run + 1 : 0; if (run > best) best = run; }
+    if (best > H * 0.15) for (let y = 0; y < H; y++) for (let k = -2; k <= 2; k++) { const xx = x + k; if (xx >= 0 && xx < W && dark[y * W + xx]) whiten(y * W + xx); }
+  }
+  for (const y of [...Array(my).keys(), ...Array.from({ length: my }, (_, i) => H - 1 - i)]) {
+    let run = 0, best = 0;
+    for (let x = 0; x < W; x++) { run = isDarkV(x, y) ? run + 1 : 0; if (run > best) best = run; }
+    if (best > W * 0.15) for (let x = 0; x < W; x++) for (let k = -2; k <= 2; k++) { const yy = y + k; if (yy >= 0 && yy < H && dark[yy * W + x]) whiten(yy * W + x); }
+  }
+}
+
 // 色ムラ補正: 紙や文字に出る薄い色かぶり・まだらな色を消し、はっきりした色（印鑑・図・写真）は残す
 function removeColorBlotches(d, W, H) {
   const S = 8, gw = Math.ceil(W / S), gh = Math.ceil(H / S);
@@ -416,12 +495,21 @@ export function enhance(canvas, { filter, fingers, denoise, evenColor = true }) 
       const k = Math.min(1, Math.max(0, (yy / yb - 0.78) / 0.12));
       if (k > 0) { d[i] += (bg[i] - d[i]) * k; d[i + 1] += (bg[i + 1] - d[i + 1]) * k; d[i + 2] += (bg[i + 2] - d[i + 2]) * k; }
     }
+    // 画面に表示した書類（白っぽい背景に文字）なら、背景のまだら・縞を白にそろえる
+    if (looksLikeDocument(d)) {
+      for (let i = 0; i < d.length; i += 4) {
+        d[i] = Math.min(255, d[i] * 250 / Math.max(bg[i], 1));
+        d[i + 1] = Math.min(255, d[i + 1] * 250 / Math.max(bg[i + 1], 1));
+        d[i + 2] = Math.min(255, d[i + 2] * 250 / Math.max(bg[i + 2], 1));
+      }
+      cleanDocument(d, W, H, { binarize: false });
+    }
   } else if (filter !== 'none') {
     const bg = estimateBackground(canvas);
     // gray/color はなめらかに、bw は文字をくっきり（ほぼ2値）にする
     const gamma = filter === 'gray' ? 1.6 : 1.35, lut = new Uint8ClampedArray(256);
     for (let i = 0; i < 256; i++) {
-      lut[i] = filter === 'bw' ? Math.max(0, Math.min(255, (i - 150) * 255 / 70)) : 255 * Math.pow(i / 255, gamma);
+      lut[i] = filter === 'bw' ? i : 255 * Math.pow(i / 255, gamma);
     }
     for (let i = 0; i < d.length; i += 4) {
       const r = Math.min(255, d[i] * 250 / Math.max(bg[i], 1));
@@ -434,6 +522,7 @@ export function enhance(canvas, { filter, fingers, denoise, evenColor = true }) 
       }
     }
     if (filter === 'color' && evenColor) removeColorBlotches(d, W, H);
+    if (filter === 'bw' || filter === 'gray') cleanDocument(d, W, H, { binarize: filter === 'bw' });
     if (fingerMask) for (let p = 0; p < W * H; p++) if (fingerMask[p]) d[p * 4] = d[p * 4 + 1] = d[p * 4 + 2] = 255;
   }
 
