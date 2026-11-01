@@ -4,11 +4,14 @@
 export const MAX_SIDE = 2400;
 const tick = () => new Promise(r => setTimeout(r, 0));
 
+// Web Worker の中でも動くよう、document が無ければ OffscreenCanvas を使う
 function makeCanvas(w, h) {
+  if (typeof document === 'undefined') return new OffscreenCanvas(w, h);
   const c = document.createElement('canvas');
   c.width = w; c.height = h;
   return c;
 }
+const toJpeg = (c, q) => c.convertToBlob ? c.convertToBlob({ type: 'image/jpeg', quality: q }) : new Promise(r => c.toBlob(r, 'image/jpeg', q));
 const ctx2d = c => c.getContext('2d', { willReadFrequently: true });
 
 function shrink(canvas, longSide) {
@@ -265,8 +268,8 @@ export function demoire(canvas) {
   const src0 = ctx2d(canvas).getImageData(0, 0, W, H).data;
   // 書類なら明るさはぼかさない（文字が太らないように）。明るさの縞は補正の段階で紙の明るさで割って消す
   const doc = looksLikeDocument(src0, 150);
-  const b1 = ctx2d(blurred(canvas, r)).getImageData(0, 0, W, H).data;
-  const b2 = ctx2d(blurred(canvas, r * 3)).getImageData(0, 0, W, H).data;
+  const b1 = doc ? src0 : ctx2d(blurred(canvas, r)).getImageData(0, 0, W, H).data;
+  const b2 = doc ? src0 : ctx2d(blurred(canvas, r * 3)).getImageData(0, 0, W, H).data;
   // 色成分用: 縮小して強くぼかしてから元の大きさへ
   const sw = Math.max(8, Math.round(W / 6)), sh = Math.max(8, Math.round(H / 6));
   const small = blurred(canvas, Math.max(2, Math.max(sw, sh) / 90), sw, sh);
@@ -348,7 +351,7 @@ function flattenFine(d, W, H) {
     if (isText[p] || (x > 0 && isText[p - 1]) || (x < W - 1 && isText[p + 1]) || (y > 0 && isText[p - W]) || (y < H - 1 && isText[p + W])) mask[p] = 1;
   }
   // 積分画像で、紙の画素だけの平均を求める
-  const S = new Float64Array((W + 1) * (H + 1)), N = new Float64Array((W + 1) * (H + 1));
+  const S = new Int32Array((W + 1) * (H + 1)), N = new Int32Array((W + 1) * (H + 1));
   for (let y = 0; y < H; y++) {
     let rs = 0, rn = 0;
     for (let x = 0; x < W; x++) {
@@ -358,16 +361,18 @@ function flattenFine(d, W, H) {
       S[q] = S[q - W - 1] + rs; N[q] = N[q - W - 1] + rn;
     }
   }
+  const W1 = W + 1;
+  let bs = 0, bn = 0;
   const box = (x, y, r) => {
-    const x0 = Math.max(0, x - r), y0 = Math.max(0, y - r), x1 = Math.min(W, x + r + 1), y1 = Math.min(H, y + r + 1);
-    const a = y0 * (W + 1) + x0, b = y0 * (W + 1) + x1, c = y1 * (W + 1) + x0, e = y1 * (W + 1) + x1;
-    return [S[e] - S[b] - S[c] + S[a], N[e] - N[b] - N[c] + N[a]];
+    const x0 = x > r ? x - r : 0, y0 = y > r ? y - r : 0, x1 = x + r + 1 < W ? x + r + 1 : W, y1 = y + r + 1 < H ? y + r + 1 : H;
+    const a = y0 * W1 + x0, b = y0 * W1 + x1, c = y1 * W1 + x0, e = y1 * W1 + x1;
+    bs = S[e] - S[b] - S[c] + S[a]; bn = N[e] - N[b] - N[c] + N[a];
   };
-  const r1 = Math.max(1, Math.round(Math.max(W, H) / 1200)), r2 = r1 * 6, r3 = r1 * 24;
+  const r1 = Math.max(1, Math.round(Math.max(W, H) / 1200)), r2 = r1 * 6, r3 = r1 * 24, need = (2 * r1 + 1) ** 2 * 0.3;
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-    let [s, n] = box(x, y, r1);
-    if (n < (2 * r1 + 1) ** 2 * 0.3) { [s, n] = box(x, y, r2); if (n < 8) [s, n] = box(x, y, r3); }
-    paper[y * W + x] = n ? s / n : 250;
+    box(x, y, r1);
+    if (bn < need) { box(x, y, r2); if (bn < 8) box(x, y, r3); }
+    paper[y * W + x] = bn ? bs / bn : 250;
   }
   for (let p = 0, i = 0; p < paper.length; p++, i += 4) {
     const k = 250 / Math.max(150, paper[p]);
@@ -395,14 +400,15 @@ function cleanDocument(d, W, H, { binarize }) {
   flattenFine(d, W, H);
   const Y = luma(d, W, H);
   // 3x3平均で判定する（細かい縞やJPEGのざらつきに引っぱられないように）
-  const S = new Uint8ClampedArray(W * H);
-  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-    let s = 0, n = 0;
-    for (let dy = -1; dy <= 1; dy++) {
-      const yy = y + dy; if (yy < 0 || yy >= H) continue;
-      for (let dx = -1; dx <= 1; dx++) { const xx = x + dx; if (xx < 0 || xx >= W) continue; s += Y[yy * W + xx]; n++; }
-    }
-    S[y * W + x] = s / n;
+  const S = new Uint8ClampedArray(W * H), row = new Uint16Array(W * H);
+  // 横→縦の2回に分けて足し合わせる（速い）
+  for (let y = 0; y < H; y++) {
+    const o = y * W;
+    for (let x = 0; x < W; x++) row[o + x] = Y[o + x] + (x > 0 ? Y[o + x - 1] : Y[o + x]) + (x < W - 1 ? Y[o + x + 1] : Y[o + x]);
+  }
+  for (let y = 0; y < H; y++) {
+    const o = y * W, up = y > 0 ? o - W : o, dn = y < H - 1 ? o + W : o;
+    for (let x = 0; x < W; x++) S[o + x] = (row[up + x] + row[o + x] + row[dn + x]) / 9;
   }
   const sample = [];
   for (let p = 0; p < S.length; p += 7) sample.push(S[p]);
@@ -731,13 +737,13 @@ export async function processImage(original, opts) {
   await tick();
   let skew = 0;
   if (opts.deskew) { skew = detectSkew(canvas); canvas = rotateBy(canvas, skew); }
-  const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.86));
+  const blob = await toJpeg(canvas, 0.86);
   // 一覧表示用の小さな画像（大量のページでも一覧が重くならないように）
   const tk = Math.min(1, 420 / Math.max(canvas.width, canvas.height));
   const tc = makeCanvas(Math.max(1, Math.round(canvas.width * tk)), Math.max(1, Math.round(canvas.height * tk))), tx = ctx2d(tc);
   tx.imageSmoothingQuality = 'high';
   tx.drawImage(canvas, 0, 0, tc.width, tc.height);
-  const thumb = await new Promise(r => tc.toBlob(r, 'image/jpeg', 0.7));
+  const thumb = await toJpeg(tc, 0.7);
   return { blob, thumb, width: canvas.width, height: canvas.height, corners: corners || FULL_FRAME, skew };
 }
 
@@ -750,7 +756,7 @@ export async function cropTop(blob, frac = 0.4, maxSide = 1600) {
   x.imageSmoothingQuality = 'high';
   x.drawImage(bitmap, 0, 0, bitmap.width, h, 0, 0, c.width, c.height);
   bitmap.close?.();
-  return { blob: await new Promise(r => c.toBlob(r, 'image/jpeg', 0.9)), width: c.width, height: c.height / frac };
+  return { blob: await toJpeg(c, 0.9), width: c.width, height: c.height / frac };
 }
 
 // 元画像を保存用に整える。大きすぎる写真は長辺3200pxに縮めて容量を抑える（向きはここで確定）
@@ -763,5 +769,5 @@ export async function limitOriginal(blob, maxSide = 3200) {
   x.imageSmoothingQuality = 'high';
   x.drawImage(bitmap, 0, 0, c.width, c.height);
   bitmap.close?.();
-  return await new Promise(r => c.toBlob(r, 'image/jpeg', 0.9));
+  return await toJpeg(c, 0.9);
 }
