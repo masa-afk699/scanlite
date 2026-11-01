@@ -119,6 +119,7 @@ async function refresh() {
     img.loading = 'lazy';
     img.decoding = 'async';
     img.alt = `${index + 1}ページ目`;
+    img.onclick = () => openViewer(p.id, 'after');
     const meta = document.createElement('div');
     meta.className = 'page-meta';
     const label = document.createElement('span');
@@ -133,7 +134,7 @@ async function refresh() {
     tools.append(
       button('範囲・補正', () => openEditor(p)),
       button('◀ 前へ', () => move(index, -1)),
-      button('OCR', () => showOcr(p)),
+      button('文字', () => openViewer(p.id, 'text')),
       del,
     );
     card.append(img, meta, tools);
@@ -445,20 +446,104 @@ async function ocrPage(page, onProgress) {
   return ocr;
 }
 
-async function showOcr(page) {
-  $('#text-dialog').showModal();
-  $('#ocr-status').textContent = '日本語OCRを準備しています（端末内で処理します）';
-  $('#ocr-result').value = '';
+// ---------- ページの確認（補正後・元の写真・OCRの文字） ----------
+const viewer = { id: null, tab: 'after', url: null, job: 0 };
+const readyPages = () => pages.filter(ready);
+
+function openViewer(id, tab) {
+  viewer.id = id;
+  $('#view-dialog').showModal();
+  showViewer(tab);
+}
+
+async function showViewer(tab = viewer.tab) {
+  viewer.tab = tab;
+  const list = readyPages(), index = list.findIndex(p => p.id === viewer.id);
+  if (index < 0) { $('#view-dialog').close(); return; }
+  const page = await db.getPage(viewer.id) || list[index];
+  const job = ++viewer.job;
+  $('#view-title').textContent = `${index + 1} / ${list.length}`;
+  $('#view-prev').disabled = index === 0;
+  $('#view-next').disabled = index === list.length - 1;
+  for (const b of document.querySelectorAll('.view-tabs button')) b.classList.toggle('active', b.dataset.tab === tab);
+  const text = tab === 'text';
+  $('#view-image').hidden = text; $('#view-hint').hidden = text; $('#view-text').hidden = !text;
+  if (!text) {
+    if (viewer.url) URL.revokeObjectURL(viewer.url);
+    viewer.url = URL.createObjectURL(tab === 'before' ? (page.original || page.blob) : page.blob);
+    $('#view-img').src = viewer.url;
+    $('#view-img').alt = tab === 'before' ? '元の写真' : '補正後の画像';
+    $('#view-image').classList.remove('zoom');
+    return;
+  }
+  const has = page.ocr && page.ocr.width === page.width;
+  $('#ocr-result').value = has ? page.ocr.text : '';
+  $('#ocr-save').disabled = true;
+  $('#ocr-run').textContent = has ? '読み直す' : '読み取る';
+  $('#ocr-status').textContent = has ? (page.ocr.edited ? '修正済みの文字です' : '認識した文字です') : 'まだ文字を読み取っていません。';
+  if (!has) runViewerOcr(page, job);
+}
+
+async function runViewerOcr(page, job, force = false) {
+  const status = $('#ocr-status');
+  status.textContent = '文字を読み取っています（端末内で処理します）…';
   try {
-    const r = await ocrPage(page, p => { $('#ocr-status').textContent = `文字を認識しています… ${Math.round(p * 100)}%`; });
+    if (force) delete page.ocr;
+    const r = await ocrPage(page, p => { if (job === viewer.job) status.textContent = `文字を読み取っています… ${Math.round(p * 100)}%`; });
+    if (job !== viewer.job) return;
     $('#ocr-result').value = r.text;
-    $('#ocr-status').textContent = '認識しました';
-    await refresh();
+    $('#ocr-run').textContent = '読み直す';
+    $('#ocr-save').disabled = true;
+    status.textContent = '読み取りました。誤りは書き換えて保存できます。';
+    scheduleRefresh();
   } catch (e) {
     console.error(e);
-    $('#ocr-status').textContent = 'OCRを開始できませんでした。';
+    if (job === viewer.job) status.textContent = '文字を読み取れませんでした。';
   }
 }
+
+async function stepViewer(d) {
+  const list = readyPages(), index = list.findIndex(p => p.id === viewer.id);
+  const next = list[index + d];
+  if (next) { viewer.id = next.id; await showViewer(); }
+}
+
+$('#view-prev').onclick = () => stepViewer(-1);
+$('#view-next').onclick = () => stepViewer(1);
+for (const b of document.querySelectorAll('.view-tabs button')) b.onclick = () => showViewer(b.dataset.tab);
+$('#view-image').ondblclick = () => $('#view-image').classList.toggle('zoom');
+// 左右にスワイプしてページを移る（拡大中は除く）
+{
+  let sx = null, sy = 0;
+  const area = $('#view-image');
+  area.addEventListener('touchstart', e => { if (e.touches.length === 1) { sx = e.touches[0].clientX; sy = e.touches[0].clientY; } else sx = null; }, { passive: true });
+  area.addEventListener('touchend', e => {
+    if (sx === null || area.classList.contains('zoom') || (window.visualViewport && visualViewport.scale > 1.05)) return;
+    const dx = e.changedTouches[0].clientX - sx, dy = e.changedTouches[0].clientY - sy;
+    sx = null;
+    if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) stepViewer(dx < 0 ? 1 : -1);
+  }, { passive: true });
+}
+$('#view-dialog').addEventListener('close', () => { viewer.job++; if (viewer.url) { URL.revokeObjectURL(viewer.url); viewer.url = null; } $('#view-img').removeAttribute('src'); });
+$('#view-edit').onclick = async () => {
+  const page = await db.getPage(viewer.id);
+  $('#view-dialog').close();
+  if (page) openEditor(page);
+};
+$('#ocr-run').onclick = async () => { const page = await db.getPage(viewer.id); if (page) runViewerOcr(page, viewer.job, true); };
+$('#ocr-result').addEventListener('input', () => { $('#ocr-save').disabled = false; });
+$('#ocr-save').onclick = async () => {
+  const page = await db.getPage(viewer.id);
+  if (!page || !page.ocr) return;
+  const text = $('#ocr-result').value;
+  const rows = text.split('\n');
+  // 行の数が同じなら、各行の位置はそのままに文字だけ差し替える（PDFの検索文字にも反映）
+  if (rows.length === page.ocr.lines.length) page.ocr.lines = page.ocr.lines.map((l, i) => ({ ...l, text: rows[i].trim() }));
+  page.ocr = { ...page.ocr, text, edited: true };
+  await db.putPage(page);
+  $('#ocr-save').disabled = true;
+  $('#ocr-status').textContent = rows.length === page.ocr.lines.length ? '保存しました（PDFの文字検索にも使います）' : '保存しました（行の数が変わったため、PDFの文字検索は元の認識結果を使います）';
+};
 $('#ocr-copy').onclick = () => navigator.clipboard?.writeText($('#ocr-result').value).catch(() => {});
 
 // ---------- PDF ----------

@@ -74,7 +74,30 @@
       </div>
     </dialog>
 
-    <dialog id="text-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2>日本語OCR</h2><p id="ocr-status">文字を認識しています…</p><textarea id="ocr-result" readonly></textarea><button id="ocr-copy" class="dark-button" type="button">テキストをコピー</button></dialog>
+    <dialog id="view-dialog" class="view-dialog">
+      <div class="view-head">
+        <button id="view-prev" type="button" aria-label="前のページ">‹</button>
+        <span id="view-title">1 / 1</span>
+        <button id="view-next" type="button" aria-label="次のページ">›</button>
+        <form method="dialog"><button class="close" aria-label="閉じる">×</button></form>
+      </div>
+      <div class="view-tabs" role="tablist">
+        <button type="button" data-tab="after" class="active">補正後</button><button type="button" data-tab="before">元の写真</button><button type="button" data-tab="text">文字（OCR）</button>
+      </div>
+      <div id="view-image" class="view-image"><img id="view-img" alt=""></div>
+      <p id="view-hint" class="dialog-note">ダブルタップで拡大・縮小。補正が気になるときは「範囲・補正」で直せます。</p>
+      <div id="view-text" class="view-text" hidden>
+        <p id="ocr-status" class="dialog-note"></p>
+        <textarea id="ocr-result" spellcheck="false" aria-label="認識した文字"></textarea>
+        <div class="view-buttons">
+          <button id="ocr-run" type="button">読み取る</button>
+          <button id="ocr-copy" type="button">コピー</button>
+          <button id="ocr-save" type="button" class="primary" disabled>修正を保存</button>
+        </div>
+        <p class="dialog-note">誤りは直接書き換えて保存できます。行の数を変えずに直すと、PDFの文字検索にも反映されます。</p>
+      </div>
+      <div class="view-foot"><button id="view-edit" type="button">範囲・補正</button></div>
+    </dialog>
 
     <dialog id="pdf-dialog">
       <form method="dialog"><button class="close" aria-label="閉じる">×</button></form>
