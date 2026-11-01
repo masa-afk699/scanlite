@@ -248,7 +248,54 @@ function median9(a) {
   return a[4];
 }
 
-export function enhance(canvas, { filter, fingers, denoise }) {
+// 色ムラ補正: 紙や文字に出る薄い色かぶり・まだらな色を消し、はっきりした色（印鑑・図・写真）は残す
+function removeColorBlotches(d, W, H) {
+  const S = 8, gw = Math.ceil(W / S), gh = Math.ceil(H / S);
+  const cb = new Float32Array(gw * gh), cr = new Float32Array(gw * gh), n = new Float32Array(gw * gh);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = (y * W + x) * 4, g = ((y / S) | 0) * gw + ((x / S) | 0);
+    const r = d[i], gg = d[i + 1], b = d[i + 2];
+    cb[g] += -0.168736 * r - 0.331264 * gg + 0.5 * b;
+    cr[g] += 0.5 * r - 0.418688 * gg - 0.081312 * b;
+    n[g]++;
+  }
+  for (let g = 0; g < n.length; g++) { cb[g] /= n[g]; cr[g] /= n[g]; }
+  // 周囲と平均して、まだら模様をならす
+  const blur = a => {
+    const o = new Float32Array(a.length);
+    for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+      let s = 0, c = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const yy = y + dy, xx = x + dx;
+        if (yy < 0 || xx < 0 || yy >= gh || xx >= gw) continue;
+        s += a[yy * gw + xx]; c++;
+      }
+      o[y * gw + x] = s / c;
+    }
+    return o;
+  };
+  const sb = blur(cb), sr = blur(cr);
+  for (let y = 0; y < H; y++) {
+    const gy = Math.min(gh - 1, (y / S) | 0);
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4, g = gy * gw + Math.min(gw - 1, (x / S) | 0);
+      const r = d[i], gg = d[i + 1], b = d[i + 2];
+      const Y = 0.299 * r + 0.587 * gg + 0.114 * b;
+      const pcb = -0.168736 * r - 0.331264 * gg + 0.5 * b, pcr = 0.5 * r - 0.418688 * gg - 0.081312 * b;
+      // 周辺の色の濃さ。薄い色（ムラ）は0に、濃い色はそのまま
+      const local = Math.hypot(sb[g], sr[g]), own = Math.hypot(pcb, pcr);
+      const strength = Math.max(local, own * 0.6);
+      let k = Math.min(1, Math.max(0, (strength - 9) / 16));
+      if (Y > 215) k *= Math.max(0, (245 - Y) / 30); // 明るい紙の部分はより強く無彩色に
+      const ncb = pcb * k, ncr = pcr * k;
+      d[i] = Y + 1.402 * ncr;
+      d[i + 1] = Y - 0.344136 * ncb - 0.714136 * ncr;
+      d[i + 2] = Y + 1.772 * ncb;
+    }
+  }
+}
+
+export function enhance(canvas, { filter, fingers, denoise, evenColor = true }) {
   const W = canvas.width, H = canvas.height, x = ctx2d(canvas);
   const img = x.getImageData(0, 0, W, H), d = img.data;
 
@@ -294,18 +341,22 @@ export function enhance(canvas, { filter, fingers, denoise }) {
 
   if (filter !== 'none') {
     const bg = estimateBackground(canvas);
-    const gamma = filter === 'bw' ? 1.8 : 1.35, lut = new Uint8ClampedArray(256);
-    for (let i = 0; i < 256; i++) lut[i] = 255 * Math.pow(i / 255, gamma);
+    // gray/color はなめらかに、bw は文字をくっきり（ほぼ2値）にする
+    const gamma = filter === 'gray' ? 1.6 : 1.35, lut = new Uint8ClampedArray(256);
+    for (let i = 0; i < 256; i++) {
+      lut[i] = filter === 'bw' ? Math.max(0, Math.min(255, (i - 150) * 255 / 70)) : 255 * Math.pow(i / 255, gamma);
+    }
     for (let i = 0; i < d.length; i += 4) {
       const r = Math.min(255, d[i] * 250 / Math.max(bg[i], 1));
       const g = Math.min(255, d[i + 1] * 250 / Math.max(bg[i + 1], 1));
       const b = Math.min(255, d[i + 2] * 250 / Math.max(bg[i + 2], 1));
-      if (filter === 'bw') {
+      if (filter === 'bw' || filter === 'gray') {
         d[i] = d[i + 1] = d[i + 2] = lut[Math.round(0.299 * r + 0.587 * g + 0.114 * b)];
       } else {
         d[i] = lut[r | 0]; d[i + 1] = lut[g | 0]; d[i + 2] = lut[b | 0];
       }
     }
+    if (filter === 'color' && evenColor) removeColorBlotches(d, W, H);
     if (fingerMask) for (let p = 0; p < W * H; p++) if (fingerMask[p]) d[p * 4] = d[p * 4 + 1] = d[p * 4 + 2] = 255;
   }
 
@@ -440,7 +491,7 @@ export async function processImage(original, opts) {
   else if (Array.isArray(opts.crop)) corners = opts.crop;
   if (corners) { canvas = warp(canvas, corners); await tick(); }
   if (opts.half === 'left' || opts.half === 'right') canvas = cropHalf(canvas, opts.half);
-  enhance(canvas, { filter: opts.filter || 'none', fingers: !!opts.fingers, denoise: opts.denoise !== false });
+  enhance(canvas, { filter: opts.filter || 'none', fingers: !!opts.fingers, denoise: opts.denoise !== false, evenColor: opts.evenColor !== false });
   await tick();
   let skew = 0;
   if (opts.deskew) { skew = detectSkew(canvas); canvas = rotateBy(canvas, skew); }

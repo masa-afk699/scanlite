@@ -57,6 +57,7 @@
 
     <section class="actions">
       <button id="pdf-button" class="dark-button" disabled>PDFを作成</button>
+      <button id="batch-button" class="light-button" disabled>まとめて設定</button>
     </section>
     <section id="pages" class="pages" aria-live="polite"></section>
     <p class="privacy-note">写真・PDF・認識テキストはすべてこのスマホの中で処理・保存します。<br>サーバーや外部サービスには送信しません（文字認識も端末内で動作）。</p>
@@ -84,18 +85,43 @@
           <label><input type="radio" name="quality" value="normal"> 標準<small>画面で読む向け</small></label>
           <label><input type="radio" name="quality" value="small"> 軽量<small>メール添付向け</small></label>
         </fieldset>
-        <label class="check"><input type="checkbox" id="pdf-ocr"> 文字で検索できるPDFにする<small>各ページを端末内でOCRします（1ページ数秒）</small></label>
+        <label class="check"><input type="checkbox" id="pdf-ocr"> 文字で検索できるPDFにする<small id="pdf-ocr-note">未処理のページを端末内でOCRします</small></label>
+        <div class="save-target">
+          <p class="save-label">保存先　<strong id="save-target-name">ダウンロード（標準）</strong></p>
+          <div class="save-buttons" id="save-folder-buttons" hidden><button id="save-choose" type="button">フォルダを選ぶ</button><button id="save-reset" type="button" hidden>標準に戻す</button></div>
+          <p class="dialog-note" id="save-android-note" hidden>このブラウザーではフォルダを直接選べません。Chromeの「︙ → 設定 → ダウンロード」で保存先を変えるか、「保存先を確認する」をオンにすると、保存のたびに場所を選べます。</p>
+        </div>
         <button id="pdf-make" class="dark-button" type="button">作成する</button>
       </div>
       <div id="pdf-result" hidden>
         <p id="pdf-info"></p>
+        <button id="pdf-save-folder" class="dark-button link-button" type="button" hidden>選んだフォルダに保存</button>
         <a id="pdf-download" class="dark-button link-button" download>スマホに保存</a>
+        <button id="pdf-save-as" class="text-button" type="button" hidden>場所を選んで保存…</button>
+        <p id="pdf-saved" class="saved" hidden></p>
         <button id="pdf-share" class="text-button" type="button" hidden>他のアプリで開く…</button>
         <p class="dialog-note">「スマホに保存」はダウンロードフォルダに保存します。共有を選んだ場合だけ、選んだアプリにPDFが渡ります。</p>
       </div>
     </dialog>
 
-    <dialog id="edit-dialog" class="edit-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2>範囲と補正</h2><p class="dialog-note">四隅の丸をドラッグして、ページの範囲に合わせます。</p><div class="edit-stage"><canvas id="edit-canvas"></canvas></div><div class="edit-row"><button id="edit-rotate" type="button">↺ 回転</button><button id="edit-auto" type="button">自動検出</button><button id="edit-full" type="button">切り抜かない</button></div><div class="edit-options"><label><input type="checkbox" id="opt-deskew"> 傾きを補正</label><label><input type="checkbox" id="opt-fingers"> 指を消す</label><label><input type="checkbox" id="opt-denoise"> ノイズを除去</label><label>色 <select id="opt-filter"></select></label><label class="wide">見開き <select id="opt-half"><option value="">分けない</option><option value="right">右ページだけ</option><option value="left">左ページだけ</option></select></label></div><button id="edit-apply" class="dark-button" type="button">この設定で補正</button></dialog>
+    <dialog id="batch-dialog" class="batch-dialog">
+      <form method="dialog"><button class="close" aria-label="閉じる">×</button></form>
+      <h2>まとめて設定</h2>
+      <p class="dialog-note">この文書の全ページに同じ設定をかけます。「そのまま」の項目は変えません。</p>
+      <div class="batch-grid">
+        <label>色<select id="batch-filter"><option value="">そのまま</option><option value="color">カラー</option><option value="gray">グレースケール</option><option value="bw">白黒</option><option value="none">補正なし</option></select></label>
+        <label>色ムラ補正<select id="batch-even" class="tri"></select></label>
+        <label>傾き補正<select id="batch-deskew" class="tri"></select></label>
+        <label>ノイズ除去<select id="batch-denoise" class="tri"></select></label>
+        <label>指を消す<select id="batch-fingers" class="tri"></select></label>
+        <label>ページ端の切り抜き<select id="batch-crop" class="tri"></select></label>
+        <label>OCR（文字検索用）<select id="batch-ocr" class="tri"></select></label>
+      </div>
+      <p class="dialog-note">OCRを「する」にすると、裏で順番に文字認識を進めます。PDFを作るときに待たずに済みます。</p>
+      <button id="batch-apply" class="dark-button" type="button">全ページに適用</button>
+    </dialog>
+
+    <dialog id="edit-dialog" class="edit-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2>範囲と補正</h2><p class="dialog-note">四隅の丸をドラッグして、ページの範囲に合わせます。</p><div class="edit-stage"><canvas id="edit-canvas"></canvas></div><div class="edit-row"><button id="edit-rotate" type="button">↺ 回転</button><button id="edit-auto" type="button">自動検出</button><button id="edit-full" type="button">切り抜かない</button></div><div class="edit-options"><label><input type="checkbox" id="opt-deskew"> 傾きを補正</label><label><input type="checkbox" id="opt-fingers"> 指を消す</label><label><input type="checkbox" id="opt-denoise"> ノイズを除去</label><label><input type="checkbox" id="opt-even"> 色ムラを補正</label><label>色 <select id="opt-filter"></select></label><label class="wide">見開き <select id="opt-half"><option value="">分けない</option><option value="right">右ページだけ</option><option value="left">左ページだけ</option></select></label></div><button id="edit-apply" class="dark-button" type="button">この設定で補正</button></dialog>
   </main>
   <script src="app.js" type="module"></script>
 </body>
