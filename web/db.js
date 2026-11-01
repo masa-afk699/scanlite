@@ -25,6 +25,7 @@ const byOrder = (a, b) => (a.created - b.created) || (a.id - b.id);
 
 export const allPages = async () => (await run('pages', 'readonly', s => s.getAll())).sort(byOrder);
 export const pagesOf = async docId => (await allPages()).filter(p => p.docId === docId);
+export const getPage = id => run('pages', 'readonly', s => s.get(id));
 export const putPage = p => run('pages', 'readwrite', s => s.put(p));
 export const addPage = p => run('pages', 'readwrite', s => s.add(p));
 export const removePage = id => run('pages', 'readwrite', s => s.delete(id));
