@@ -1,9 +1,9 @@
 // オフライン動作用。自サイトのファイルだけをキャッシュし、外部への通信は行わない。
-const CACHE = 'scanlite-shell-v10';
+const CACHE = 'scanlite-shell-v11';
 // OCRモデルなど大きなファイルは別に保存し、アプリを更新しても消さない（毎回ダウンロードし直さないため）
 const MODELS = 'scanlite-models-v1';
 const FILES = [
-  './', './index.html', './style.css', './app.js', './scan.js', './db.js', './pdf.js', './ocr.js', './ocr-worker.js', './camera.js', './save.js', './manifest.webmanifest', './icon.svg', './icon-192.png', './icon-512.png',
+  './', './index.html', './style.css', './app.js', './scan.js', './db.js', './pdf.js', './ocr.js', './ocr-worker.js', './scan-worker.js', './camera.js', './save.js', './manifest.webmanifest', './icon.svg', './icon-192.png', './icon-512.png',
   './vendor/tesseract/tesseract.esm.min.js',
   './vendor/tesseract/worker.min.js',
   './vendor/tesseract/core/tesseract-core-simd-lstm.wasm.js',

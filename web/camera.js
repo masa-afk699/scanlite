@@ -64,14 +64,17 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
     }
   }
 
+  // 映像のいまのフレームをそのまま使う（静止画撮影に切り替えるより速く、シャッターがすぐ切れる）
   async function grab() {
-    const track = stream?.getVideoTracks()[0];
-    // 対応していれば高画質の静止画で撮る
-    if (track && 'ImageCapture' in window) {
-      try { return await new ImageCapture(track).takePhoto(); } catch {}
+    const w = video.videoWidth, h = video.videoHeight;
+    if (!w || !h) return null;
+    if (typeof OffscreenCanvas !== 'undefined') {
+      const c = new OffscreenCanvas(w, h);
+      c.getContext('2d').drawImage(video, 0, 0);
+      return await c.convertToBlob({ type: 'image/jpeg', quality: 0.92 });
     }
     const c = document.createElement('canvas');
-    c.width = video.videoWidth; c.height = video.videoHeight;
+    c.width = w; c.height = h;
     c.getContext('2d').drawImage(video, 0, 0);
     return await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92));
   }
@@ -80,12 +83,14 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
     if (busy || !stream) return;
     busy = true;
     try {
-      const blob = await grab();
-      if (!blob) return;
+      if (!video.videoWidth) return;
+      // 押した瞬間に反応を返してから、画像を保存する
       shots++;
       counter.textContent = `${shots}枚`;
       navigator.vibrate?.(30);
       dialog.classList.remove('flash'); void dialog.offsetWidth; dialog.classList.add('flash');
+      const blob = await grab();
+      if (!blob) { shots--; counter.textContent = `${shots}枚`; return; }
       onCapture(blob);
       needMotion = true; stillSince = 0;
       say(autoToggle.checked ? '撮影しました。次のページをめくってください' : '撮影しました');

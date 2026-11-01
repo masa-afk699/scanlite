@@ -1,5 +1,5 @@
 // ScanLite: すべての処理をブラウザー内で行う。撮影画像・PDF・OCR結果はネットワークに送らない。
-import { processImage, decode, drawRotated, detectPage, FULL_FRAME, recompress, limitOriginal, cropTop } from './scan.js';
+import { processImage as processHere, decode, drawRotated, detectPage, FULL_FRAME, recompress, limitOriginal as limitHere, cropTop } from './scan.js';
 import * as db from './db.js';
 import { buildPdf } from './pdf.js';
 import { recognize } from './ocr.js';
@@ -20,6 +20,41 @@ const MODE_TEXT = {
   document: { title: '書類をスキャン', help: '紙を置き換えて手を止めると、自動で撮影します。' },
   screen: { title: '画面をスキャン', help: 'PCやスマホの画面の四隅を見つけて、縞模様（モアレ）と色かぶりを抑えます。' },
 };
+
+// ---------- 画像補正のワーカー（別スレッド。端末のコア数に応じて最大2つ） ----------
+const SCAN_POOL = Math.max(1, Math.min(2, (navigator.hardwareConcurrency || 2) - 2));
+const scanWorkers = [];
+let scanSeq = 0, scanBroken = typeof OffscreenCanvas === 'undefined';
+function scanWorker() {
+  // いちばん空いているワーカーを使う
+  if (scanWorkers.length < SCAN_POOL) {
+    const w = new Worker(new URL('./scan-worker.js', import.meta.url), { type: 'module' });
+    w.jobs = new Map();
+    w.onmessage = ({ data: { id, result, error } }) => {
+      const job = w.jobs.get(id); if (!job) return;
+      w.jobs.delete(id);
+      error ? job.reject(new Error(error)) : job.resolve(result);
+    };
+    w.onerror = e => { scanBroken = true; for (const j of w.jobs.values()) j.reject(new Error(e.message || 'worker error')); w.jobs.clear(); };
+    scanWorkers.push(w);
+  }
+  return scanWorkers.reduce((a, b) => (b.jobs.size < a.jobs.size ? b : a));
+}
+async function inWorker(op, blob, opts, here) {
+  if (!scanBroken) {
+    try {
+      const w = scanWorker();
+      return await new Promise((resolve, reject) => { const id = ++scanSeq; w.jobs.set(id, { resolve, reject }); w.postMessage({ id, op, blob, opts }); });
+    } catch (e) {
+      // ワーカー自体が動かないときだけ、画面のスレッドで処理する
+      if (!scanBroken) throw e;
+      console.error('scan worker failed, using main thread', e);
+    }
+  }
+  return here();
+}
+const processImage = (blob, opts) => inWorker('process', blob, opts, () => processHere(blob, opts));
+const limitOriginal = blob => inWorker('limit', blob, null, () => limitHere(blob));
 
 const $ = s => document.querySelector(s);
 let docs = [], docId = null, pages = [], thumbUrls = [];
@@ -216,6 +251,19 @@ async function enqueue(blobs) {
 }
 
 let working = false;
+async function processOne(p) {
+  try {
+    if (!p.sized) { p.original = await limitOriginal(p.original); p.sized = true; }
+    Object.assign(p, await processImage(p.original, optionsOf(p)));
+  } catch (e) {
+    console.error(e);
+    p.failed = true;
+  }
+  p.waiting = false;
+  // 処理中に削除されたページは保存し直さない
+  if (await db.getPage(p.id)) await db.putPage(p);
+  scheduleRefresh();
+}
 async function processWaiting() {
   if (working) return;
   working = true;
@@ -225,18 +273,8 @@ async function processWaiting() {
       pending = waiting.length;
       showPending();
       if (!waiting.length) break;
-      const p = waiting[0];
-      try {
-        if (!p.sized) { p.original = await limitOriginal(p.original); p.sized = true; }
-        Object.assign(p, await processImage(p.original, optionsOf(p)));
-      } catch (e) {
-        console.error(e);
-        p.failed = true;
-      }
-      p.waiting = false;
-      // 処理中に削除されたページは保存し直さない
-      if (await db.getPage(p.id)) await db.putPage(p);
-      scheduleRefresh();
+      // 撮った順に、ワーカーの数だけ同時に補正する
+      await Promise.all(waiting.slice(0, scanBroken ? 1 : SCAN_POOL).map(processOne));
     }
   } finally {
     working = false;
@@ -397,16 +435,20 @@ $('#batch-apply').onclick = async () => {
   btn.disabled = true;
   const needImage = Object.keys(change).length > 0;
   const list = pages.filter(ready);
-  for (let i = 0; i < list.length; i++) {
-    const p = list[i];
-    if (ocr !== undefined) p.wantOcr = ocr;
-    if (needImage) {
-      btn.textContent = `補正しています… ${i + 1}/${list.length}`;
-      await reprocess(p, change, { quiet: true });
-    } else {
-      await db.putPage(p);
+  // ワーカーの数だけ同時に補正する
+  let next = 0, done = 0;
+  const lane = async () => {
+    while (next < list.length) {
+      const p = list[next++];
+      if (ocr !== undefined) p.wantOcr = ocr;
+      if (needImage) await reprocess(p, change, { quiet: true });
+      else await db.putPage(p);
+      done++;
+      if (needImage) btn.textContent = `補正しています… ${done}/${list.length}`;
     }
-  }
+  };
+  if (needImage) btn.textContent = `補正しています… 0/${list.length}`;
+  await Promise.all(Array.from({ length: needImage && !scanBroken ? SCAN_POOL : 1 }, lane));
   $('#batch-dialog').close();
   await refresh();
   runBackgroundOcr();
