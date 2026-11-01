@@ -132,7 +132,21 @@ async function refresh() {
   const root = $('#pages');
   const frag = document.createDocumentFragment();
   const button = (text, fn, cls) => { const b = document.createElement('button'); b.textContent = text; b.onclick = fn; if (cls) b.className = cls; return b; };
+  // 文字で探す: 読み取り済みの文字に含まれるページだけを出す
+  const query = $('#search').value.trim();
+  const norm = t => (t || '').replace(/\s+/g, '').toLowerCase();
+  const q = norm(query);
+  let hits = 0, unread = 0;
   pages.forEach((p, index) => {
+    let snippet = null;
+    if (q) {
+      if (!ready(p)) return;
+      if (!(p.ocr && p.ocr.width === p.width)) { unread++; return; }
+      const flat = p.ocr.text.replace(/\s+/g, ''), at = norm(flat).indexOf(q);
+      if (at < 0) return;
+      hits++;
+      snippet = { before: flat.slice(Math.max(0, at - 20), at), hit: flat.slice(at, at + q.length), after: flat.slice(at + q.length, at + q.length + 40) };
+    }
     const card = document.createElement('article');
     card.className = 'page-card';
     const del = button('削除', async () => { await db.removePage(p.id); await refresh(); }, 'danger');
@@ -172,9 +186,22 @@ async function refresh() {
       button('文字', () => openViewer(p.id, 'text')),
       del,
     );
-    card.append(img, meta, tools);
+    card.append(img, meta);
+    if (snippet) {
+      const sn = document.createElement('p');
+      sn.className = 'page-snippet';
+      const mark = document.createElement('mark'); mark.textContent = snippet.hit;
+      sn.append('…' + snippet.before, mark, snippet.after + '…');
+      sn.onclick = () => openViewer(p.id, 'text');
+      card.append(sn);
+    }
+    card.append(tools);
     frag.append(card);
   });
+  const note = $('#search-note');
+  note.hidden = !q;
+  if (q) note.textContent = `「${query}」が見つかったページ: ${hits}` + (unread ? `　（文字を読み取っていない ${unread} ページは対象外です。「まとめて設定」でOCRを「する」にすると探せます）` : '');
+  $('#text-export').disabled = !done;
   root.replaceChildren(frag);
   showStorage();
 }
@@ -305,6 +332,8 @@ const camera = createCamera({
   dialog: $('#camera-dialog'), video: $('#camera-video'), status: $('#camera-status'),
   shutter: $('#camera-shutter'), autoToggle: $('#camera-auto'), counter: $('#camera-count'),
   onCapture: blob => enqueue([blob]),
+  guide: $('#camera-guide'), torch: $('#camera-torch'),
+  subject: () => (mode === 'screen' ? 'screen' : 'paper'),
 });
 $('#camera-auto').checked = prefs.get('autoShutter', true);
 $('#camera-auto').addEventListener('change', e => prefs.set('autoShutter', e.target.checked));
@@ -587,6 +616,66 @@ $('#ocr-save').onclick = async () => {
   $('#ocr-status').textContent = rows.length === page.ocr.lines.length ? '保存しました（PDFの文字検索にも使います）' : '保存しました（行の数が変わったため、PDFの文字検索は元の認識結果を使います）';
 };
 $('#ocr-copy').onclick = () => navigator.clipboard?.writeText($('#ocr-result').value).catch(() => {});
+
+// ---------- 文字で探す ----------
+{
+  let t = null;
+  $('#search').addEventListener('input', () => { clearTimeout(t); t = setTimeout(refresh, 250); });
+}
+
+// ---------- 文字の書き出し（文書全体のOCR結果を .txt で保存） ----------
+$('#text-export').onclick = async () => {
+  const btn = $('#text-export'), list = pages.filter(ready);
+  if (!list.length) return;
+  btn.disabled = true;
+  try {
+    let done = 0;
+    const out = [];
+    for (const p of list) {
+      setBusy(`文字を読み取っています… ${done + 1}/${list.length}`);
+      const r = await ocrPage(p, () => {});
+      out.push(`--- ${++done}ページ ---\n${r.text.trim()}`);
+    }
+    setBusy('');
+    const doc = currentDoc();
+    const name = `${cleanName(doc.name) || 'scan'}.txt`;
+    const blob = new Blob([out.join('\n\n') + '\n'], { type: 'text/plain;charset=utf-8' });
+    const file = new File([blob], name, { type: 'text/plain' });
+    // 共有できる端末では共有シート、そうでなければダウンロード
+    if (navigator.canShare && navigator.canShare({ files: [file] }) && confirm('文字を書き出しました。他のアプリに渡しますか？（キャンセルでスマホに保存）')) {
+      await navigator.share({ files: [file], title: name }).catch(() => {});
+    } else {
+      const a = document.createElement('a'), url = URL.createObjectURL(blob);
+      a.href = url; a.download = name; document.body.append(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    }
+    scheduleRefresh();
+  } catch (e) {
+    console.error(e);
+    setBusy('文字を書き出せませんでした。');
+  } finally { btn.disabled = false; }
+};
+
+// ---------- 撮り直し・回転（確認画面から） ----------
+$('#view-retake').onclick = () => $('#retake-input').click();
+$('#retake-input').addEventListener('change', async e => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  const page = file && await db.getPage(viewer.id);
+  if (!page) return;
+  $('#view-dialog').close();
+  page.original = await limitOriginal(file);
+  page.sized = true;
+  page.crop = 'auto';
+  await reprocess(page, {});
+  openViewer(page.id, 'after');
+});
+$('#view-rotate').onclick = async () => {
+  const page = await db.getPage(viewer.id);
+  if (!page) return;
+  await reprocess(page, { rotation: ((page.rotation || 0) + 90) % 360, crop: 'auto' });
+  showViewer('after');
+};
 
 // ---------- PDF ----------
 let pdfUrl = null;
