@@ -134,7 +134,8 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
       // 押した瞬間に反応を返してから、画像を保存する
       shots++;
       counter.textContent = `${shots}枚`;
-      navigator.vibrate?.(30);
+      // 音は鳴らさず、振動で撮影を知らせる（映像のフレームを使うのでシャッター音も出ない）
+      navigator.vibrate?.([60, 40, 60]);
       dialog.classList.remove('flash'); void dialog.offsetWidth; dialog.classList.add('flash');
       const blob = await grab();
       if (!blob) { shots--; counter.textContent = `${shots}枚`; return; }
