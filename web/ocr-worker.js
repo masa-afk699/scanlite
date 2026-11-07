@@ -65,9 +65,9 @@ async function detect(bitmap) {
 }
 
 // ---------- 文字の認識 ----------
-async function read(bitmap, b) {
+async function read(bitmap, b, horizontalOnly = false) {
   const bw = b.x1 - b.x0, bh = b.y1 - b.y0;
-  const vertical = bh > bw * 1.5;
+  const vertical = !horizontalOnly && bh > bw * 1.5;
   // 縦書きの行は90度回して横書きとして読む
   const lw = vertical ? bh : bw, lh = vertical ? bw : bh;
   const w = Math.max(16, Math.min(3200, Math.round(48 * lw / lh)));
@@ -116,7 +116,29 @@ function order(lines) {
 // 1枚ずつ順番に処理する（同時に動かすとメモリを食うため）
 let queue = Promise.resolve();
 self.onmessage = e => { queue = queue.then(() => handle(e.data)); };
-async function handle({ id, blob }) {
+// 向きの判定: 候補の画像それぞれで行を読み、読み取りの確かさ（平均の確信度）を返す。
+// 逆さまや横倒しの文字は確信度が下がるので、いちばん高い向きが正しい向き
+async function orient(blobs) {
+  const scores = [];
+  for (const blob of blobs) {
+    const bitmap = await createImageBitmap(blob);
+    const boxes = (await detect(bitmap)).filter(b => Math.min(b.x1 - b.x0, b.y1 - b.y0) >= 8)
+      .sort((a, b) => (b.x1 - b.x0) * (b.y1 - b.y0) - (a.x1 - a.x0) * (a.y1 - a.y0)).slice(0, 12);
+    let sum = 0, n = 0;
+    // 横向きの行として読む（横倒しの文字は縦長の枠になり、読めずに確信度が下がる）
+    for (const b of boxes) { const r = await read(bitmap, b, true); sum += r.text ? r.conf : 0; n++; }
+    bitmap.close();
+    scores.push(n ? sum / n : 0);
+  }
+  return scores;
+}
+
+async function handle({ id, blob, orient: cands }) {
+  if (cands) {
+    try { await load(); self.postMessage({ id, result: await orient(cands) }); }
+    catch (err) { self.postMessage({ id, error: String(err && err.message || err) }); }
+    return;
+  }
   const progress = p => self.postMessage({ id, progress: p });
   try {
     progress(0);

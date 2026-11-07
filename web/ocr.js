@@ -66,6 +66,18 @@ function recognizePaddle(blob, onProgress) {
   });
 }
 
+// 向きの候補（画像）ごとに、文字として読めた確かさを返す。使えない端末では null
+export async function orientScores(blobs) {
+  if (paddleFailed) return null;
+  try {
+    return await new Promise((resolve, reject) => {
+      const id = ++seq;
+      jobs.set(id, { resolve, reject, onProgress: () => {} });
+      paddleWorker().postMessage({ id, orient: blobs });
+    });
+  } catch (e) { console.error(e); return null; }
+}
+
 // 返り値: { text, lines: [{ text, bbox: {x0,y0,x1,y1} }] }（座標は入力画像のピクセル）
 export async function recognize(blob, onProgress = () => {}) {
   if (!paddleFailed) {

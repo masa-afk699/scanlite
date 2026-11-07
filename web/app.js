@@ -1,8 +1,8 @@
 // ScanLite: すべての処理をブラウザー内で行う。撮影画像・PDF・OCR結果はネットワークに送らない。
-import { processImage as processHere, decode, drawRotated, detectPage, FULL_FRAME, recompress, limitOriginal as limitHere, cropTop } from './scan.js';
+import { processImage as processHere, decode, drawRotated, detectPage, FULL_FRAME, recompress, limitOriginal as limitHere, cropTop, orientCandidates } from './scan.js';
 import * as db from './db.js';
 import { buildPdf } from './pdf.js';
-import { recognize } from './ocr.js';
+import { recognize, orientScores } from './ocr.js';
 import { createCamera } from './camera.js';
 import * as save from './save.js';
 
@@ -55,6 +55,30 @@ async function inWorker(op, blob, opts, here) {
 }
 const processImage = (blob, opts) => inWorker('process', blob, opts, () => processHere(blob, opts));
 const limitOriginal = blob => inWorker('limit', blob, null, () => limitHere(blob));
+
+// 横倒しに写った写真の向きを決める（同じ写真から作る左右のページで1回だけ）。
+// 文字を読んで確かさの高い向きを選び、決めきれないときはスマホの傾き（撮影時）を使う
+const rotationCache = new Map();
+function decideRotation(p) {
+  const key = p.capture;
+  if (!rotationCache.has(key)) {
+    rotationCache.set(key, (async () => {
+      const split = !!p.half;
+      const g = await inWorker('orient', p.original, { split }, () => orientCandidates(p.original, split));
+      if (!g.need) return 0;
+      const s = await orientScores(g.cands), turns = [0, 90, 270];
+      if (s) {
+        const best = s.indexOf(Math.max(...s)), other = Math.max(...s.filter((_, i) => i !== best));
+        if (s[best] - other > 0.02) return turns[best];
+      }
+      // 文字で決めきれないときは、撮影時のスマホの傾き（横持ちの向き）で決める
+      if (typeof p.tilt === 'number' && Math.abs(p.tilt) > 1.5) return p.tilt > 0 ? 270 : 90;
+      return 0;
+    })().catch(e => { console.error(e); return 0; }));
+    if (rotationCache.size > 50) rotationCache.delete(rotationCache.keys().next().value);
+  }
+  return rotationCache.get(key);
+}
 
 const $ = s => document.querySelector(s);
 let docs = [], docId = null, pages = [], thumbUrls = [];
@@ -258,7 +282,7 @@ async function move(index, delta) {
 // 撮った写真はまず「補正待ち」としてすぐ端末に保存し、順番に補正する。
 // 大量に撮ってもメモリに溜めず、アプリを閉じても次回の起動で続きから処理する
 let seq = 0;
-async function enqueue(blobs) {
+async function enqueue(blobs, extra = {}) {
   const target = docId, split = mode === 'book' && $('#opt-split').checked;
   const halves = split ? ($('#opt-order').value === 'rtl' ? ['right', 'left'] : ['left', 'right']) : [null];
   for (const blob of blobs) {
@@ -268,6 +292,7 @@ async function enqueue(blobs) {
       await db.addPage({
         original: blob, ...defaultsFor(mode), half: halves[i], wantOcr: prefs.get('autoOcr', false),
         mode, docId: target, created: created + i / 10000, waiting: true,
+        capture: created, autoRotate: mode !== 'screen', tilt: extra.tilt ?? null,
       });
     }
     pending++;
@@ -281,6 +306,7 @@ let working = false;
 async function processOne(p) {
   try {
     if (!p.sized) { p.original = await limitOriginal(p.original); p.sized = true; }
+    if (p.autoRotate) { p.rotation = await decideRotation(p); p.autoRotate = false; }
     Object.assign(p, await processImage(p.original, optionsOf(p)));
   } catch (e) {
     console.error(e);
@@ -331,7 +357,7 @@ $('#opt-order').onchange = e => prefs.set('order', e.target.value);
 const camera = createCamera({
   dialog: $('#camera-dialog'), video: $('#camera-video'), status: $('#camera-status'),
   shutter: $('#camera-shutter'), autoToggle: $('#camera-auto'), counter: $('#camera-count'),
-  onCapture: blob => enqueue([blob]),
+  onCapture: (blob, info) => enqueue([blob], info),
   guide: $('#camera-guide'), torch: $('#camera-torch'),
   subject: () => (mode === 'screen' ? 'screen' : 'paper'),
 });
