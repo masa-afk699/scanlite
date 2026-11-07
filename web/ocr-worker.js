@@ -21,6 +21,13 @@ const canvas = (w, h) => new OffscreenCanvas(w, h);
 
 // ---------- 文字の検出 ----------
 async function detect(bitmap) {
+  const { prob, w, h, W, H } = await probMap(bitmap);
+  const n = w * h;
+  return regionsOf(prob, w, h, W, H, n);
+}
+
+// 文字らしさの地図（縮小した画像の画素ごとの確からしさ）
+async function probMap(bitmap) {
   const W = bitmap.width, H = bitmap.height;
   const k = Math.min(1, 1280 / Math.max(W, H));
   const w = Math.max(32, Math.round(W * k / 32) * 32), h = Math.max(32, Math.round(H * k / 32) * 32);
@@ -36,7 +43,10 @@ async function detect(bitmap) {
     input[2 * n + p] = (px[i] / 255 - mean[2]) / std[2];
   }
   const out = await det.run({ [det.inputNames[0]]: new ort.Tensor('float32', input, [1, 3, h, w]) });
-  const prob = out[det.outputNames[0]].data;
+  return { prob: out[det.outputNames[0]].data, w, h, W, H };
+}
+
+function regionsOf(prob, w, h, W, H, n) {
   // しきい値を超えた領域をまとめて、行の枠にする
   const label = new Int32Array(n).fill(-1), stack = [], boxes = [];
   for (let s = 0; s < n; s++) {
@@ -116,6 +126,57 @@ function order(lines) {
 // 1枚ずつ順番に処理する（同時に動かすとメモリを食うため）
 let queue = Promise.resolve();
 self.onmessage = e => { queue = queue.then(() => handle(e.data)); };
+// 行の位置: 検出した各行に直線を当てはめ、両端の点と太さを返す（ページの範囲と台形のゆがみを求めるのに使う）。
+// 座標は画像に対する割合
+async function textLines(blob, rotation) {
+  let bitmap = await createImageBitmap(blob);
+  if (rotation) {
+    const swap = rotation % 180 !== 0, c = new OffscreenCanvas(swap ? bitmap.height : bitmap.width, swap ? bitmap.width : bitmap.height), x = c.getContext('2d');
+    x.translate(c.width / 2, c.height / 2); x.rotate(rotation * Math.PI / 180); x.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
+    bitmap.close(); bitmap = c.transferToImageBitmap();
+  }
+  const { prob, w, h } = await probMap(bitmap);
+  bitmap.close();
+  const label = new Uint8Array(w * h), stack = [], lines = [];
+  for (let s0 = 0; s0 < w * h; s0++) {
+    if (prob[s0] <= 0.3 || label[s0]) continue;
+    const px = [];
+    label[s0] = 1; stack.push(s0);
+    while (stack.length) {
+      const p = stack.pop(); px.push(p);
+      const x = p % w, y = (p - x) / w;
+      if (x > 0 && prob[p - 1] > 0.3 && !label[p - 1]) { label[p - 1] = 1; stack.push(p - 1); }
+      if (x < w - 1 && prob[p + 1] > 0.3 && !label[p + 1]) { label[p + 1] = 1; stack.push(p + 1); }
+      if (y > 0 && prob[p - w] > 0.3 && !label[p - w]) { label[p - w] = 1; stack.push(p - w); }
+      if (y < h - 1 && prob[p + w] > 0.3 && !label[p + w]) { label[p + w] = 1; stack.push(p + w); }
+    }
+    if (px.length < 12) continue;
+    let mx = 0, my = 0;
+    for (const p of px) { mx += p % w; my += (p / w) | 0; }
+    mx /= px.length; my /= px.length;
+    let sxx = 0, sxy = 0, syy = 0;
+    for (const p of px) { const dx = p % w - mx, dy = ((p / w) | 0) - my; sxx += dx * dx; sxy += dx * dy; syy += dy * dy; }
+    const th = 0.5 * Math.atan2(2 * sxy, sxx - syy), ux = Math.cos(th), uy = Math.sin(th);
+    let t0 = Infinity, t1 = -Infinity;
+    for (const p of px) { const t = (p % w - mx) * ux + (((p / w) | 0) - my) * uy; if (t < t0) t0 = t; if (t > t1) t1 = t; }
+    const len = t1 - t0 + 1, thick = px.length / len;
+    if (len < thick * 2.5) continue;
+    // 行の中心線を10か所で求める（紙の反りで曲がった行をまっすぐに直すため）
+    const K = 10, sumS = new Float64Array(K), cnt = new Float64Array(K);
+    for (const p of px) {
+      const dx = p % w - mx, dy = ((p / w) | 0) - my, t = dx * ux + dy * uy, k = Math.min(K - 1, Math.floor((t - t0) / len * K));
+      sumS[k] += -dx * uy + dy * ux; cnt[k]++;
+    }
+    const pts = [];
+    for (let k = 0; k < K; k++) if (cnt[k]) {
+      const t = t0 + (k + 0.5) * len / K, sv = sumS[k] / cnt[k];
+      pts.push([(mx + ux * t - uy * sv) / w, (my + uy * t + ux * sv) / h]);
+    }
+    lines.push({ a: [(mx + ux * t0) / w, (my + uy * t0) / h], b: [(mx + ux * t1) / w, (my + uy * t1) / h], t: thick / Math.max(w, h), pts });
+  }
+  return lines;
+}
+
 // 向きの判定: 候補の画像それぞれで行を読み、読み取りの確かさ（平均の確信度）を返す。
 // 逆さまや横倒しの文字は確信度が下がるので、いちばん高い向きが正しい向き
 async function orient(blobs) {
@@ -133,7 +194,12 @@ async function orient(blobs) {
   return scores;
 }
 
-async function handle({ id, blob, orient: cands }) {
+async function handle({ id, blob, orient: cands, lines, rotation }) {
+  if (lines) {
+    try { await load(); self.postMessage({ id, result: await textLines(blob, rotation || 0) }); }
+    catch (err) { self.postMessage({ id, error: String(err && err.message || err) }); }
+    return;
+  }
   if (cands) {
     try { await load(); self.postMessage({ id, result: await orient(cands) }); }
     catch (err) { self.postMessage({ id, error: String(err && err.message || err) }); }

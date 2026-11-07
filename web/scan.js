@@ -807,6 +807,231 @@ export function enhance(canvas, { filter, fingers, denoise, evenColor = true }) 
   x.putImageData(img, 0, 0);
 }
 
+// 写真の縁に乗っていない辺の数（4なら、ページ全体が写真の中に収まって端まで見えている）
+function insideSides(c) {
+  const m = 0.02;
+  let n = 0;
+  for (let k = 0; k < 4; k++) {
+    const [ax, ay] = c[k], [bx, by] = c[(k + 1) % 4];
+    if (!(Math.max(ax, bx) < m || Math.min(ax, bx) > 1 - m || Math.max(ay, by) < m || Math.min(ay, by) > 1 - m)) n++;
+  }
+  return n;
+}
+
+// 4点を 左上・右上・右下・左下 の順に並べる
+function orderCorners(pts) {
+  const cx = pts.reduce((s, p) => s + p[0], 0) / 4, cy = pts.reduce((s, p) => s + p[1], 0) / 4;
+  const sorted = pts.slice().sort((a, b) => Math.atan2(a[1] - cy, a[0] - cx) - Math.atan2(b[1] - cy, b[0] - cx));
+  // atan2 の小さい順 = 左上(-135°付近)から時計回り
+  let start = 0, best = Infinity;
+  sorted.forEach((p, i) => { if (p[0] + p[1] < best) { best = p[0] + p[1]; start = i; } });
+  return [0, 1, 2, 3].map(k => sorted[(start + k) % 4]);
+}
+
+// 点の集まりに直線を当てはめる（外れた点を除きながら）。{ mx, my, dx, dy } 方向つき
+function fitLine(pts, tol, dir) {
+  let sel = pts;
+  let line = null;
+  for (let it = 0; it < 4 && sel.length >= 2; it++) {
+    let mx = 0, my = 0; for (const [x, y] of sel) { mx += x; my += y; } mx /= sel.length; my /= sel.length;
+    let dx, dy;
+    if (dir) { [dx, dy] = dir; } else {
+      let sxx = 0, sxy = 0, syy = 0; for (const [x, y] of sel) { sxx += (x - mx) ** 2; sxy += (x - mx) * (y - my); syy += (y - my) ** 2; }
+      const th = 0.5 * Math.atan2(2 * sxy, sxx - syy); dx = Math.cos(th); dy = Math.sin(th);
+    }
+    line = { mx, my, dx, dy };
+    const keep = sel.filter(([x, y]) => Math.abs((x - mx) * -dy + (y - my) * dx) < tol);
+    if (keep.length === sel.length || keep.length < Math.max(2, sel.length * 0.4)) break;
+    sel = keep;
+  }
+  return line;
+}
+const meet = (a, b) => {
+  const det = a.dx * b.dy - a.dy * b.dx;
+  if (Math.abs(det) < 1e-6) return null;
+  const t = ((b.mx - a.mx) * b.dy - (b.my - a.my) * b.dx) / det;
+  return [a.mx + a.dx * t, a.my + a.dy * t];
+};
+const shiftLine = (l, nx, ny, d) => ({ ...l, mx: l.mx + nx * d, my: l.my + ny * d });
+
+// ---------- 本文の行からページの範囲を求める ----------
+// 文字認識の検出で見つけた行（両端の点）から、本文のかたまりごとに四辺の直線を求める。
+// 本文の左右の端（行頭・行末）と最初・最後の行は印刷でまっすぐそろっているので、
+// 写真の台形のゆがみと傾きがわかる。lines: [{ a:[x,y], b:[x,y], t }]（割合）
+// 返り値: かたまりごとに { corners（余白を足した四隅・割合）, cx, wide }。行の多い順
+// 行が縦（縦書き）か。写真の向きを直したあとの行で判定する
+export function linesVertical(lines) {
+  let v = 0, t = 0;
+  for (const l of lines || []) { const dx = Math.abs(l.b[0] - l.a[0]), dy = Math.abs(l.b[1] - l.a[1]), len = Math.hypot(dx, dy); t += len; if (dy > dx) v += len; }
+  return t ? v > t / 2 : null;
+}
+
+export function linesQuads(lines, W, H) {
+  if (!lines || lines.length < 6) return [];
+  const S = Math.max(W, H);
+  let L = lines.map(l => {
+    const a = [l.a[0] * W, l.a[1] * H], b = [l.b[0] * W, l.b[1] * H];
+    return { a, b, t: l.t * S, len: Math.hypot(b[0] - a[0], b[1] - a[1]) };
+  });
+  // 縦書き（行が縦）なら x と y を入れかえて同じ処理をする
+  const vert = L.filter(l => Math.abs(l.b[1] - l.a[1]) > Math.abs(l.b[0] - l.a[0])).reduce((s, l) => s + l.len, 0);
+  const vertical = vert > L.reduce((s, l) => s + l.len, 0) / 2;
+  if (vertical) L = L.map(l => ({ ...l, a: [l.a[1], l.a[0]], b: [l.b[1], l.b[0]] }));
+  // 横向きの行だけ使い、左→右の順にそろえる
+  L = L.filter(l => Math.abs(l.b[1] - l.a[1]) < Math.abs(l.b[0] - l.a[0])).map(l => (l.a[0] <= l.b[0] ? l : { ...l, a: l.b, b: l.a }));
+  if (L.length < 6) return [];
+  // 行の間隔（上下に重なって並ぶ、いちばん近い行までの距離の中央値）。検出した行は実際の文字より細いので、間隔を目安にする
+  const midY = l => (l.a[1] + l.b[1]) / 2;
+  const gaps = [];
+  for (const p of L) {
+    let best = Infinity;
+    for (const q of L) {
+      if (q === p || Math.min(p.b[0], q.b[0]) - Math.max(p.a[0], q.a[0]) < Math.min(p.len, q.len) * 0.3) continue;
+      const dy = Math.abs(midY(q) - midY(p));
+      if (dy > 0 && dy < best) best = dy;
+    }
+    if (best < Infinity) gaps.push(best);
+  }
+  if (gaps.length < 4) return [];
+  gaps.sort((x, y) => x - y);
+  const pitch = gaps[gaps.length >> 1], cs = pitch * 0.6;
+  // 行どうしをつないで本文のかたまりにする（上下の行間は狭く、ページとページの間は広い）
+  const parent = L.map((_, i) => i), find = i => { while (parent[i] !== i) i = parent[i] = parent[parent[i]]; return i; };
+  for (let i = 0; i < L.length; i++) for (let j = i + 1; j < L.length; j++) {
+    const p = L[i], q = L[j];
+    const gapX = Math.max(p.a[0], q.a[0]) - Math.min(p.b[0], q.b[0]); // 負なら横方向に重なる
+    const yp = (p.a[1] + p.b[1]) / 2, yq = (q.a[1] + q.b[1]) / 2;
+    if (gapX < pitch * 1.2 && Math.abs(yp - yq) < pitch * 2.2) parent[find(i)] = find(j);
+  }
+  const groups = new Map();
+  L.forEach((l, i) => { const r = find(i); if (!groups.has(r)) groups.set(r, []); groups.get(r).push(l); });
+  const out = [];
+  for (const g of groups.values()) {
+    if (g.length < 5) continue;
+    const q = blockQuad(g, cs, pitch);
+    if (!q) continue;
+    let pts = q;
+    if (vertical) pts = pts.map(([x, y]) => [y, x]);
+    const corners = orderCorners(pts);
+    const qw = Math.hypot(corners[1][0] - corners[0][0], corners[1][1] - corners[0][1]), qh = Math.hypot(corners[3][0] - corners[0][0], corners[3][1] - corners[0][1]);
+    out.push({ corners: corners.map(([x, y]) => [Math.min(1, Math.max(0, x / W)), Math.min(1, Math.max(0, y / H))]), cx: corners.reduce((s, p) => s + p[0], 0) / 4 / W, wide: qw > qh * 1.1, n: g.length });
+  }
+  out.sort((a, b) => b.n - a.n);
+  return out.filter(q => q.n > out[0].n * 0.3);
+}
+
+// 1つの本文のかたまり（横向きの行の一覧）から、余白を足した四隅を求める
+function blockQuad(rows, cs, pitch) {
+  const maxLen = Math.max(...rows.map(r => r.len));
+  // 行頭・行末に直線を当てはめる（字下げ・短い行・見出しは外れ値として除く）
+  const leftLine = fitLine(rows.filter(r => r.len > maxLen * 0.4).map(r => r.a), pitch * 0.35);
+  const rightLine = fitLine(rows.filter(r => r.len > maxLen * 0.8).map(r => r.b), pitch * 0.35);
+  if (!leftLine || !rightLine) return null;
+  // 上下: 最初と最後の行の向きと位置（長い行の向きを使い、位置はいちばん外の行）
+  const mid = r => [(r.a[0] + r.b[0]) / 2, (r.a[1] + r.b[1]) / 2];
+  const dirOf = r => { const dx = r.b[0] - r.a[0], dy = r.b[1] - r.a[1], n = Math.hypot(dx, dy) || 1; return [dx / n, dy / n]; };
+  const long = rows.filter(r => r.len > maxLen * 0.6).sort((p, q) => mid(p)[1] - mid(q)[1]);
+  if (long.length < 2) return null;
+  const byY = rows.slice().sort((p, q) => mid(p)[1] - mid(q)[1]);
+  const first = byY[0], last = byY[byY.length - 1];
+  const [tdx, tdy] = dirOf(long[0]), [bdx, bdy] = dirOf(long[long.length - 1]);
+  // いちばん外の行を通り、近くの長い行と同じ向きの直線
+  const topLine = { mx: mid(first)[0], my: mid(first)[1], dx: tdx, dy: tdy };
+  const botLine = { mx: mid(last)[0], my: mid(last)[1], dx: bdx, dy: bdy };
+  // 当てはめた直線は向きだけ使い、位置はいちばん外にある行の端まで広げる（字下げ・見出しの文字を切らないように）。
+  // そこから行の間隔ほどの余白を足す
+  const ends = rows.flatMap(r => [r.a, r.b]);
+  const out = (l, sx, sy, m) => {
+    let nx = -l.dy, ny = l.dx; if (nx * sx + ny * sy < 0) { nx = -nx; ny = -ny; }
+    let far = -Infinity;
+    for (const [x, y] of ends) far = Math.max(far, (x - l.mx) * nx + (y - l.my) * ny);
+    return shiftLine(l, nx, ny, far + m);
+  };
+  const tl = out(topLine, 0, -1, pitch * 1.2), bl = out(botLine, 0, 1, pitch * 1.2);
+  const ll = out(leftLine, -1, 0, pitch), rl = out(rightLine, 1, 0, pitch);
+  const pts = [meet(tl, ll), meet(tl, rl), meet(bl, rl), meet(bl, ll)];
+  if (pts.some(p => !p)) return null;
+  return pts;
+}
+
+// ---------- 紙の反りの補正 ----------
+// 台形補正した画像の上で、各行の中心線が水平になるよう縦方向に画素をずらす。
+// 行と行の間はずれ量をなめらかにつなぐ。corners: 台形補正に使った四隅（割合）、size: 補正前の画像の大きさ
+function straightenLines(canvas, corners, size, lines) {
+  const W = canvas.width, H = canvas.height;
+  // 補正前の画像の座標 → 補正後の画像の座標（射影変換の逆）
+  const m = squareToQuad(corners.map(([x, y]) => [x * size.w, y * size.h]));
+  const A = [[m.a, m.b, m.c], [m.d, m.e, m.f], [m.g, m.h, 1]];
+  const det = A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1]) - A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0]) + A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
+  if (Math.abs(det) < 1e-12) return canvas;
+  const inv = [
+    [(A[1][1] * A[2][2] - A[1][2] * A[2][1]) / det, (A[0][2] * A[2][1] - A[0][1] * A[2][2]) / det, (A[0][1] * A[1][2] - A[0][2] * A[1][1]) / det],
+    [(A[1][2] * A[2][0] - A[1][0] * A[2][2]) / det, (A[0][0] * A[2][2] - A[0][2] * A[2][0]) / det, (A[0][2] * A[1][0] - A[0][0] * A[1][2]) / det],
+    [(A[1][0] * A[2][1] - A[1][1] * A[2][0]) / det, (A[0][1] * A[2][0] - A[0][0] * A[2][1]) / det, (A[0][0] * A[1][1] - A[0][1] * A[1][0]) / det],
+  ];
+  const toOut = ([x, y]) => {
+    const X = x * size.w, Y = y * size.h, z = inv[2][0] * X + inv[2][1] * Y + inv[2][2];
+    return [(inv[0][0] * X + inv[0][1] * Y + inv[0][2]) / z * W, (inv[1][0] * X + inv[1][1] * Y + inv[1][2]) / z * H];
+  };
+  // このページの中にある横向きの長い行だけ使う
+  const polys = [];
+  const ts = lines.map(l => l.t).sort((a, b) => a - b), tMed = ts[ts.length >> 1] || 0;
+  for (const l of lines) {
+    if (!l.pts || l.pts.length < 6 || l.t > tMed * 1.6) continue; // 2行がつながって検出されたものは使わない
+    const P = l.pts.map(toOut);
+    if (P.some(([x, y]) => x < -W * 0.02 || x > W * 1.02 || y < 0 || y > H)) continue;
+    const dx = P[P.length - 1][0] - P[0][0];
+    if (Math.abs(dx) < W * 0.3 || Math.abs(P[P.length - 1][1] - P[0][1]) > Math.abs(dx) * 0.3) continue;
+    if (dx < 0) P.reverse();
+    polys.push(P);
+  }
+  if (polys.length < 5) return canvas;
+  // 各行の、あるべき高さ（行のまっすぐな部分＝中央値）からのずれを列ごとに求める
+  const C = 48, colX = Array.from({ length: C + 1 }, (_, i) => i * W / C);
+  // 列ごとに、その列を通る行の（あるべき高さ, ずれ）の一覧を作る
+  const cols = colX.map(() => []);
+  let maxOff = 0;
+  for (const P of polys) {
+    const ys = P.map(p => p[1]).slice().sort((a, b) => a - b), base = ys[ys.length >> 1];
+    colX.forEach((x, c) => {
+      // 行の端より外は、端の曲がり方をそのまま延ばす（行の長さの1/4まで）
+      const span = P[P.length - 1][0] - P[0][0];
+      if (x < P[0][0] - span * 0.25 || x > P[P.length - 1][0] + span * 0.25) return;
+      let k = 1; while (k < P.length - 1 && x > P[k][0]) k++;
+      const t = (x - P[k - 1][0]) / (P[k][0] - P[k - 1][0] || 1), off = P[k - 1][1] + (P[k][1] - P[k - 1][1]) * t - base;
+      cols[c].push([base, off]);
+      maxOff = Math.max(maxOff, Math.abs(off));
+    });
+  }
+  cols.forEach(l => l.sort((a, b) => a[0] - b[0]));
+  if (maxOff < H * 0.003) return canvas; // ほとんど曲がっていない
+  const offAt = (c, y) => {
+    const l = cols[c];
+    if (!l.length) return 0;
+    if (y <= l[0][0]) return l[0][1];
+    if (y >= l[l.length - 1][0]) return l[l.length - 1][1];
+    let k = 1; while (k < l.length && l[k][0] < y) k++;
+    const t = (y - l[k - 1][0]) / (l[k][0] - l[k - 1][0] || 1);
+    return l[k - 1][1] + (l[k][1] - l[k - 1][1]) * t;
+  };
+  // 出力の各画素 (x, y) は、元の (x, y + ずれ) から取る。ずれは上下の行の間で直線的につなぐ
+  const src = ctx2d(canvas).getImageData(0, 0, W, H).data;
+  const out = makeCanvas(W, H), octx = ctx2d(out), dst = octx.createImageData(W, H), o = dst.data;
+  const colOff = new Float32Array(C + 1);
+  for (let y = 0; y < H; y++) {
+    for (let c = 0; c <= C; c++) colOff[c] = offAt(c, y);
+    for (let x = 0; x < W; x++) {
+      const cf = x / W * C, c0 = Math.min(C - 1, cf | 0), t = cf - c0;
+      let sy = y + colOff[c0] + (colOff[c0 + 1] - colOff[c0]) * t;
+      sy = Math.min(H - 1.001, Math.max(0, sy));
+      const y0 = sy | 0, fy = sy - y0, i0 = (y0 * W + x) * 4, i1b = i0 + W * 4, oi = (y * W + x) * 4;
+      o[oi] = src[i0] + (src[i1b] - src[i0]) * fy; o[oi + 1] = src[i0 + 1] + (src[i1b + 1] - src[i0 + 1]) * fy; o[oi + 2] = src[i0 + 2] + (src[i1b + 2] - src[i0 + 2]) * fy; o[oi + 3] = 255;
+    }
+  }
+  octx.putImageData(dst, 0, 0);
+  return out;
+}
+
 // ---------- 文字のかたまり（本文の範囲） ----------
 // 補正後の画像から、文字や図がある範囲を求め、余白を少し残して切り抜く範囲（割合の四隅）を返す。
 // ページの外の机や物が残ったときや、余白が広すぎるときに使う。切り取る量が少なければ null
@@ -942,17 +1167,37 @@ export async function processImage(original, opts) {
   let canvas = drawRotated(bitmap, opts.rotation || 0, maxSide);
   bitmap.close?.();
   await tick();
-  let corners = null;
-  if (opts.crop === 'auto') corners = detectPage(canvas, opts.subject);
-  else if (Array.isArray(opts.crop)) corners = opts.crop;
+  let corners = null, perPage = Array.isArray(opts.crop) && !!opts.perPage, fromLines = false;
+  if (opts.crop === 'auto') {
+    corners = detectPage(canvas, opts.subject);
+    // ページの端がはっきり写っていない（白い机に白い紙、ページが写真からはみ出す等）ときは、
+    // 本文の行の並びからページの範囲と台形のゆがみを求める。見開きは左右のページを別々に求める
+    if (opts.subject !== 'screen' && opts.lines && (!corners || insideSides(corners) < 3)) {
+      const blocks = linesQuads(opts.lines, canvas.width, canvas.height);
+      let pick = null;
+      if (opts.half && blocks.length >= 2) {
+        const two = blocks.slice(0, 2).sort((a, b) => a.cx - b.cx);
+        pick = opts.half === 'left' ? two[0] : two[1];
+        perPage = true;
+      } else if (!opts.half && blocks.length >= 2 && blocks[1].n > blocks[0].n * 0.5) {
+        // 1ページとして撮った見開き: 左右のページをまとめた範囲
+        const [l, r] = blocks.slice(0, 2).sort((a, b) => a.cx - b.cx);
+        pick = { corners: [l.corners[0], r.corners[1], r.corners[2], l.corners[3]] };
+      } else if (blocks.length && (!opts.half || blocks[0].wide)) pick = blocks[0];
+      if (pick) { corners = pick.corners; fromLines = true; }
+    }
+  } else if (Array.isArray(opts.crop)) corners = opts.crop;
+  const before = { w: canvas.width, h: canvas.height };
   if (corners) { canvas = warp(canvas, corners, maxSide); await tick(); }
-  if (opts.half === 'left' || opts.half === 'right') canvas = cropHalf(canvas, opts.half);
+  // 紙の反りで曲がった行をまっすぐにする（行の位置がわかっているとき）
+  if (corners && fromLines) { canvas = straightenLines(canvas, corners, before, opts.lines); await tick(); }
+  if ((opts.half === 'left' || opts.half === 'right') && !perPage) canvas = cropHalf(canvas, opts.half);
   if (opts.moire) { demoire(canvas); await tick(); }
   enhance(canvas, { filter: opts.filter || 'none', fingers: !!opts.fingers, denoise: opts.denoise !== false, evenColor: opts.evenColor !== false });
   await tick();
   let skew = 0;
   // 文字のかたまりに合わせて切り抜き、台形のゆがみも直す（ページの端が見つからなかったとき・余白が多いとき）
-  if (opts.crop === 'auto' && opts.subject !== 'screen' && opts.filter !== 'none') {
+  if (opts.crop === 'auto' && !perPage && !fromLines && opts.subject !== 'screen' && opts.filter !== 'none') {
     const q = textBlock(canvas);
     if (q) { canvas = warp(canvas, q, Math.max(canvas.width, canvas.height)); await tick(); }
   }
@@ -964,7 +1209,7 @@ export async function processImage(original, opts) {
   tx.imageSmoothingQuality = 'high';
   tx.drawImage(canvas, 0, 0, tc.width, tc.height);
   const thumb = await toJpeg(tc, 0.7);
-  return { blob, thumb, width: canvas.width, height: canvas.height, corners: corners || FULL_FRAME, skew };
+  return { blob, thumb, width: canvas.width, height: canvas.height, corners: corners || FULL_FRAME, skew, perPage };
 }
 
 // ---------- 向きの自動判定 ----------
