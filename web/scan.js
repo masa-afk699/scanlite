@@ -947,8 +947,9 @@ function blockQuad(rows, cs, pitch) {
     for (const [x, y] of ends) far = Math.max(far, (x - l.mx) * nx + (y - l.my) * ny);
     return shiftLine(l, nx, ny, far + m);
   };
-  const tl = out(topLine, 0, -1, pitch * 1.2), bl = out(botLine, 0, 1, pitch * 1.2);
-  const ll = out(leftLine, -1, 0, pitch), rl = out(rightLine, 1, 0, pitch);
+  // 上下は広めに取り、ページ番号や柱（本文から少し離れた小さな文字）も入るようにする。
+  const tl = out(topLine, 0, -1, pitch * 2.8), bl = out(botLine, 0, 1, pitch * 2.8);
+  const ll = out(leftLine, -1, 0, pitch * 1.3), rl = out(rightLine, 1, 0, pitch * 1.3);
   const pts = [meet(tl, ll), meet(tl, rl), meet(bl, rl), meet(bl, ll)];
   if (pts.some(p => !p)) return null;
   return pts;
@@ -1050,7 +1051,7 @@ export function textBlock(canvas) {
   // 小さな点（ゴミ）は数えず、文字のかたまりが占める範囲を求める
   let x0 = w, y0 = h, x1 = -1, y1 = -1, total = 0;
   for (const c of components(mask, w, h)) {
-    if (c.px.length < w * h * 0.002) continue;
+    if (c.px.length < w * h * 0.0002) continue; // ページ番号くらいの小さな文字は残す
     total += c.px.length;
     x0 = Math.min(x0, c.minX); y0 = Math.min(y0, c.minY); x1 = Math.max(x1, c.maxX); y1 = Math.max(y1, c.maxY);
   }
@@ -1197,7 +1198,7 @@ export async function processImage(original, opts) {
   await tick();
   let skew = 0;
   // 文字のかたまりに合わせて切り抜き、台形のゆがみも直す（ページの端が見つからなかったとき・余白が多いとき）
-  if (opts.crop === 'auto' && !perPage && !fromLines && opts.subject !== 'screen' && opts.filter !== 'none') {
+  if (opts.crop === 'auto' && (fromLines || !perPage) && opts.subject !== 'screen' && opts.filter !== 'none') {
     const q = textBlock(canvas);
     if (q) { canvas = warp(canvas, q, Math.max(canvas.width, canvas.height)); await tick(); }
   }
