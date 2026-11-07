@@ -283,7 +283,7 @@ async function move(index, delta) {
 // 大量に撮ってもメモリに溜めず、アプリを閉じても次回の起動で続きから処理する
 let seq = 0;
 async function enqueue(blobs, extra = {}) {
-  const target = docId, split = mode === 'book' && $('#opt-split').checked;
+  const target = docId, split = mode !== 'screen' && $('#opt-split').checked;
   const halves = split ? ($('#opt-order').value === 'rtl' ? ['right', 'left'] : ['left', 'right']) : [null];
   for (const blob of blobs) {
     if (blob.type && !blob.type.startsWith('image/')) continue;
@@ -345,7 +345,7 @@ function applyMode() {
   document.querySelectorAll('.mode').forEach(x => x.classList.toggle('active', x.dataset.mode === mode));
   $('#mode-title').textContent = MODE_TEXT[mode].title;
   $('#mode-help').textContent = MODE_TEXT[mode].help;
-  $('#spread-options').hidden = mode !== 'book';
+  $('#spread-options').hidden = mode === 'screen';
 }
 document.querySelectorAll('.mode').forEach(b => b.addEventListener('click', () => { mode = b.dataset.mode; prefs.set('mode', mode); applyMode(); }));
 $('#opt-split').checked = prefs.get('split', false);
@@ -366,16 +366,18 @@ $('#camera-auto').addEventListener('change', e => prefs.set('autoShutter', e.tar
 // 撮影中でも見開き（2ページ同時）に切り替えられるボタン。今のモードも表示して取り違えを防ぐ
 function syncCameraBar() {
   $('#camera-mode').textContent = { book: '本', document: '書類', screen: '画面' }[mode];
-  $('#camera-split').hidden = mode !== 'book';
-  $('#camera-split').setAttribute('aria-pressed', String($('#opt-split').checked));
+  $('#camera-pages').hidden = mode === 'screen';
+  const two = $('#opt-split').checked;
+  document.querySelectorAll('#camera-pages button').forEach(b => b.setAttribute('aria-checked', String((b.dataset.pages === '2') === two)));
 }
-$('#camera-split').onclick = () => {
-  const on = !$('#opt-split').checked;
+// 撮影中でも「1ページ」「2ページ（見開き）」をいつでも切り替えられる
+document.querySelectorAll('#camera-pages button').forEach(b => b.onclick = () => {
+  const on = b.dataset.pages === '2';
   $('#opt-split').checked = on;
   prefs.set('split', on);
   syncCameraBar();
-  $('#camera-status').textContent = on ? '見開きを2ページに分けて保存します' : '1ページずつ保存します';
-};
+  $('#camera-status').textContent = on ? '見開きを撮ると、左右2ページに分けて保存します' : '1ページずつ保存します';
+});
 $('#camera-button').onclick = () => {
   if (!navigator.mediaDevices?.getUserMedia) { $('#camera-input').click(); return; }
   syncCameraBar();
