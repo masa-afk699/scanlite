@@ -22,7 +22,11 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
     try {
       stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } },
+        // できるだけ高い解像度で（4:3の全画角→4K→ブラウザーに任せる、の順に試す）
+        video: {
+          facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 },
+          advanced: [{ width: 4032, height: 3024 }, { width: 4000, height: 3000 }, { width: 3264, height: 2448 }],
+        },
       });
     } catch (e) {
       say('カメラを使えませんでした。ブラウザーの設定でカメラを許可してください。');

@@ -337,8 +337,22 @@ const camera = createCamera({
 });
 $('#camera-auto').checked = prefs.get('autoShutter', true);
 $('#camera-auto').addEventListener('change', e => prefs.set('autoShutter', e.target.checked));
+// 撮影中でも見開き（2ページ同時）に切り替えられるボタン。今のモードも表示して取り違えを防ぐ
+function syncCameraBar() {
+  $('#camera-mode').textContent = { book: '本', document: '書類', screen: '画面' }[mode];
+  $('#camera-split').hidden = mode !== 'book';
+  $('#camera-split').setAttribute('aria-pressed', String($('#opt-split').checked));
+}
+$('#camera-split').onclick = () => {
+  const on = !$('#opt-split').checked;
+  $('#opt-split').checked = on;
+  prefs.set('split', on);
+  syncCameraBar();
+  $('#camera-status').textContent = on ? '見開きを2ページに分けて保存します' : '1ページずつ保存します';
+};
 $('#camera-button').onclick = () => {
   if (!navigator.mediaDevices?.getUserMedia) { $('#camera-input').click(); return; }
+  syncCameraBar();
   camera.open();
 };
 
