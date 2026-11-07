@@ -144,6 +144,26 @@ export function detectPage(canvas, subject = 'paper') {
     if (q && (!best || q.score > best.score)) best = q;
   }
   if (!best) return null;
+  // 写真の中ほどを通る辺は、内と外で明るさか色がはっきり違うはず（紙の端）。
+  // 違いがなければ、照明の明暗で紙の途中を区切っただけなので使わない
+  const m = Math.min(w, h) * 0.02, off = Math.max(3, Math.round(Math.min(w, h) * 0.03));
+  const at = (x, y) => { const i = (Math.min(h - 1, Math.max(0, Math.round(y))) * w + Math.min(w - 1, Math.max(0, Math.round(x)))) * 4; return [d[i], d[i + 1], d[i + 2]]; };
+  const cx = best.corners.reduce((s, c) => s + c[0], 0) / 4, cy = best.corners.reduce((s, c) => s + c[1], 0) / 4;
+  for (let k = 0; k < 4; k++) {
+    const [ax, ay] = best.corners[k], [bx, by] = best.corners[(k + 1) % 4];
+    const onBorder = (Math.max(ax, bx) < m) || (Math.min(ax, bx) > w - m) || (Math.max(ay, by) < m) || (Math.min(ay, by) > h - m);
+    if (onBorder) continue;
+    const len = Math.hypot(bx - ax, by - ay) || 1;
+    let nx = -(by - ay) / len, ny = (bx - ax) / len;
+    if ((cx - ax) * nx + (cy - ay) * ny < 0) { nx = -nx; ny = -ny; } // 内向きに
+    let diff = 0, n = 0;
+    for (let t = 0.15; t <= 0.85; t += 0.05) {
+      const px = ax + (bx - ax) * t, py = ay + (by - ay) * t;
+      const a = at(px + nx * off, py + ny * off), b = at(px - nx * off, py - ny * off);
+      diff += Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2]); n++;
+    }
+    if (diff / n < 40) return null;
+  }
   return best.corners.map(([x, y]) => [Math.min(1, Math.max(0, x / w)), Math.min(1, Math.max(0, y / h))]);
 }
 
@@ -527,8 +547,8 @@ function documentTone(d, Y) {
   const paper = pct(0.6), black = Math.min(pct(0.004), paper - 90);
   const white = Math.max(black + 60, paper - 16), k = 255 / (white - black);
   const lut = new Uint8ClampedArray(256);
-  // 芯は真っ黒にせず濃いグレーに、中間調は少し明るく（印刷物のような細い線に見せる）
-  for (let v = 0; v < 256; v++) { const t = Math.min(1, Math.max(0, (v - black) * k / 255)); lut[v] = 24 + 231 * Math.pow(t, 0.85); }
+  // 芯はほぼ黒に、中間調は少し濃く（小さい文字やかすれた文字も読みやすく）
+  for (let v = 0; v < 256; v++) { const t = Math.min(1, Math.max(0, (v - black) * k / 255)); lut[v] = 8 + 247 * Math.pow(t, 1.15); }
   for (let i = 0; i < d.length; i += 4) { d[i] = lut[d[i]]; d[i + 1] = lut[d[i + 1]]; d[i + 2] = lut[d[i + 2]]; }
 }
 
@@ -787,6 +807,36 @@ export function enhance(canvas, { filter, fingers, denoise, evenColor = true }) 
   x.putImageData(img, 0, 0);
 }
 
+// ---------- 文字のかたまり（本文の範囲） ----------
+// 補正後の画像から、文字や図がある範囲を求め、余白を少し残して切り抜く範囲（割合の四隅）を返す。
+// ページの外の机や物が残ったときや、余白が広すぎるときに使う。切り取る量が少なければ null
+export function textBlock(canvas) {
+  const img = shrink(canvas, 600), { width: w, height: h, data: d } = img;
+  let mask = new Uint8Array(w * h);
+  for (let p = 0, i = 0; p < mask.length; p++, i += 4) mask[p] = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8 < 170 ? 1 : 0;
+  // 端にかかった大きな暗い部分（指・机・ページの外の物）は本文ではない
+  const big = Math.max(w, h) / 30;
+  for (const c of components(mask, w, h)) {
+    if (c.minX > 0 && c.minY > 0 && c.maxX < w - 1 && c.maxY < h - 1) continue;
+    if (Math.max(c.maxX - c.minX, c.maxY - c.minY) > big || c.px.length < 30) for (const p of c.px) mask[p] = 0;
+  }
+  const r = Math.max(3, Math.round(Math.max(w, h) / 70));
+  mask = morph(mask, w, h, r, true); mask = morph(mask, w, h, r, false);
+  // 小さな点（ゴミ）は数えず、文字のかたまりが占める範囲を求める
+  let x0 = w, y0 = h, x1 = -1, y1 = -1, total = 0;
+  for (const c of components(mask, w, h)) {
+    if (c.px.length < w * h * 0.002) continue;
+    total += c.px.length;
+    x0 = Math.min(x0, c.minX); y0 = Math.min(y0, c.minY); x1 = Math.max(x1, c.maxX); y1 = Math.max(y1, c.maxY);
+  }
+  if (x1 < 0 || total < w * h * 0.08) return null;
+  // ふくらませた分を戻し、長辺の3%の余白を残す
+  const m = Math.max(w, h) * 0.03;
+  const L = Math.max(0, x0 + r - m) / w, T = Math.max(0, y0 + r - m) / h, R = Math.min(w, x1 + 1 - r + m) / w, B = Math.min(h, y1 + 1 - r + m) / h;
+  if ((R - L) * (B - T) > 0.88) return null;
+  return [[L, T], [R, T], [R, B], [L, B]];
+}
+
 // ---------- 傾き補正 ----------
 // 文字の行が水平になる角度を探す（投影プロファイルの分散が最大になる角度）
 export function detectSkew(canvas) {
@@ -794,16 +844,17 @@ export function detectSkew(canvas) {
   let sum = 0;
   for (let i = 0; i < d.length; i += 4) sum += d[i] + d[i + 1] + d[i + 2];
   const mean = sum / (w * h * 3), pts = [];
-  const step = Math.max(1, Math.round(Math.sqrt((w * h) / 120000)));
+  const step = Math.max(1, Math.round(Math.sqrt((w * h) / 400000)));
   for (let y = 0; y < h; y += step) for (let x = 0; x < w; x += step) {
     const i = (y * w + x) * 4;
     if ((d[i] + d[i + 1] + d[i + 2]) / 3 < mean * 0.6) pts.push(x - w / 2, y - h / 2);
   }
   if (pts.length < 200) return 0;
-  const rows = Math.ceil(Math.hypot(w, h)) + 2;
+  // 間引いた点の間隔と同じ幅の区間で数える（細かい区間だと0度だけ点が同じ区間に集まり、傾きを見逃していた）
+  const rows = Math.ceil(Math.hypot(w, h) / step) + 2;
   const score = deg => {
     const t = deg * Math.PI / 180, s = Math.sin(t), c = Math.cos(t), hist = new Float64Array(rows);
-    for (let i = 0; i < pts.length; i += 2) hist[(pts[i + 1] * c - pts[i] * s + rows / 2) | 0]++;
+    for (let i = 0; i < pts.length; i += 2) hist[((pts[i + 1] * c - pts[i] * s) / step + rows / 2) | 0]++;
     let v = 0; for (const n of hist) v += n * n;
     return v;
   };
@@ -815,7 +866,7 @@ export function detectSkew(canvas) {
   // 縦書き（日本語の本）は列が縦に並ぶので、横方向でも試して強い方を採る
   const scoreV = deg => {
     const t = deg * Math.PI / 180, s = Math.sin(t), c = Math.cos(t), hist = new Float64Array(rows);
-    for (let i = 0; i < pts.length; i += 2) hist[(pts[i] * c + pts[i + 1] * s + rows / 2) | 0]++;
+    for (let i = 0; i < pts.length; i += 2) hist[((pts[i] * c + pts[i + 1] * s) / step + rows / 2) | 0]++;
     let v = 0; for (const n of hist) v += n * n;
     return v;
   };
@@ -823,8 +874,9 @@ export function detectSkew(canvas) {
   for (let a = -8; a <= 8; a += 0.5) { const sc = scoreV(a); if (sc > bestVScore) { bestVScore = sc; bestV = a; } }
   const cV = bestV;
   for (let a = cV - 0.5; a <= cV + 0.5; a += 0.1) { const sc = scoreV(a); if (sc > bestVScore) { bestVScore = sc; bestV = a; } }
-  const horizontalGain = bestScore / score(0), verticalGain = bestVScore / scoreV(0);
-  const angle = verticalGain > horizontalGain ? bestV : best;
+  // 行の向き: 行と行の間のすき間は字と字の間より広いので、行に沿った方向のほうが山と谷がはっきり出る
+  // （日本語は字が升目に並ぶため、改善の割合で比べると逆の向きを選ぶことがあった）
+  const angle = bestVScore > bestScore ? bestV : best;
   return Math.abs(angle) < 0.15 ? 0 : angle;
 }
 
@@ -899,6 +951,11 @@ export async function processImage(original, opts) {
   enhance(canvas, { filter: opts.filter || 'none', fingers: !!opts.fingers, denoise: opts.denoise !== false, evenColor: opts.evenColor !== false });
   await tick();
   let skew = 0;
+  // 文字のかたまりに合わせて切り抜き、台形のゆがみも直す（ページの端が見つからなかったとき・余白が多いとき）
+  if (opts.crop === 'auto' && opts.subject !== 'screen' && opts.filter !== 'none') {
+    const q = textBlock(canvas);
+    if (q) { canvas = warp(canvas, q, Math.max(canvas.width, canvas.height)); await tick(); }
+  }
   if (opts.deskew) { skew = detectSkew(canvas); canvas = rotateBy(canvas, skew); }
   const blob = await toJpeg(canvas, 0.86);
   // 一覧表示用の小さな画像（大量のページでも一覧が重くならないように）
