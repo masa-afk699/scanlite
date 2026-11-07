@@ -78,6 +78,18 @@ export async function orientScores(blobs) {
   } catch (e) { console.error(e); return null; }
 }
 
+// 写真の中の文字の行（両端の点と太さ、割合）。使えない端末では null
+export async function textLines(blob, rotation = 0) {
+  if (paddleFailed) return null;
+  try {
+    return await new Promise((resolve, reject) => {
+      const id = ++seq;
+      jobs.set(id, { resolve, reject, onProgress: () => {} });
+      paddleWorker().postMessage({ id, blob, lines: true, rotation });
+    });
+  } catch (e) { console.error(e); return null; }
+}
+
 // 返り値: { text, lines: [{ text, bbox: {x0,y0,x1,y1} }] }（座標は入力画像のピクセル）
 export async function recognize(blob, onProgress = () => {}) {
   if (!paddleFailed) {

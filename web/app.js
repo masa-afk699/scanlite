@@ -1,8 +1,8 @@
 // ScanLite: すべての処理をブラウザー内で行う。撮影画像・PDF・OCR結果はネットワークに送らない。
-import { processImage as processHere, decode, drawRotated, detectPage, FULL_FRAME, recompress, limitOriginal as limitHere, cropTop, orientCandidates } from './scan.js';
+import { processImage as processHere, decode, drawRotated, detectPage, FULL_FRAME, recompress, limitOriginal as limitHere, cropTop, orientCandidates, linesVertical } from './scan.js';
 import * as db from './db.js';
 import { buildPdf } from './pdf.js';
-import { recognize, orientScores } from './ocr.js';
+import { recognize, orientScores, textLines } from './ocr.js';
 import { createCamera } from './camera.js';
 import * as save from './save.js';
 
@@ -78,6 +78,20 @@ function decideRotation(p) {
     if (rotationCache.size > 50) rotationCache.delete(rotationCache.keys().next().value);
   }
   return rotationCache.get(key);
+}
+
+// 写真の中の文字の行を調べておく（ページの端が写っていないときに、行の並びから範囲とゆがみを求めるため）
+const linesCache = new Map();
+async function ensureLines(p) {
+  if (p.crop !== 'auto' || p.mode === 'screen') return;
+  if (p.lines && p.linesRotation === (p.rotation || 0)) return;
+  const key = (p.capture ?? p.id) + ':' + (p.rotation || 0);
+  if (!linesCache.has(key)) {
+    linesCache.set(key, textLines(p.original, p.rotation || 0));
+    if (linesCache.size > 50) linesCache.delete(linesCache.keys().next().value);
+  }
+  p.lines = await linesCache.get(key);
+  p.linesRotation = p.rotation || 0;
 }
 
 const $ = s => document.querySelector(s);
@@ -249,9 +263,9 @@ async function showStorage() {
 }
 
 const optionsOf = p => ({
-  rotation: p.rotation || 0, filter: p.filter || 'none', crop: p.crop || 'none', half: p.half || null,
+  rotation: p.rotation || 0, filter: p.filter || 'none', crop: p.crop || 'none', half: p.half || null, perPage: !!p.perPage,
   deskew: !!p.deskew, fingers: !!p.fingers, denoise: p.denoise !== false, evenColor: p.evenColor !== false,
-  moire: !!p.moire, subject: p.mode === 'screen' ? 'screen' : 'paper',
+  moire: !!p.moire, subject: p.mode === 'screen' ? 'screen' : 'paper', lines: p.lines || null,
 });
 
 async function reprocess(page, change, { quiet = false } = {}) {
@@ -259,6 +273,7 @@ async function reprocess(page, change, { quiet = false } = {}) {
   Object.assign(page, change);
   setBusy('画像を補正しています…');
   try {
+    await ensureLines(page);
     Object.assign(page, await processImage(page.original, optionsOf(page)));
     page.rev = (page.rev || 0) + 1;
     delete page.ocr; // 画像が変わったのでOCR結果は作り直す
@@ -291,7 +306,7 @@ async function enqueue(blobs, extra = {}) {
     for (let i = 0; i < halves.length; i++) {
       await db.addPage({
         original: blob, ...defaultsFor(mode), half: halves[i], wantOcr: prefs.get('autoOcr', false),
-        mode, docId: target, created: created + i / 10000, waiting: true,
+        mode, docId: target, created: created + i / 2000, waiting: true,
         capture: created, autoRotate: mode !== 'screen', tilt: extra.tilt ?? null,
       });
     }
@@ -307,6 +322,12 @@ async function processOne(p) {
   try {
     if (!p.sized) { p.original = await limitOriginal(p.original); p.sized = true; }
     if (p.autoRotate) { p.rotation = await decideRotation(p); p.autoRotate = false; }
+    await ensureLines(p);
+    // 見開きの順番: 横書きの本は左ページから、縦書きの本は右ページから（文字の向きで自動で決める）
+    if (p.half && p.capture != null && p.lines) {
+      const v = linesVertical(p.lines);
+      if (v !== null) p.created = p.capture + ((p.half === 'left') === !v ? 0 : 1) / 2000;
+    }
     Object.assign(p, await processImage(p.original, optionsOf(p)));
   } catch (e) {
     console.error(e);
