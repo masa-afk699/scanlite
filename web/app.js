@@ -866,4 +866,20 @@ async function start() {
   navigator.storage?.persist?.().catch(() => {});
 }
 start();
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+// 新しい版が届いたら自動で読み込み直す（古い版のまま動き続けないように）
+if ('serviceWorker' in navigator) {
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController || reloaded) return; // 初回インストール時は読み込み直さない
+    reloaded = true;
+    // 撮影中や確認画面を開いている間は待ってから読み込み直す
+    const go = () => { if (document.querySelector('dialog[open]')) setTimeout(go, 1500); else location.reload(); };
+    go();
+  });
+  navigator.serviceWorker.register('./sw.js').then(reg => {
+    reg.update().catch(() => {});
+    // アプリに戻ってきたときも更新を確認する
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) reg.update().catch(() => {}); });
+  }).catch(() => {});
+}
