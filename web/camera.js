@@ -38,10 +38,16 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
     prev = null; stillSince = 0; needMotion = false;
     say(autoToggle.checked ? 'ページを枠に入れて、手を止めると自動で撮影します' : 'シャッターを押して撮影します');
     timer = setInterval(watch, 180);
+    window.addEventListener('devicemotion', onMotion);
   }
+
+  // 撮影したときのスマホの傾き（横持ちかどうか）。向きを決める手がかりにする
+  let tiltX = null;
+  function onMotion(e) { const g = e.accelerationIncludingGravity; if (g && typeof g.x === 'number') tiltX = g.x; }
 
   function close() {
     clearInterval(timer); timer = null;
+    window.removeEventListener('devicemotion', onMotion); tiltX = null;
     clearGuide();
     torchOn = false; torch.hidden = true; torch.setAttribute('aria-pressed', 'false');
     stream?.getTracks().forEach(t => t.stop());
@@ -143,7 +149,7 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
       dialog.classList.remove('flash'); void dialog.offsetWidth; dialog.classList.add('flash');
       const blob = await grab();
       if (!blob) { shots--; counter.textContent = `${shots}枚`; return; }
-      onCapture(blob);
+      onCapture(blob, { tilt: tiltX });
       needMotion = true; stillSince = 0;
       say(autoToggle.checked ? '撮影しました。次のページをめくってください' : '撮影しました');
     } finally { busy = false; }

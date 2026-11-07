@@ -153,8 +153,10 @@ function quadOf(mask, w, h) {
   if (!comps.length) return null;
   const big = comps.reduce((a, b) => (b.px.length > a.px.length ? b : a));
   // のどの影で左右に分かれたページ: 高さがほぼ重なる大きな領域を合わせる
+  // （スマホを横にして撮ると見開きが上下に並ぶので、幅が重なる場合も合わせる）
+  const overlap = (a0, a1, b0, b1) => Math.min(a1, b1) - Math.max(a0, b0) > 0.6 * Math.min(a1 - a0, b1 - b0);
   const parts = comps.filter(c => c === big || (c.px.length > big.px.length * 0.2 &&
-    Math.min(c.maxY, big.maxY) - Math.max(c.minY, big.minY) > 0.6 * Math.min(c.maxY - c.minY, big.maxY - big.minY)));
+    (overlap(c.minY, c.maxY, big.minY, big.maxY) || overlap(c.minX, c.maxX, big.minX, big.maxX))));
   const area = parts.reduce((s, c) => s + c.px.length, 0);
   if (area < w * h * 0.1 || area > w * h * 0.97) return null;
   const sel = new Uint8Array(w * h);
@@ -277,12 +279,12 @@ function squareToQuad(q) {
   return { a: x1 - x0 + g * x1, b: x3 - x0 + hh * x3, c: x0, d: y1 - y0 + g * y1, e: y3 - y0 + hh * y3, f: y0, g, h: hh };
 }
 
-export function warp(canvas, corners) {
+export function warp(canvas, corners, maxSide = MAX_SIDE) {
   const W = canvas.width, H = canvas.height;
   const q = corners.map(([x, y]) => [x * W, y * H]);
   const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
   let ow = (dist(q[0], q[1]) + dist(q[3], q[2])) / 2, oh = (dist(q[0], q[3]) + dist(q[1], q[2])) / 2;
-  const k = Math.min(1, MAX_SIDE / Math.max(ow, oh));
+  const k = Math.min(1, maxSide / Math.max(ow, oh));
   ow = Math.max(8, Math.round(ow * k)); oh = Math.max(8, Math.round(oh * k));
   const src = ctx2d(canvas).getImageData(0, 0, W, H).data;
   const out = makeCanvas(ow, oh), octx = ctx2d(out), dst = octx.createImageData(ow, oh), o = dst.data;
@@ -532,8 +534,9 @@ function documentTone(d, Y) {
 
 // 背景のまだら・縞・薄い汚れを白にし、点状のゴミとページ端の線を消す。
 // binarize: 文字を黒・背景を白にくっきり分ける（白黒）
-function cleanDocument(d, W, H, { binarize }) {
-  flattenFine(d, W, H);
+function cleanDocument(d, W, H, { binarize, fine = false }) {
+  // 画面の細かい縞を打ち消す処理。紙の写真では薄い・ぼけた文字まで紙と見なして消してしまうので使わない
+  if (fine) flattenFine(d, W, H);
   const Y = luma(d, W, H);
   // 3x3平均で判定する（細かい縞やJPEGのざらつきに引っぱられないように）
   const S = new Uint8ClampedArray(W * H), row = new Uint16Array(W * H);
@@ -580,6 +583,15 @@ function cleanDocument(d, W, H, { binarize }) {
     for (const p of c.px) if (Y2[p] < core) core = Y2[p];
     if (c.px.length > maxArea && (core < 150 || c.px.length > maxArea * 40)) continue;
     if (c.px.length <= maxArea && core < 150 && count(c.minX - R, c.minY - R, c.maxX + R + 1, c.maxY + R + 1) > c.px.length) continue;
+    for (const p of c.px) d[p * 4] = d[p * 4 + 1] = d[p * 4 + 2] = 255;
+  }
+  // ページの端にかかった暗いかたまり（影になった指・のどの奥・本の外の机など）を消す。
+  // 文字は端に接しないので、端に接していて文字より大きく、中まで詰まった暗い部分だけを対象にする
+  const big = Math.max(W, H) / 50;
+  for (const c of components(dark, W, H)) {
+    if (c.minX > 1 && c.minY > 1 && c.maxX < W - 2 && c.maxY < H - 2) continue;
+    const bw = c.maxX - c.minX + 1, bh = c.maxY - c.minY + 1;
+    if (Math.max(bw, bh) < big || c.px.length > W * H * 0.06 || c.px.length < bw * bh * 0.3) continue;
     for (const p of c.px) d[p * 4] = d[p * 4 + 1] = d[p * 4 + 2] = 255;
   }
   // 線の判定は薄いグレーも含める（かすれた縁の線も消せるように）
@@ -709,7 +721,7 @@ export function enhance(canvas, { filter, fingers, denoise, evenColor = true }) 
     }
     if (looksLikeDocument(flat)) {
       d.set(flat);
-      cleanDocument(d, W, H, { binarize: false });
+      cleanDocument(d, W, H, { binarize: false, fine: true });
     } else {
       screenLevels(d);
       // 背景（白い画面やタイトルバーの地の色）に近い部分をその色にそろえ、明るさの縞を消す
@@ -873,13 +885,15 @@ export async function recompress(blob, maxSide, quality) {
 // opts: { rotation, filter, crop: 'auto' | 'none' | corners, half: 'left' | 'right' | null, deskew, fingers, denoise }
 export async function processImage(original, opts) {
   const bitmap = await decode(original);
-  let canvas = drawRotated(bitmap, opts.rotation || 0);
+  // 見開きは2ページ分あるので、1ページあたりの細かさが落ちないよう大きめに扱う
+  const maxSide = opts.half ? MAX_SIDE * 1.5 : MAX_SIDE;
+  let canvas = drawRotated(bitmap, opts.rotation || 0, maxSide);
   bitmap.close?.();
   await tick();
   let corners = null;
   if (opts.crop === 'auto') corners = detectPage(canvas, opts.subject);
   else if (Array.isArray(opts.crop)) corners = opts.crop;
-  if (corners) { canvas = warp(canvas, corners); await tick(); }
+  if (corners) { canvas = warp(canvas, corners, maxSide); await tick(); }
   if (opts.half === 'left' || opts.half === 'right') canvas = cropHalf(canvas, opts.half);
   if (opts.moire) { demoire(canvas); await tick(); }
   enhance(canvas, { filter: opts.filter || 'none', fingers: !!opts.fingers, denoise: opts.denoise !== false, evenColor: opts.evenColor !== false });
@@ -894,6 +908,33 @@ export async function processImage(original, opts) {
   tx.drawImage(canvas, 0, 0, tc.width, tc.height);
   const thumb = await toJpeg(tc, 0.7);
   return { blob, thumb, width: canvas.width, height: canvas.height, corners: corners || FULL_FRAME, skew };
+}
+
+// ---------- 向きの自動判定 ----------
+// スマホを横にして撮ると、縦向きに固定した画面では本が90度回って写る。
+// ページの形から「90度回す必要があるか」を調べ、必要なら右回り・左回りの2つの候補画像を作る
+// （そのまま・右回り・左回りのどれが正しいかは文字を読んで決める）。split: 見開き（左右2ページ）として撮ったか
+export async function orientCandidates(blob, split) {
+  const bitmap = await decode(blob);
+  let canvas = drawRotated(bitmap, 0, 1400);
+  bitmap.close?.();
+  const corners = detectPage(canvas, 'paper');
+  if (corners) canvas = warp(canvas, corners);
+  const w = canvas.width, h = canvas.height;
+  // 見開きは横長、1ページは縦長のはず。そうでなければ横倒しに写っている
+  const need = split ? h > w * 1.05 : w > h * 1.15;
+  if (!need) return { need: false };
+  const k = Math.min(1, 1100 / Math.max(w, h));
+  const small = makeCanvas(Math.round(w * k), Math.round(h * k));
+  ctx2d(small).drawImage(canvas, 0, 0, small.width, small.height);
+  const cands = [];
+  for (const r of [0, 90, 270]) {
+    const c = r ? makeCanvas(small.height, small.width) : makeCanvas(small.width, small.height), x = ctx2d(c);
+    x.translate(c.width / 2, c.height / 2); x.rotate(r * Math.PI / 180);
+    x.drawImage(small, -small.width / 2, -small.height / 2);
+    cands.push(await toJpeg(c, 0.85));
+  }
+  return { need: true, cands };
 }
 
 // 画像の上の方だけを切り出す（題名の読み取り用。小さい画像の方がOCRが速い）
