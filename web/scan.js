@@ -105,37 +105,159 @@ function otsu(values) {
 // 紙は「明るく、色みが少ない」。その最大の領域を探し、四隅を推定する。
 // 返り値は画像サイズに対する0〜1の座標 [左上, 右上, 右下, 左下]。見つからなければ null。
 // subject: 'paper'（紙） | 'screen'（PCなどの画面。光っていて色があるので明るさだけで判定）
+// ページ（または画面）の四隅を探す。返り値は画像に対する割合 [[x,y]×4]（左上から時計回り）
 export function detectPage(canvas, subject = 'paper') {
-  const img = shrink(canvas, 360), { width: w, height: h, data: d } = img;
+  const img = shrink(canvas, 480), { width: w, height: h, data: d } = img;
+  const masks = [];
+  // 候補1: 白っぽさ（彩度が低く明るい）で紙を探す。画面モードは明るさで光っている部分を探す
   const score = new Uint8Array(w * h);
   for (let i = 0, p = 0; p < score.length; i += 4, p++) {
     const mx = Math.max(d[i], d[i + 1], d[i + 2]), mn = Math.min(d[i], d[i + 1], d[i + 2]);
     score[p] = subject === 'screen' ? (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8 : Math.max(0, Math.min(255, mx - 1.5 * (mx - mn)));
   }
-  // 画面: 暗い枠・部屋と、光っている画面（色の濃いタイトルバーなども含む）を分ける
   const t = subject === 'screen' ? Math.max(45, Math.min(otsu(score), 70)) : otsu(score);
-  let mask = new Uint8Array(w * h);
-  for (let p = 0; p < mask.length; p++) mask[p] = score[p] > t ? 1 : 0;
-  // 文字の穴を埋め、細いつながりを切る
-  mask = morph(mask, w, h, 2, true); mask = morph(mask, w, h, 4, false); mask = morph(mask, w, h, 2, true);
+  masks.push(score.map(v => (v > t ? 1 : 0)));
+  // 候補2: 写真の縁（机など背景）の色との違いで探す。白っぽい机の上の紙にも効く
+  if (subject !== 'screen') {
+    const ring = [[], [], []], m = Math.max(2, Math.round(Math.min(w, h) * 0.03));
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      if (x >= m && x < w - m && y >= m && y < h - m) continue;
+      const i = (y * w + x) * 4; ring[0].push(d[i]); ring[1].push(d[i + 1]); ring[2].push(d[i + 2]);
+    }
+    const bg = ring.map(a => { a.sort((u, v) => u - v); return a[a.length >> 1]; });
+    const ybg = bg[0] * 0.299 + bg[1] * 0.587 + bg[2] * 0.114;
+    const diff = new Uint8Array(w * h);
+    for (let i = 0, p = 0; p < diff.length; i += 4, p++) {
+      const y = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+      const chroma = Math.abs(d[i] - bg[0] - (y - ybg)) + Math.abs(d[i + 2] - bg[2] - (y - ybg));
+      // 背景より明るい、または色が違う（影は背景より暗いだけなので含めない）
+      diff[p] = Math.max(0, Math.min(255, (y - ybg) * 3 + chroma * 0.5));
+    }
+    const t2 = Math.max(12, otsu(diff));
+    masks.push(diff.map(v => (v > t2 ? 1 : 0)));
+  }
+  let best = null;
+  for (let mask of masks) {
+    // 文字の穴を埋め、細いつながりを切る
+    mask = morph(mask, w, h, 2, true); mask = morph(mask, w, h, 4, false); mask = morph(mask, w, h, 2, true);
+    const q = quadOf(mask, w, h);
+    if (q && (!best || q.score > best.score)) best = q;
+  }
+  if (!best) return null;
+  return best.corners.map(([x, y]) => [Math.min(1, Math.max(0, x / w)), Math.min(1, Math.max(0, y / h))]);
+}
+
+// マスクからページの四角形を求める（見開きの左右のページはまとめる）
+function quadOf(mask, w, h) {
   const comps = components(mask, w, h);
   if (!comps.length) return null;
-  const page = comps.reduce((a, b) => (b.px.length > a.px.length ? b : a));
-  if (page.px.length < w * h * 0.12) return null;
-  // 画像全体が紙なら切り抜き不要
-  if (page.px.length > w * h * 0.97) return null;
-  let tl = [0, 0, Infinity], tr = [0, 0, -Infinity], br = [0, 0, -Infinity], bl = [0, 0, -Infinity];
-  for (const p of page.px) {
-    const x = p % w, y = (p - x) / w;
-    if (x + y < tl[2]) tl = [x, y, x + y];
-    if (x - y > tr[2]) tr = [x, y, x - y];
-    if (x + y > br[2]) br = [x, y, x + y];
-    if (y - x > bl[2]) bl = [x, y, y - x];
+  const big = comps.reduce((a, b) => (b.px.length > a.px.length ? b : a));
+  // のどの影で左右に分かれたページ: 高さがほぼ重なる大きな領域を合わせる
+  const parts = comps.filter(c => c === big || (c.px.length > big.px.length * 0.2 &&
+    Math.min(c.maxY, big.maxY) - Math.max(c.minY, big.minY) > 0.6 * Math.min(c.maxY - c.minY, big.maxY - big.minY)));
+  const area = parts.reduce((s, c) => s + c.px.length, 0);
+  if (area < w * h * 0.1 || area > w * h * 0.97) return null;
+  const sel = new Uint8Array(w * h);
+  for (const c of parts) for (const p of c.px) sel[p] = 1;
+  // 行ごとの左端・右端、列ごとの上端・下端（輪郭の点）
+  const pts = [];
+  for (let y = 0; y < h; y++) {
+    let l = -1, r = -1;
+    for (let x = 0; x < w; x++) if (sel[y * w + x]) { if (l < 0) l = x; r = x; }
+    if (l >= 0) { pts.push([l, y]); pts.push([r + 1, y]); }
   }
-  const corners = [tl, tr, br, bl].map(([x, y]) => [(x + 0.5) / w, (y + 0.5) / h]);
-  // 中心へ少しだけ寄せて、机の写り込みを残さない
+  for (let x = 0; x < w; x++) {
+    let t = -1, b = -1;
+    for (let y = 0; y < h; y++) if (sel[y * w + x]) { if (t < 0) t = y; b = y; }
+    if (t >= 0) { pts.push([x, t]); pts.push([x, b + 1]); }
+  }
+  const hull = convexHull(pts);
+  if (hull.length < 4) return null;
+  // 凸包から面積が最大になる4点を選ぶ
+  const n = hull.length, ext = [0, 0, 0, 0], val = [Infinity, -Infinity, -Infinity, -Infinity];
+  hull.forEach(([x, y], i) => {
+    if (x + y < val[0]) { val[0] = x + y; ext[0] = i; }
+    if (x - y > val[1]) { val[1] = x - y; ext[1] = i; }
+    if (x + y > val[2]) { val[2] = x + y; ext[2] = i; }
+    if (y - x > val[3]) { val[3] = y - x; ext[3] = i; }
+  });
+  const quadArea = idx => { let s = 0; for (let k = 0; k < 4; k++) { const [x1, y1] = hull[idx[k]], [x2, y2] = hull[idx[(k + 1) % 4]]; s += x1 * y2 - x2 * y1; } return Math.abs(s) / 2; };
+  let idx = ext.slice();
+  for (let iter = 0; iter < 4; iter++) {
+    for (let k = 0; k < 4; k++) {
+      const from = idx[(k + 3) % 4], to = idx[(k + 1) % 4];
+      let bestI = idx[k], bestA = quadArea(idx);
+      for (let i = (from + 1) % n; i !== to; i = (i + 1) % n) {
+        const trial = idx.slice(); trial[k] = i;
+        const a = quadArea(trial);
+        if (a > bestA) { bestA = a; bestI = i; }
+      }
+      idx[k] = bestI;
+    }
+  }
+  let corners = idx.map(i => hull[i].slice());
+  // 各辺に沿った輪郭の点に直線を当てはめて、角の位置を正確にする（指や紙の反りの影響を減らす）
+  const refined = refineQuad(corners, pts, Math.max(w, h));
+  if (refined) corners = refined;
+  // 机の写り込みを残さないよう、ほんの少し内側へ
   const cx = corners.reduce((s, c) => s + c[0], 0) / 4, cy = corners.reduce((s, c) => s + c[1], 0) / 4;
-  return corners.map(([x, y]) => [x + (cx - x) * 0.01, y + (cy - y) * 0.01]);
+  corners = corners.map(([x, y]) => [x + (cx - x) * 0.006, y + (cy - y) * 0.006]);
+  const qa = Math.abs(corners.reduce((s, [x1, y1], k) => { const [x2, y2] = corners[(k + 1) % 4]; return s + x1 * y2 - x2 * y1; }, 0)) / 2;
+  const fill = area / Math.max(1, qa);
+  // 写真の四辺すべてに張りついた四角形は、紙ではなく背景ごと拾った可能性が高い
+  const m = Math.min(w, h) * 0.02;
+  const hugs = corners.filter(([x, y]) => (x < m || x > w - m) && (y < m || y > h - m)).length === 4;
+  // 四角形らしさ（領域が四角形をよく埋めている）と大きさで評価
+  return { corners, score: Math.min(1, fill) * Math.min(1, qa / (w * h * 0.5)) * (fill > 0.8 ? 1 : 0.3) * (hugs ? 0.7 : 1) };
+}
+
+function convexHull(points) {
+  const p = points.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lower = [], upper = [];
+  for (const q of p) { while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], q) <= 0) lower.pop(); lower.push(q); }
+  for (let i = p.length - 1; i >= 0; i--) { const q = p[i]; while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], q) <= 0) upper.pop(); upper.push(q); }
+  upper.pop(); lower.pop();
+  // 画面の座標（y下向き）で時計回り＝左上→右上→右下→左下の順になる
+  return lower.concat(upper);
+}
+
+function refineQuad(corners, pts, size) {
+  const tol = size * 0.02, lines = [];
+  for (let k = 0; k < 4; k++) {
+    const [ax, ay] = corners[k], [bx, by] = corners[(k + 1) % 4];
+    const len = Math.hypot(bx - ax, by - ay); if (len < 4) return null;
+    const nx = -(by - ay) / len, ny = (bx - ax) / len;
+    // 辺の両端10%を除いた範囲で、辺の近くにある輪郭点を使う
+    let sel = pts.filter(([x, y]) => {
+      const t = ((x - ax) * (bx - ax) + (y - ay) * (by - ay)) / (len * len);
+      return t > 0.1 && t < 0.9 && Math.abs((x - ax) * nx + (y - ay) * ny) < tol;
+    });
+    let line = null;
+    for (let it = 0; it < 3 && sel.length >= 8; it++) {
+      // 全最小二乗で直線を当てはめ、外れた点を除いてやり直す
+      let mx = 0, my = 0; for (const [x, y] of sel) { mx += x; my += y; } mx /= sel.length; my /= sel.length;
+      let sxx = 0, sxy = 0, syy = 0; for (const [x, y] of sel) { sxx += (x - mx) ** 2; sxy += (x - mx) * (y - my); syy += (y - my) ** 2; }
+      const th = 0.5 * Math.atan2(2 * sxy, sxx - syy), dx = Math.cos(th), dy = Math.sin(th);
+      line = { mx, my, nx: -dy, ny: dx };
+      const keep = sel.filter(([x, y]) => Math.abs((x - mx) * line.nx + (y - my) * line.ny) < Math.max(1.5, size * 0.004));
+      if (keep.length === sel.length || keep.length < 8) break;
+      sel = keep;
+    }
+    if (!line) return null;
+    lines.push(line);
+  }
+  const out = [];
+  for (let k = 0; k < 4; k++) {
+    const L1 = lines[(k + 3) % 4], L2 = lines[k];
+    const c1 = L1.nx * L1.mx + L1.ny * L1.my, c2 = L2.nx * L2.mx + L2.ny * L2.my, det = L1.nx * L2.ny - L1.ny * L2.nx;
+    if (Math.abs(det) < 1e-6) return null;
+    const x = (c1 * L2.ny - L1.ny * c2) / det, y = (L1.nx * c2 - c1 * L2.nx) / det;
+    // 元の角から大きく離れたら当てはめ失敗とみなす
+    if (Math.hypot(x - corners[k][0], y - corners[k][1]) > size * 0.05) return null;
+    out.push([x, y]);
+  }
+  return out;
 }
 
 export const FULL_FRAME = [[0, 0], [1, 0], [1, 1], [0, 1]];
@@ -224,6 +346,20 @@ export function detectFingers(canvas) {
     const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
     const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
     mask[p] = y > 50 && cr > 138 && cr < 180 && cb > 80 && cb < 128 && r > g && g >= b * 0.9 && r - b > 25 ? 1 : 0;
+  }
+  // 黄ばんだ紙や電球色の照明では紙も肌色に近くなるので、紙より「はっきり赤みが強く、暗い」ところだけを指とみなす
+  const crs = [], ys = [];
+  for (let i = 0; i < d.length; i += 4 * 7) {
+    const r = d[i], g = d[i + 1], b = d[i + 2];
+    crs.push(0.5 * r - 0.418688 * g - 0.081312 * b); ys.push(0.299 * r + 0.587 * g + 0.114 * b);
+  }
+  crs.sort((a, b) => a - b); ys.sort((a, b) => a - b);
+  const paperCr = crs[Math.floor(crs.length * 0.6)], paperY = ys[Math.floor(ys.length * 0.8)];
+  for (let i = 0, p = 0; p < mask.length; i += 4, p++) {
+    if (!mask[p]) continue;
+    const r = d[i], g = d[i + 1], b = d[i + 2];
+    const cr = 0.5 * r - 0.418688 * g - 0.081312 * b, y = 0.299 * r + 0.587 * g + 0.114 * b;
+    if (cr < paperCr + 12 || y > paperY * 0.93) mask[p] = 0;
   }
   mask = morph(mask, w, h, 1, false); mask = morph(mask, w, h, 2, true);
   const keep = new Uint8Array(w * h);
@@ -433,11 +569,17 @@ function cleanDocument(d, W, H, { binarize }) {
   const Y2 = luma(d, W, H), dark = new Uint8Array(W * H);
   for (let p = 0; p < dark.length; p++) dark[p] = Y2[p] < 215 ? 1 : 0;
   const maxArea = Math.max(4, Math.round((Math.max(W, H) / 1400) ** 2 * 9));
+  // 近くにほかの文字がある点（句読点・点線「……」・濁点など）は残すため、暗い画素の数を積分画像で数える
+  const W1 = W + 1, I = new Int32Array(W1 * (H + 1));
+  for (let y = 0; y < H; y++) { let rs = 0; for (let x = 0; x < W; x++) { rs += dark[y * W + x]; I[(y + 1) * W1 + x + 1] = I[y * W1 + x + 1] + rs; } }
+  const count = (x0, y0, x1, y1) => { x0 = Math.max(0, x0); y0 = Math.max(0, y0); x1 = Math.min(W, x1); y1 = Math.min(H, y1); return I[y1 * W1 + x1] - I[y0 * W1 + x1] - I[y1 * W1 + x0] + I[y0 * W1 + x0]; };
+  const R = Math.max(6, Math.round(Math.max(W, H) / 120));
   for (const c of components(dark, W, H)) {
-    // 小さすぎる点、または濃い芯のない薄いまだら（画面の縞・ざらつき）は文字ではない
+    // 小さすぎて周りに何もない点、または濃い芯のない薄いまだら（画面の縞・ざらつき）は文字ではない
     let core = 255;
-    if (c.px.length > maxArea) for (const p of c.px) if (Y2[p] < core) core = Y2[p];
+    for (const p of c.px) if (Y2[p] < core) core = Y2[p];
     if (c.px.length > maxArea && (core < 150 || c.px.length > maxArea * 40)) continue;
+    if (c.px.length <= maxArea && core < 150 && count(c.minX - R, c.minY - R, c.maxX + R + 1, c.maxY + R + 1) > c.px.length) continue;
     for (const p of c.px) d[p * 4] = d[p * 4 + 1] = d[p * 4 + 2] = 255;
   }
   // 線の判定は薄いグレーも含める（かすれた縁の線も消せるように）
@@ -511,6 +653,7 @@ function removeColorBlotches(d, W, H) {
 }
 
 export function enhance(canvas, { filter, fingers, denoise, evenColor = true }) {
+  let docColor = false;
   const W = canvas.width, H = canvas.height, x = ctx2d(canvas);
   const img = x.getImageData(0, 0, W, H), d = img.data;
 
@@ -587,21 +730,27 @@ export function enhance(canvas, { filter, fingers, denoise, evenColor = true }) 
       lut[i] = filter === 'color' ? 255 * Math.pow(i / 255, gamma) : i;
     }
     for (let i = 0; i < d.length; i += 4) {
-      const r = Math.min(255, d[i] * 250 / Math.max(bg[i], 1));
-      const g = Math.min(255, d[i + 1] * 250 / Math.max(bg[i + 1], 1));
-      const b = Math.min(255, d[i + 2] * 250 / Math.max(bg[i + 2], 1));
+      d[i] = Math.min(255, d[i] * 250 / Math.max(bg[i], 1));
+      d[i + 1] = Math.min(255, d[i + 1] * 250 / Math.max(bg[i + 1], 1));
+      d[i + 2] = Math.min(255, d[i + 2] * 250 / Math.max(bg[i + 2], 1));
+    }
+    // 本や書類のページ（白っぽい紙に文字）は、紙を白・文字をくっきりに仕上げる（色のある部分は残す）
+    docColor = filter === 'color' && looksLikeDocument(d);
+    for (let i = 0; i < d.length; i += 4) {
+      const r = d[i], g = d[i + 1], b = d[i + 2];
       if (filter === 'bw' || filter === 'gray') {
         d[i] = d[i + 1] = d[i + 2] = lut[Math.round(0.299 * r + 0.587 * g + 0.114 * b)];
-      } else {
-        d[i] = lut[r | 0]; d[i + 1] = lut[g | 0]; d[i + 2] = lut[b | 0];
+      } else if (!docColor) {
+        d[i] = lut[r]; d[i + 1] = lut[g]; d[i + 2] = lut[b];
       }
     }
     if (filter === 'color' && evenColor) removeColorBlotches(d, W, H);
+    if (docColor) cleanDocument(d, W, H, { binarize: false });
     if (filter === 'bw' || filter === 'gray') cleanDocument(d, W, H, { binarize: filter === 'bw' });
     if (fingerMask) for (let p = 0; p < W * H; p++) if (fingerMask[p]) d[p * 4] = d[p * 4 + 1] = d[p * 4 + 2] = 255;
   }
 
-  if (denoise && filter !== 'none' && filter !== 'screen') {
+  if (denoise && filter !== 'none' && filter !== 'screen' && !docColor && filter !== 'gray' && filter !== 'bw') {
     // 紙のざらつき・薄い汚れを白に寄せる
     for (let i = 0; i < d.length; i += 4) {
       const mn = Math.min(d[i], d[i + 1], d[i + 2]);
