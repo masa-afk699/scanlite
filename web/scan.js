@@ -1074,12 +1074,37 @@ export function linesSpan(lines, W, H) {
   return orderCorners([at(u0, v0), at(u1, v0), at(u1, v1), at(u0, v1)]);
 }
 
+// ---------- 本文の行だけを残す ----------
+// 紙の外にある文字（マグカップのロゴ・机の上の物）の行を除く。行のまわりの地が、紙の白さと違うものを捨てる
+export function linesMain(lines, canvas) {
+  if (!lines || lines.length < 6) return lines;
+  const img = shrink(canvas, 800), { width: w, height: h, data: d } = img, S = Math.max(w, h);
+  // 行のまわりの地の色（明るい方から15%の画素の明るさと色みの濃さ）
+  const bg = l => {
+    const pad = Math.max(2, l.t * S);
+    const x0 = Math.max(0, Math.floor(Math.min(l.a[0], l.b[0]) * w - pad)), x1 = Math.min(w - 1, Math.ceil(Math.max(l.a[0], l.b[0]) * w + pad));
+    const y0 = Math.max(0, Math.floor(Math.min(l.a[1], l.b[1]) * h - pad)), y1 = Math.min(h - 1, Math.ceil(Math.max(l.a[1], l.b[1]) * h + pad));
+    const px = [];
+    for (let y = y0; y <= y1; y += 2) for (let x = x0; x <= x1; x += 2) { const i = (y * w + x) * 4; px.push([d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114, Math.max(d[i], d[i + 1], d[i + 2]) - Math.min(d[i], d[i + 1], d[i + 2])]); }
+    if (!px.length) return null;
+    px.sort((p, q) => q[0] - p[0]);
+    const top = px.slice(0, Math.max(1, Math.round(px.length * 0.15)));
+    return [top[top.length >> 1][0], top.reduce((s, p) => s + p[1], 0) / top.length];
+  };
+  const info = lines.map(bg), ys = info.filter(Boolean).map(v => v[0]).sort((p, q) => p - q), cs = info.filter(Boolean).map(v => v[1]).sort((p, q) => p - q);
+  if (!ys.length) return lines;
+  const Ym = ys[ys.length >> 1], Cm = cs[cs.length >> 1];
+  // 地が紙よりずっと暗い・色が濃い行は紙の外（マグカップのロゴなど）
+  const keep = lines.filter((_, i) => info[i] && info[i][0] > Ym * 0.78 && info[i][1] < Cm + 35);
+  return keep.length >= 6 ? keep : lines;
+}
+
 // ---------- 本文の範囲から紙の端まで広げる ----------
 // 文字の行から求めた四角形は本文だけを囲むので、図や枠が欠けやすい。
 // 四辺それぞれを外へたどり、紙から机に変わるところ（黄色っぽさが増える・暗くなる）まで広げる。
 // クリーム色の机と白い紙は明るさがほぼ同じでも、明るさで割った黄色っぽさ (R-B)/Y で見分けられる。
 // keep: 広げない辺の番号（見開きの のど 側）。見つからない辺はそのまま
-export function expandToPaper(canvas, corners, keep = [], info = {}) {
+export function expandToPaper(canvas, corners, keep = [], info = {}, pad = 0) {
   info.found = 0;
   const img = shrink(canvas, 720), { width: w, height: h, data: d } = img;
   const S = Math.max(w, h), raw = new Float32Array(w * h), Y = new Float32Array(w * h);
@@ -1149,13 +1174,10 @@ export function expandToPaper(canvas, corners, keep = [], info = {}) {
       const dist = (line.mx - A[0]) * nx + (line.my - A[1]) * ny;
       if (cos < Math.cos(15 * Math.PI / 180) || dist < 0) line = null;
     }
-    if (line) {
-      // 紙の端の影や机を写しこまないよう、ほんの少し内側へ
-      let lnx = -line.dy, lny = line.dx; if (lnx * nx + lny * ny > 0) { lnx = -lnx; lny = -lny; }
-      line = shiftLine(line, lnx, lny, S * 0.004);
-    }
+    // 紙の端そのものに合わせる（内側へは寄せない。紙が欠けるより、机が少し写る方がよい）
     if (line) info.found++;
-    sides.push(line || orig);
+    // 見つからなかった辺は、迷ったら広めに（紙を切らないように）外へ pad の分だけ広げる
+    sides.push(line || (pad && !keep.includes(k) ? shiftLine(orig, nx, ny, S * pad) : orig));
   }
   const out = [];
   for (let k = 0; k < 4; k++) {
@@ -1569,16 +1591,27 @@ export async function processImage(original, opts) {
     // ページの端がはっきり写っていない（白い机に白い紙、ページが写真からはみ出す等）ときは、
     // 本文の行の並びからページの範囲と台形のゆがみを求める。見開きは左右のページを別々に求める
     if (opts.subject !== 'screen' && opts.lines && (!corners || insideSides(corners) < 3)) {
-      const blocks = linesQuads(opts.lines, canvas.width, canvas.height);
+      const blocks = linesQuads(linesMain(opts.lines, canvas), canvas.width, canvas.height);
       let pick = null;
       // まず、すべての行を囲む範囲から外へたどって紙の端を探す（図の多いページや、机と紙の色が違うとき）。
       // 三辺以上で紙の端が見つかれば、それを使う（見開きは後で のど で左右に分ける）
-      const span = linesSpan(opts.lines, canvas.width, canvas.height), info = {};
+      const main = linesMain(opts.lines, canvas);
+      const span = linesSpan(main, canvas.width, canvas.height), info = {};
       const paper = span && expandToPaper(canvas, span, [], info);
       if (paper && info.found >= 3) { pick = { corners: paper, done: true }; edgeFound = true; }
-      else if (opts.half && blocks.length >= 2) {
-        const two = blocks.slice(0, 2).sort((a, b) => a.cx - b.cx);
-        pick = opts.half === 'left' ? two[0] : two[1];
+      else if (paper && info.found >= 2) {
+        // 紙の端が二辺だけ見つかったとき: 見つからない辺は行の範囲から広めに取る（紙が切れないように）
+        pick = { corners: expandToPaper(canvas, span, [], {}, 0.05), done: true }; edgeFound = true;
+      } else if (opts.half && blocks.length >= 2) {
+        // 本文のかたまりを左右のページに分ける（1ページに見出しで区切られたかたまりが複数あっても、
+        // 横位置のいちばん大きなすき間で左右に分け、それぞれ全部を囲む）
+        const sorted = blocks.slice().sort((a, b) => a.cx - b.cx);
+        let cut = 1, best = -1;
+        for (let i = 1; i < sorted.length; i++) { const g = sorted[i].cx - sorted[i - 1].cx; if (g > best) { best = g; cut = i; } }
+        const side = opts.half === 'left' ? sorted.slice(0, cut) : sorted.slice(cut);
+        const all = side.flatMap(b => b.corners);
+        const ext = f => all.reduce((p, q) => (f(q) > f(p) ? q : p));
+        pick = { corners: [ext(([x, y]) => -x - y), ext(([x, y]) => x - y), ext(([x, y]) => x + y), ext(([x, y]) => y - x)] };
         perPage = true;
       } else if (!opts.half && blocks.length >= 2 && blocks[1].n > blocks[0].n * 0.5) {
         // 1ページとして撮った見開き: 左右のページをまとめた範囲
