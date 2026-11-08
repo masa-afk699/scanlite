@@ -597,12 +597,14 @@ function cleanDocument(d, W, H, { binarize, fine = false }) {
   for (let y = 0; y < H; y++) { let rs = 0; for (let x = 0; x < W; x++) { rs += dark[y * W + x]; I[(y + 1) * W1 + x + 1] = I[y * W1 + x + 1] + rs; } }
   const count = (x0, y0, x1, y1) => { x0 = Math.max(0, x0); y0 = Math.max(0, y0); x1 = Math.min(W, x1); y1 = Math.min(H, y1); return I[y1 * W1 + x1] - I[y0 * W1 + x1] - I[y1 * W1 + x0] + I[y0 * W1 + x0]; };
   const R = Math.max(6, Math.round(Math.max(W, H) / 120));
+  // 文字とみなす芯の濃さ。紙の写真では薄い灰色の印刷や光って薄くなった文字も残す
+  const coreMax = fine ? 150 : 185;
   for (const c of components(dark, W, H)) {
     // 小さすぎて周りに何もない点、または濃い芯のない薄いまだら（画面の縞・ざらつき）は文字ではない
     let core = 255;
     for (const p of c.px) if (Y2[p] < core) core = Y2[p];
-    if (c.px.length > maxArea && (core < 150 || c.px.length > maxArea * 40)) continue;
-    if (c.px.length <= maxArea && core < 150 && count(c.minX - R, c.minY - R, c.maxX + R + 1, c.maxY + R + 1) > c.px.length) continue;
+    if (c.px.length > maxArea && (core < coreMax || c.px.length > maxArea * 40)) continue;
+    if (c.px.length <= maxArea && core < coreMax && count(c.minX - R, c.minY - R, c.maxX + R + 1, c.maxY + R + 1) > c.px.length) continue;
     for (const p of c.px) d[p * 4] = d[p * 4 + 1] = d[p * 4 + 2] = 255;
   }
   // ページの端にかかった暗いかたまり（影になった指・のどの奥・本の外の机など）を消す。
@@ -612,6 +614,15 @@ function cleanDocument(d, W, H, { binarize, fine = false }) {
     if (c.minX > 1 && c.minY > 1 && c.maxX < W - 2 && c.maxY < H - 2) continue;
     const bw = c.maxX - c.minX + 1, bh = c.maxY - c.minY + 1;
     if (Math.max(bw, bh) < big || c.px.length > W * H * 0.06 || c.px.length < bw * bh * 0.3) continue;
+    // 端に太く接しているものだけ（細い線で端とつながっただけの見出しの帯などは中身なので残す）
+    let contact = 0;
+    for (const p of c.px) { const x = p % W, y = (p - x) / W; if (x <= 1 || y <= 1 || x >= W - 2 || y >= H - 2) contact++; }
+    if (contact < Math.min(bw, bh) * 0.3) continue;
+    // 端からページの奥まで（4割以上）のびているもの（端まで続く見出しの帯・図など）は中身
+    // 接している辺から測った奥行き（割合）
+    const depthFrac = Math.min(c.minX <= 1 ? (c.maxX + 1) / W : 1, c.maxX >= W - 2 ? (W - c.minX) / W : 1,
+      c.minY <= 1 ? (c.maxY + 1) / H : 1, c.maxY >= H - 2 ? (H - c.minY) / H : 1);
+    if (depthFrac > 0.4) continue;
     for (const p of c.px) d[p * 4] = d[p * 4 + 1] = d[p * 4 + 2] = 255;
   }
   // 線の判定は薄いグレーも含める（かすれた縁の線も消せるように）
@@ -622,19 +633,35 @@ function cleanDocument(d, W, H, { binarize, fine = false }) {
 // ページの縁に沿った長い線（元の紙の端・とじ目・画面の枠）を消す
 function removeEdgeLines(d, W, H, dark) {
   const whiten = p => { d[p * 4] = d[p * 4 + 1] = d[p * 4 + 2] = 255; };
-  const mx = Math.round(W * 0.07), my = Math.round(H * 0.07);
+  const mx = Math.round(W * 0.05), my = Math.round(H * 0.05);
   const isDark = (x, y) => dark[y * W + x] || (x > 0 && dark[y * W + x - 1]) || (x < W - 1 && dark[y * W + x + 1]);
   const isDarkV = (x, y) => dark[y * W + x] || (y > 0 && dark[(y - 1) * W + x]) || (y < H - 1 && dark[(y + 1) * W + x]);
+  // 線は細いものだけ。見出しの帯や枠の太い部分など、太い暗い帯は中身なので残す
+  const thin = Math.max(4, Math.round(Math.max(W, H) * 0.006));
+  const colHit = new Uint8Array(W), rowHit = new Uint8Array(H);
   for (const x of [...Array(mx).keys(), ...Array.from({ length: mx }, (_, i) => W - 1 - i)]) {
     let run = 0, best = 0;
     for (let y = 0; y < H; y++) { run = isDark(x, y) ? run + 1 : 0; if (run > best) best = run; }
-    if (best > H * 0.15) for (let y = 0; y < H; y++) for (let k = -2; k <= 2; k++) { const xx = x + k; if (xx >= 0 && xx < W && dark[y * W + xx]) whiten(y * W + xx); }
+    if (best > H * 0.15) colHit[x] = 1;
   }
   for (const y of [...Array(my).keys(), ...Array.from({ length: my }, (_, i) => H - 1 - i)]) {
     let run = 0, best = 0;
     for (let x = 0; x < W; x++) { run = isDarkV(x, y) ? run + 1 : 0; if (run > best) best = run; }
-    if (best > W * 0.15) for (let x = 0; x < W; x++) for (let k = -2; k <= 2; k++) { const yy = y + k; if (yy >= 0 && yy < H && dark[yy * W + x]) whiten(yy * W + x); }
+    if (best > W * 0.15) rowHit[y] = 1;
   }
+  // 帯の外側（数画素先）も同じ場所が暗ければ、太いもの（文字の入った見出しの帯など）の一部
+  const thick = (a, b, n, get, len) => {
+    const m = (a + b) >> 1; let base = 0, out = 0;
+    for (let t = 0; t < len; t++) {
+      if (!get(m, t)) continue; base++;
+      const p1 = a - 3, p2 = b + 3;
+      if ((p1 >= 0 && get(p1, t)) || (p2 < n && get(p2, t))) out++;
+    }
+    return base > 0 && out > base * 0.5;
+  };
+  const bands = (hit, n, get, len) => { const out = []; for (let i = 0; i < n; i++) { if (!hit[i]) continue; let j = i; while (j + 1 < n && hit[j + 1]) j++; if (j - i + 1 <= thin && !thick(i, j, n, get, len)) out.push([i, j]); i = j; } return out; };
+  for (const [a, b] of bands(colHit, W, (x, y) => dark[y * W + x], H)) for (let x = a - 2; x <= b + 2; x++) if (x >= 0 && x < W) for (let y = 0; y < H; y++) if (dark[y * W + x]) whiten(y * W + x);
+  for (const [a, b] of bands(rowHit, H, (y, x) => dark[y * W + x], W)) for (let y = a - 2; y <= b + 2; y++) if (y >= 0 && y < H) for (let x = 0; x < W; x++) if (dark[y * W + x]) whiten(y * W + x);
 }
 
 // 色ムラ補正: 紙や文字に出る薄い色かぶり・まだらな色を消し、はっきりした色（印鑑・図・写真）は残す
@@ -955,6 +982,117 @@ function blockQuad(rows, cs, pitch) {
   return pts;
 }
 
+// ---------- 文字の行全体を囲む四角形 ----------
+// 行の向き（長さで重みづけした平均）にそろえた、すべての行を囲む長方形（四隅・割合）
+export function linesSpan(lines, W, H) {
+  if (!lines || lines.length < 6) return null;
+  let sx = 0, sy = 0;
+  const pts = [];
+  for (const l of lines) {
+    const ax = l.a[0] * W, ay = l.a[1] * H, bx = l.b[0] * W, by = l.b[1] * H, len = Math.hypot(bx - ax, by - ay);
+    const th = Math.atan2(by - ay, bx - ax);
+    sx += len * Math.cos(2 * th); sy += len * Math.sin(2 * th);
+    pts.push([ax, ay], [bx, by]);
+  }
+  const th = Math.atan2(sy, sx) / 2, ux = Math.cos(th), uy = Math.sin(th);
+  let u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity;
+  for (const [x, y] of pts) { const u = x * ux + y * uy, v = -x * uy + y * ux; u0 = Math.min(u0, u); u1 = Math.max(u1, u); v0 = Math.min(v0, v); v1 = Math.max(v1, v); }
+  const at = (u, v) => [(u * ux - v * uy) / W, (u * uy + v * ux) / H];
+  return orderCorners([at(u0, v0), at(u1, v0), at(u1, v1), at(u0, v1)]);
+}
+
+// ---------- 本文の範囲から紙の端まで広げる ----------
+// 文字の行から求めた四角形は本文だけを囲むので、図や枠が欠けやすい。
+// 四辺それぞれを外へたどり、紙から机に変わるところ（黄色っぽさが増える・暗くなる）まで広げる。
+// クリーム色の机と白い紙は明るさがほぼ同じでも、明るさで割った黄色っぽさ (R-B)/Y で見分けられる。
+// keep: 広げない辺の番号（見開きの のど 側）。見つからない辺はそのまま
+export function expandToPaper(canvas, corners, keep = [], info = {}) {
+  info.found = 0;
+  const img = shrink(canvas, 720), { width: w, height: h, data: d } = img;
+  const S = Math.max(w, h), raw = new Float32Array(w * h), Y = new Float32Array(w * h);
+  for (let i = 0, p = 0; p < raw.length; i += 4, p++) { raw[p] = d[i] - d[i + 2]; Y[p] = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114; }
+  // 小さくぼかしてから (R-B)/Y。暗い画素は NaN
+  const warm = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let s = 0, sy = 0, n = 0;
+    for (let yy = Math.max(0, y - 1); yy <= Math.min(h - 1, y + 1); yy++) for (let xx = Math.max(0, x - 1); xx <= Math.min(w - 1, x + 1); xx++) { const q = yy * w + xx; s += raw[q]; sy += Y[q]; n++; }
+    warm[y * w + x] = sy / n < 90 ? NaN : (s / n) / (sy / n + 20) * 500;
+  }
+  const med = a => { a = a.filter(v => !isNaN(v)).sort((u, v) => u - v); return a.length ? a[a.length >> 1] : NaN; };
+  const P = corners.map(([x, y]) => [x * w, y * h]);
+  const at = (x, y) => (x < 0 || y < 0 || x >= w || y >= h) ? undefined : warm[Math.floor(y) * w + Math.floor(x)];
+  // 紙（四角形の内側）と机（写真の縁）の黄色っぽさ
+  const inside = [];
+  for (let u = 0.1; u <= 0.9; u += 0.04) for (let v = 0.1; v <= 0.9; v += 0.04) {
+    const x = (1 - v) * ((1 - u) * P[0][0] + u * P[1][0]) + v * ((1 - u) * P[3][0] + u * P[2][0]);
+    const y = (1 - v) * ((1 - u) * P[0][1] + u * P[1][1]) + v * ((1 - u) * P[3][1] + u * P[2][1]);
+    inside.push(at(x, y));
+  }
+  const ring = [], m = Math.round(Math.min(w, h) * 0.03);
+  for (let y = 0; y < h; y += 2) for (let x = 0; x < w; x += 2) if (x < m || y < m || x >= w - m || y >= h - m) ring.push(warm[y * w + x]);
+  const pw = med(inside), dw = med(ring);
+  if (isNaN(pw) || isNaN(dw) || dw - pw < 6) return corners;
+  const half = (dw - pw) / 2, K = Math.max(4, Math.round(S * 0.02));
+  const cx = P.reduce((s, p) => s + p[0], 0) / 4, cy = P.reduce((s, p) => s + p[1], 0) / 4;
+  const sides = [];
+  for (let k = 0; k < 4; k++) {
+    const A = P[k], B = P[(k + 1) % 4], len = Math.hypot(B[0] - A[0], B[1] - A[1]) || 1;
+    const tx = (B[0] - A[0]) / len, ty = (B[1] - A[1]) / len;
+    let nx = -ty, ny = tx; if ((A[0] - cx) * nx + (A[1] - cy) * ny < 0) { nx = -nx; ny = -ny; }
+    const orig = { mx: A[0], my: A[1], dx: tx, dy: ty };
+    if (keep.includes(k)) { sides.push(orig); continue; }
+    const pts = []; let tries = 0;
+    for (let t = 0.08; t <= 0.92; t += 0.04) {
+      tries++;
+      const ox = A[0] + (B[0] - A[0]) * t, oy = A[1] + (B[1] - A[1]) * t, v = [];
+      // 外へ1画素ずつ。辺の向きに少し幅を持たせて平均（暗い画素は机とみなす）
+      for (let dd = 0; ; dd++) {
+        const x = ox + nx * dd, y = oy + ny * dd;
+        if (x < 0 || y < 0 || x >= w || y >= h) break;
+        let s = 0, n = 0;
+        for (let e = -4; e <= 4; e += 2) { const val = at(x + tx * e, y + ty * e); if (val === undefined || isNaN(val)) continue; s += val; n++; }
+        v.push(n ? s / n : NaN);
+      }
+      // 区間の平均。暗い画素（図の線・机の黒い部分）は数えず、ほとんど暗ければ机とみなす
+      const avg = (from, len = K) => { let s = 0, n = 0; const to = Math.min(v.length, from + len); for (let j = from; j < to; j++) if (!isNaN(v[j])) { s += v[j]; n++; } return n < (to - from) * 0.3 ? dw : s / n; };
+      // 内側は紙らしく、外側は机らしい最初の段差
+      let found = -1;
+      for (let dd = K; dd + K <= v.length; dd++) {
+        const a = avg(dd - K), b = avg(dd);
+        // 外側がしばらく机らしいまま続くこと（灰色の見出しの帯などで止まらないように）
+        if (b - a > half && a < pw + half && b > pw + half && avg(dd, K * 4) > pw + half) {
+          // 段差がいちばん大きいところに合わせる
+          let best = dd, bv = b - a;
+          for (let e = dd + 1; e < Math.min(v.length - K, dd + K); e++) { const g = avg(e) - avg(e - K); if (g > bv) { bv = g; best = e; } }
+          found = best; break;
+        }
+      }
+      if (found >= 0) pts.push([ox + nx * found, oy + ny * found]);
+    }
+    let line = pts.length >= Math.max(4, tries * 0.35) ? fitLine(pts, S * 0.008) : null;
+    if (line) {
+      // 向きがもとの辺と大きく違う・内側に入る なら使わない
+      const cos = Math.abs(line.dx * tx + line.dy * ty);
+      const dist = (line.mx - A[0]) * nx + (line.my - A[1]) * ny;
+      if (cos < Math.cos(15 * Math.PI / 180) || dist < 0) line = null;
+    }
+    if (line) {
+      // 紙の端の影や机を写しこまないよう、ほんの少し内側へ
+      let lnx = -line.dy, lny = line.dx; if (lnx * nx + lny * ny > 0) { lnx = -lnx; lny = -lny; }
+      line = shiftLine(line, lnx, lny, S * 0.004);
+    }
+    if (line) info.found++;
+    sides.push(line || orig);
+  }
+  const out = [];
+  for (let k = 0; k < 4; k++) {
+    const c = meet(sides[(k + 3) % 4], sides[k]);
+    if (!c || c[0] < -w * 0.05 || c[1] < -h * 0.05 || c[0] > w * 1.05 || c[1] > h * 1.05) return corners;
+    out.push([Math.min(1, Math.max(0, c[0] / w)), Math.min(1, Math.max(0, c[1] / h))]);
+  }
+  return out;
+}
+
 // ---------- 紙の反りの補正 ----------
 // 台形補正した画像の上で、各行の中心線が水平になるよう縦方向に画素をずらす。
 // 行と行の間はずれ量をなめらかにつなぐ。corners: 台形補正に使った四隅（割合）、size: 補正前の画像の大きさ
@@ -1009,8 +1147,9 @@ function straightenLines(canvas, corners, size, lines) {
   const offAt = (c, y) => {
     const l = cols[c];
     if (!l.length) return 0;
-    if (y <= l[0][0]) return l[0][1];
-    if (y >= l[l.length - 1][0]) return l[l.length - 1][1];
+    // 最初の行より上・最後の行より下は、写真の端でずれが0になるようにつなぐ（端の文字や見出しを押し出さない）
+    if (y <= l[0][0]) return l[0][1] * Math.max(0, y) / Math.max(1, l[0][0]);
+    if (y >= l[l.length - 1][0]) { const b = l[l.length - 1]; return b[1] * Math.max(0, H - y) / Math.max(1, H - b[0]); }
     let k = 1; while (k < l.length && l[k][0] < y) k++;
     const t = (y - l[k - 1][0]) / (l[k][0] - l[k - 1][0] || 1);
     return l[k - 1][1] + (l[k][1] - l[k - 1][1]) * t;
@@ -1121,10 +1260,12 @@ export function rotateBy(canvas, deg, fill = '#fff') {
 // 中央付近で最も暗い縦の帯（のど）を探し、そのx座標を返す
 export function findGutter(canvas) {
   const img = shrink(canvas, 600), { width: w, height: h, data: d } = img;
-  const col = new Float64Array(w);
-  for (let y = Math.floor(h * 0.1); y < h * 0.9; y++) for (let x = 0; x < w; x++) {
-    const i = (y * w + x) * 4;
-    col[x] += d[i] + d[i + 1] + d[i + 2];
+  // 列ごとの明るさの中央値（のどの影は上から下まで続く。図の黒い部分などは一部の行だけなので効かない）
+  const col = new Float64Array(w), buf = [];
+  for (let x = 0; x < w; x++) {
+    buf.length = 0;
+    for (let y = Math.floor(h * 0.1); y < h * 0.9; y++) { const i = (y * w + x) * 4; buf.push(d[i] + d[i + 1] + d[i + 2]); }
+    buf.sort((a, b) => a - b); col[x] = buf[buf.length >> 1];
   }
   let best = Math.round(w / 2), bestV = Infinity;
   for (let x = Math.floor(w * 0.35); x < w * 0.65; x++) {
@@ -1140,7 +1281,7 @@ export function findGutter(canvas) {
 export function cropHalf(canvas, half) {
   const gx = findGutter(canvas), W = canvas.width, H = canvas.height;
   // のどの影を少し切り落とす
-  const trim = Math.round(W * 0.02);
+  const trim = Math.round(W * 0.01);
   const x0 = half === 'left' ? 0 : Math.min(W - 8, gx + trim), x1 = half === 'left' ? Math.max(8, gx - trim) : W;
   const out = makeCanvas(Math.max(8, x1 - x0), H);
   ctx2d(out).drawImage(canvas, x0, 0, x1 - x0, H, 0, 0, x1 - x0, H);
@@ -1168,7 +1309,7 @@ export async function processImage(original, opts) {
   let canvas = drawRotated(bitmap, opts.rotation || 0, maxSide);
   bitmap.close?.();
   await tick();
-  let corners = null, perPage = Array.isArray(opts.crop) && !!opts.perPage, fromLines = false;
+  let corners = null, perPage = Array.isArray(opts.crop) && !!opts.perPage, fromLines = false, edgeFound = false;
   if (opts.crop === 'auto') {
     corners = detectPage(canvas, opts.subject);
     // ページの端がはっきり写っていない（白い机に白い紙、ページが写真からはみ出す等）ときは、
@@ -1176,7 +1317,12 @@ export async function processImage(original, opts) {
     if (opts.subject !== 'screen' && opts.lines && (!corners || insideSides(corners) < 3)) {
       const blocks = linesQuads(opts.lines, canvas.width, canvas.height);
       let pick = null;
-      if (opts.half && blocks.length >= 2) {
+      // まず、すべての行を囲む範囲から外へたどって紙の端を探す（図の多いページや、机と紙の色が違うとき）。
+      // 三辺以上で紙の端が見つかれば、それを使う（見開きは後で のど で左右に分ける）
+      const span = linesSpan(opts.lines, canvas.width, canvas.height), info = {};
+      const paper = span && expandToPaper(canvas, span, [], info);
+      if (paper && info.found >= 3) { pick = { corners: paper, done: true }; edgeFound = true; }
+      else if (opts.half && blocks.length >= 2) {
         const two = blocks.slice(0, 2).sort((a, b) => a.cx - b.cx);
         pick = opts.half === 'left' ? two[0] : two[1];
         perPage = true;
@@ -1198,7 +1344,7 @@ export async function processImage(original, opts) {
   await tick();
   let skew = 0;
   // 文字のかたまりに合わせて切り抜き、台形のゆがみも直す（ページの端が見つからなかったとき・余白が多いとき）
-  if (opts.crop === 'auto' && (fromLines || !perPage) && opts.subject !== 'screen' && opts.filter !== 'none') {
+  if (opts.crop === 'auto' && !edgeFound && (fromLines || !perPage) && opts.subject !== 'screen' && opts.filter !== 'none') {
     const q = textBlock(canvas);
     if (q) { canvas = warp(canvas, q, Math.max(canvas.width, canvas.height)); await tick(); }
   }
