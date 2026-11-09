@@ -1,8 +1,8 @@
 // ScanLite: すべての処理をブラウザー内で行う。撮影画像・PDF・OCR結果はネットワークに送らない。
-import { processImage as processHere, decode, drawRotated, detectPage, FULL_FRAME, recompress, limitOriginal as limitHere, cropTop, orientCandidates, linesVertical } from './scan.js';
+import { processImage as processHere, processSpread as spreadHere, finishHalf as finishHere, decode, drawRotated, detectPage, FULL_FRAME, recompress, limitOriginal as limitHere, cropTop, orientCandidates, linesVertical } from './scan.js';
 import * as db from './db.js';
 import { buildPdf } from './pdf.js';
-import { recognize, orientScores, textLines } from './ocr.js';
+import { recognize, textLines, warmUp } from './ocr.js';
 import { createCamera } from './camera.js';
 import * as save from './save.js';
 
@@ -25,26 +25,32 @@ const MODE_TEXT = {
 const SCAN_POOL = Math.max(1, Math.min(2, (navigator.hardwareConcurrency || 2) - 2));
 const scanWorkers = [];
 let scanSeq = 0, scanBroken = typeof OffscreenCanvas === 'undefined';
-function scanWorker() {
-  // いちばん空いているワーカーを使う
+function scanWorker(busy = null) {
+  // いちばん空いているワーカーを使う（busy は今まさに使っているワーカー。なるべく避ける）
   if (scanWorkers.length < SCAN_POOL) {
     const w = new Worker(new URL('./scan-worker.js', import.meta.url), { type: 'module' });
     w.jobs = new Map();
-    w.onmessage = ({ data: { id, result, error } }) => {
+    w.onmessage = ({ data: { id, result, error, second } }) => {
       const job = w.jobs.get(id); if (!job) return;
+      if (second !== undefined) return job.onSecond?.(second, w);
       w.jobs.delete(id);
       error ? job.reject(new Error(error)) : job.resolve(result);
     };
     w.onerror = e => { scanBroken = true; for (const j of w.jobs.values()) j.reject(new Error(e.message || 'worker error')); w.jobs.clear(); };
     scanWorkers.push(w);
   }
-  return scanWorkers.reduce((a, b) => (b.jobs.size < a.jobs.size ? b : a));
+  const load = w => w.jobs.size + (w === busy ? 1 : 0);
+  return scanWorkers.reduce((a, b) => (load(b) < load(a) ? b : a));
 }
-async function inWorker(op, blob, opts, here) {
+async function inWorker(op, blob, opts, here, extra = {}, onSecond = null, busy = null) {
   if (!scanBroken) {
     try {
-      const w = scanWorker();
-      return await new Promise((resolve, reject) => { const id = ++scanSeq; w.jobs.set(id, { resolve, reject }); w.postMessage({ id, op, blob, opts }); });
+      const w = scanWorker(busy);
+      return await new Promise((resolve, reject) => {
+        const id = ++scanSeq;
+        w.jobs.set(id, { resolve, reject, onSecond });
+        w.postMessage({ id, op, blob, opts, ...extra }, extra.image ? [extra.image] : []);
+      });
     } catch (e) {
       // ワーカー自体が動かないときだけ、画面のスレッドで処理する
       if (!scanBroken) throw e;
@@ -55,10 +61,31 @@ async function inWorker(op, blob, opts, here) {
 }
 const processImage = (blob, opts) => inWorker('process', blob, opts, () => processHere(blob, opts));
 const limitOriginal = blob => inWorker('limit', blob, null, () => limitHere(blob));
+// 見開きの左右のページ（同じ写真・同じ設定）をまとめて補正する。範囲・台形・紙の反りの補正は1回だけ行い、
+// のどで切り分けたあとの仕上げは、左右を2つのワーカーで同時に行う。返り値: [1ページ目, 2ページ目] の Promise
+function processSpread(blob, optsA, optsB) {
+  let secondDone;
+  const second = new Promise((resolve, reject) => { secondDone = { resolve, reject }; });
+  const pass = SCAN_POOL > 1;
+  const onSecond = (half, busy) => {
+    // 左右で範囲を別々に求めるときは、2ページ目を最初から補正する
+    const job = half ? inWorker('finish', null, optsB, () => finishHere(half.image, optsB, half.state), { image: half.image, state: half.state }, null, busy)
+      : inWorker('process', blob, optsB, () => processHere(blob, optsB), {}, null, busy);
+    job.then(secondDone.resolve, secondDone.reject);
+  };
+  const first = inWorker('spread', blob, optsA, () => spreadHere(blob, optsA, optsB), { optsB, pass }, pass ? onSecond : null)
+    .then(r => { if (r.second) secondDone.resolve(r.second); return r.first; });
+  first.catch(e => secondDone.reject(e));
+  return [first, second];
+}
 
 // 横倒しに写った写真の向きを決める（同じ写真から作る左右のページで1回だけ）。
-// 文字を読んで確かさの高い向きを選び、決めきれないときはスマホの傾き（撮影時）を使う
+// 文字を読んで確かさの高い向きを選び、決めきれないときはスマホの傾き（撮影時）を使う。
+// 向きの判定は文字の行の検出といっしょに行う（前の写真と同じ向きと仮定して行を検出し、その行を
+// 向きを変えて読み比べる。仮定が外れたときだけ検出し直す）。求めた行は ensureLines で使う
 const rotationCache = new Map();
+let lastTurn = null;
+const tiltTurn = p => (typeof p.tilt === 'number' && Math.abs(p.tilt) > 1.5 ? (p.tilt > 0 ? 270 : 90) : null);
 function decideRotation(p) {
   const key = p.capture;
   if (!rotationCache.has(key)) {
@@ -66,14 +93,21 @@ function decideRotation(p) {
       const split = !!p.half;
       const g = await inWorker('orient', p.original, { split }, () => orientCandidates(p.original, split));
       if (!g.need) return 0;
-      const s = await orientScores(g.cands), turns = [0, 90, 270];
-      if (s) {
-        const best = s.indexOf(Math.max(...s)), other = Math.max(...s.filter((_, i) => i !== best));
-        if (s[best] - other > 0.02) return turns[best];
+      const turns = [0, 90, 270], guess = lastTurn ?? tiltTurn(p) ?? 90;
+      const r = await textLines(p.original, guess, turns);
+      if (r && r.scores) {
+        const s = r.scores, best = s.indexOf(Math.max(...s)), other = Math.max(...s.filter((_, i) => i !== best));
+        if (s[best] - other > 0.02) {
+          // この向きの文字の行はもう求めてあるので、覚えておく
+          if (r.rotation === turns[best]) rememberLines(p, r.rotation, Promise.resolve(r.lines));
+          lastTurn = turns[best];
+          return turns[best];
+        }
       }
       // 文字で決めきれないときは、撮影時のスマホの傾き（横持ちの向き）で決める
-      if (typeof p.tilt === 'number' && Math.abs(p.tilt) > 1.5) return p.tilt > 0 ? 270 : 90;
-      return 0;
+      const turn = tiltTurn(p) ?? 0;
+      if (r && r.rotation === turn) rememberLines(p, turn, Promise.resolve(r.lines));
+      return turn;
     })().catch(e => { console.error(e); return 0; }));
     if (rotationCache.size > 50) rotationCache.delete(rotationCache.keys().next().value);
   }
@@ -82,14 +116,16 @@ function decideRotation(p) {
 
 // 写真の中の文字の行を調べておく（ページの端が写っていないときに、行の並びから範囲とゆがみを求めるため）
 const linesCache = new Map();
+const linesKey = (p, rotation) => (p.capture ?? p.id) + ':' + rotation;
+function rememberLines(p, rotation, lines) {
+  linesCache.set(linesKey(p, rotation), lines);
+  if (linesCache.size > 50) linesCache.delete(linesCache.keys().next().value);
+}
 async function ensureLines(p) {
   if (p.crop !== 'auto' || p.mode === 'screen') return;
   if (p.lines && p.linesRotation === (p.rotation || 0)) return;
-  const key = (p.capture ?? p.id) + ':' + (p.rotation || 0);
-  if (!linesCache.has(key)) {
-    linesCache.set(key, textLines(p.original, p.rotation || 0));
-    if (linesCache.size > 50) linesCache.delete(linesCache.keys().next().value);
-  }
+  const key = linesKey(p, p.rotation || 0);
+  if (!linesCache.has(key)) rememberLines(p, p.rotation || 0, textLines(p.original, p.rotation || 0));
   p.lines = await linesCache.get(key);
   p.linesRotation = p.rotation || 0;
 }
@@ -580,18 +616,33 @@ async function enqueue(blobs, extra = {}) {
   processWaiting();
 }
 
+// 元写真を保存用の大きさにする（同じ写真から作る左右のページで1回だけ）
+const sizedCache = new Map();
+function sizedOriginal(p) {
+  if (p.capture == null) return limitOriginal(p.original);
+  if (!sizedCache.has(p.capture)) {
+    sizedCache.set(p.capture, limitOriginal(p.original).catch(e => { sizedCache.delete(p.capture); throw e; }));
+    if (sizedCache.size > 20) sizedCache.delete(sizedCache.keys().next().value);
+  }
+  return sizedCache.get(p.capture);
+}
+// 補正の下準備: 元写真の大きさ・向き・文字の行（どれも撮影ごとに1回だけ求め、結果を覚えておく）
+async function preparePage(p) {
+  if (!p.sized) { p.original = await sizedOriginal(p); p.sized = true; }
+  if (p.autoRotate) { p.rotation = await decideRotation(p); p.autoRotate = false; }
+  await ensureLines(p);
+}
+
 let working = false;
-async function processOne(p) {
+async function processOne(p, ready = preparePage(p), run = () => processImage(p.original, optionsOf(p))) {
   try {
-    if (!p.sized) { p.original = await limitOriginal(p.original); p.sized = true; }
-    if (p.autoRotate) { p.rotation = await decideRotation(p); p.autoRotate = false; }
-    await ensureLines(p);
+    await ready;
     // 見開きの順番: 横書きの本は左ページから、縦書きの本は右ページから（文字の向きで自動で決める）
     if (p.half && p.capture != null && p.lines) {
       const v = linesVertical(p.lines);
       if (v !== null) p.created = p.capture + ((p.half === 'left') === !v ? 0 : 1) / 2000;
     }
-    Object.assign(p, await processImage(p.original, optionsOf(p)));
+    Object.assign(p, await run());
   } catch (e) {
     console.error(e);
     p.failed = true;
@@ -611,7 +662,26 @@ async function processWaiting() {
       showPending();
       if (!waiting.length) break;
       // 撮った順に、ワーカーの数だけ同時に補正する
-      await Promise.all(waiting.slice(0, scanBroken ? 1 : SCAN_POOL).map(processOne));
+      // 見開きの左右のページ（同じ写真）は、共通の処理を1回にするため2枚まとめて補正する
+      const head = waiting[0], mate = head.half && head.capture != null && waiting.find(p => p !== head && p.capture === head.capture && p.half && p.half !== head.half);
+      const batch = mate ? [head, mate] : waiting.slice(0, scanBroken ? 1 : SCAN_POOL), ready = batch.map(p => preparePage(p));
+      // 今の写真の下準備が済んだら、補正している間に次の写真の下準備（向き・文字の行の検出）を始めておく。
+      // 文字の検出は補正とは別のスレッドで動くので、その分だけ待ち時間が減る
+      const next = waiting.find(p => !batch.some(b => b.id === p.id || (b.capture != null && b.capture === p.capture)));
+      if (next) Promise.allSettled(ready).then(() => preparePage({ ...next })).catch(e => console.error(e));
+      if (mate) {
+        let jobs = null;
+        const both = Promise.all(ready);
+        const run = i => async () => {
+          await both;
+          const [a, b] = batch.map(optionsOf);
+          // 設定が左右で違う（half 以外）ときは、別々に補正する
+          if (JSON.stringify({ ...a, half: 0 }) !== JSON.stringify({ ...b, half: 0 })) return processImage(batch[i].original, [a, b][i]);
+          jobs = jobs || processSpread(batch[0].original, a, b);
+          return jobs[i];
+        };
+        await Promise.all(batch.map((p, i) => processOne(p, ready[i], run(i))));
+      } else await Promise.all(batch.map((p, i) => processOne(p, ready[i])));
     }
   } finally {
     working = false;
@@ -670,6 +740,7 @@ $('#camera-button').onclick = () => {
   if (!navigator.mediaDevices?.getUserMedia) { $('#camera-input').click(); return; }
   syncCameraBar();
   camera.open();
+  if (mode !== 'screen') warmUp(); // 撮影を始める前にOCRの準備をしておく（向きの判定・文字の行の検出に使う）
 };
 $('#camera-dest').onclick = () => openDest('camera');
 

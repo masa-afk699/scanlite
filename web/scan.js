@@ -1905,13 +1905,44 @@ export async function recompress(blob, maxSide, quality) {
 // ---------- まとめ ----------
 // opts: { rotation, filter, crop: 'auto' | 'none' | corners, half: 'left' | 'right' | null, deskew, fingers, denoise }
 export async function processImage(original, opts) {
+  const s = await pageGeometry(original, opts);
+  return finishPage(s.split ? cropHalf(s.canvas, opts.half, s.gutter) : s.canvas, opts, s.state);
+}
+
+// 見開きの左右のページをまとめて補正する（範囲・台形・紙の反りの補正は左右で同じなので1回だけ行う）。
+// optsA と optsB は half だけが違う。onSecond があれば、2ページ目の画像（のどで切り分けたもの）を渡して
+// 別のスレッドで仕上げてもらう（このときの返り値の second は null）。
+// 左右で範囲を別々に求めるとき（行のかたまりから1ページずつ求めるとき）は、2ページ目を最初から処理する
+export async function processSpread(original, optsA, optsB, onSecond = null) {
+  const s = await pageGeometry(original, optsA);
+  if (!s.split) {
+    const first = await finishPage(s.canvas, optsA, s.state);
+    if (onSecond) { onSecond(null); return { first, second: null }; }
+    return { first, second: await processImage(original, optsB) };
+  }
+  const b = cropHalf(s.canvas, optsB.half, s.gutter);
+  if (onSecond) { onSecond({ image: await createImageBitmap(b), state: s.state }); }
+  const first = await finishPage(cropHalf(s.canvas, optsA.half, s.gutter), optsA, s.state);
+  return { first, second: onSecond ? null : await finishPage(b, optsB, s.state) };
+}
+
+// processSpread で切り分けた2ページ目の画像を仕上げる
+export async function finishHalf(image, opts, state) {
+  const c = makeCanvas(image.width, image.height);
+  ctx2d(c).drawImage(image, 0, 0);
+  image.close?.();
+  return finishPage(c, opts, state);
+}
+
+// 範囲の検出・台形の補正・紙の反りの補正まで（見開きは、のどで切り分ける前の画像を返す）
+async function pageGeometry(original, opts) {
   const bitmap = await decode(original);
   // 見開きは2ページ分あるので、1ページあたりの細かさが落ちないよう大きめに扱う
   const maxSide = opts.half ? MAX_SIDE * 1.5 : MAX_SIDE;
   let canvas = drawRotated(bitmap, opts.rotation || 0, maxSide);
   bitmap.close?.();
   await tick();
-  let corners = null, perPage = Array.isArray(opts.crop) && !!opts.perPage, fromLines = false, edgeFound = false, extended = false, leveled = false;
+  let corners = null, perPage = Array.isArray(opts.crop) && !!opts.perPage, fromLines = false, edgeFound = false, extended = false;
   if (opts.crop === 'auto') {
     corners = detectPage(canvas, opts.subject);
     // ページの端がはっきり写っていない（白い机に白い紙、ページが写真からはみ出す等）ときは、
@@ -1960,7 +1991,13 @@ export async function processImage(original, opts) {
   // 見開きの左右の境目は、文字の行のすき間から求める（のどの影がはっきりしない・中央からずれているときも正しく分ける）
   const gutter = opts.half && !perPage && corners && opts.lines ? linesGutter(canvas, corners, before, opts.lines) : null;
   if (corners && fromLines) { canvas = straightenLines(canvas, corners, before, opts.lines, gutter); await tick(); }
-  if ((opts.half === 'left' || opts.half === 'right') && !perPage) canvas = cropHalf(canvas, opts.half, gutter);
+  const split = (opts.half === 'left' || opts.half === 'right') && !perPage;
+  return { canvas, gutter, split, state: { corners, perPage, fromLines, edgeFound, extended } };
+}
+
+// 切り出したページの仕上げ（行の波打ち・明るさ・色・文字のくっきり・傾き・端の掃除）
+async function finishPage(canvas, opts, { corners, perPage, fromLines, edgeFound, extended }) {
+  let leveled = false;
   // 行の波打ち・傾きを画像から測って仕上げる（横書きの紙のみ。2回かけて残りを詰める）
   if (opts.subject !== 'screen' && opts.crop === 'auto' && opts.lines && linesVertical(opts.lines) === false) {
     for (let i = 0; i < 2; i++) { const c2 = levelRows(canvas); if (c2 === canvas) break; canvas = c2; leveled = true; await tick(); }
@@ -1989,8 +2026,8 @@ export async function processImage(original, opts) {
 
 // ---------- 向きの自動判定 ----------
 // スマホを横にして撮ると、縦向きに固定した画面では本が90度回って写る。
-// ページの形から「90度回す必要があるか」を調べ、必要なら右回り・左回りの2つの候補画像を作る
-// （そのまま・右回り・左回りのどれが正しいかは文字を読んで決める）。split: 見開き（左右2ページ）として撮ったか
+// ページの形から「90度回す必要があるか」を調べる（そのまま・右回り・左回りのどれが正しいかは、
+// 文字の行を向きを変えて読み比べて決める）。split: 見開き（左右2ページ）として撮ったか
 export async function orientCandidates(blob, split) {
   const bitmap = await decode(blob);
   let canvas = drawRotated(bitmap, 0, 1400);
@@ -1999,19 +2036,7 @@ export async function orientCandidates(blob, split) {
   if (corners) canvas = warp(canvas, corners);
   const w = canvas.width, h = canvas.height;
   // 見開きは横長、1ページは縦長のはず。そうでなければ横倒しに写っている
-  const need = split ? h > w * 1.05 : w > h * 1.15;
-  if (!need) return { need: false };
-  const k = Math.min(1, 1100 / Math.max(w, h));
-  const small = makeCanvas(Math.round(w * k), Math.round(h * k));
-  ctx2d(small).drawImage(canvas, 0, 0, small.width, small.height);
-  const cands = [];
-  for (const r of [0, 90, 270]) {
-    const c = r ? makeCanvas(small.height, small.width) : makeCanvas(small.width, small.height), x = ctx2d(c);
-    x.translate(c.width / 2, c.height / 2); x.rotate(r * Math.PI / 180);
-    x.drawImage(small, -small.width / 2, -small.height / 2);
-    cands.push(await toJpeg(c, 0.85));
-  }
-  return { need: true, cands };
+  return { need: split ? h > w * 1.05 : w > h * 1.15 };
 }
 
 // 画像の上の方だけを切り出す（題名の読み取り用。小さい画像の方がOCRが速い）

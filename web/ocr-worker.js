@@ -128,15 +128,35 @@ let queue = Promise.resolve();
 self.onmessage = e => { queue = queue.then(() => handle(e.data)); };
 // 行の位置: 検出した各行に直線を当てはめ、両端の点と太さを返す（ページの範囲と台形のゆがみを求めるのに使う）。
 // 座標は画像に対する割合
-async function textLines(blob, rotation) {
-  let bitmap = await createImageBitmap(blob);
-  if (rotation) {
-    const swap = rotation % 180 !== 0, c = new OffscreenCanvas(swap ? bitmap.height : bitmap.width, swap ? bitmap.width : bitmap.height), x = c.getContext('2d');
-    x.translate(c.width / 2, c.height / 2); x.rotate(rotation * Math.PI / 180); x.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
-    bitmap.close(); bitmap = c.transferToImageBitmap();
+// choose（向きの候補の配列）があるときは、向きの判定もいっしょに行う: rotation の向きで検出した行を
+// 候補の向きに回して読み比べ、はっきり別の向きが正しければ、その向きで行を検出し直す
+// （向きの判定のためだけに文字の検出をし直さなくてよいので速い）。返り値: { lines, scores, rotation }
+async function textLines(blob, rotation, choose = null) {
+  const source = await createImageBitmap(blob);
+  let bitmap = turned(source, rotation), { prob, w, h, W, H } = await probMap(bitmap), scores = null;
+  if (choose) {
+    const boxes = topBoxes(regionsOf(prob, w, h, W, H, w * h));
+    scores = await scoreTurns(bitmap, boxes, choose.map(a => (a - rotation + 360) % 360));
+    const best = scores.indexOf(Math.max(...scores)), other = Math.max(...scores.filter((_, i) => i !== best));
+    if (scores[best] - other > 0.02 && choose[best] !== rotation) {
+      rotation = choose[best];
+      bitmap.close(); bitmap = turned(source, rotation);
+      ({ prob, w, h } = await probMap(bitmap));
+    }
   }
-  const { prob, w, h } = await probMap(bitmap);
-  bitmap.close();
+  bitmap.close(); source.close();
+  const lines = linesOf(prob, w, h);
+  return choose ? { lines, scores, rotation } : lines;
+}
+
+// 画像を右回りに rotation 度回したもの
+function turned(bitmap, rotation) {
+  const swap = rotation % 180 !== 0, c = new OffscreenCanvas(swap ? bitmap.height : bitmap.width, swap ? bitmap.width : bitmap.height), x = c.getContext('2d');
+  x.translate(c.width / 2, c.height / 2); x.rotate(rotation * Math.PI / 180); x.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
+  return c.transferToImageBitmap();
+}
+
+function linesOf(prob, w, h) {
   const label = new Uint8Array(w * h), stack = [], lines = [];
   for (let s0 = 0; s0 < w * h; s0++) {
     if (prob[s0] <= 0.3 || label[s0]) continue;
@@ -177,31 +197,48 @@ async function textLines(blob, rotation) {
   return lines;
 }
 
-// 向きの判定: 候補の画像それぞれで行を読み、読み取りの確かさ（平均の確信度）を返す。
-// 逆さまや横倒しの文字は確信度が下がるので、いちばん高い向きが正しい向き
-async function orient(blobs) {
-  const scores = [];
-  for (const blob of blobs) {
-    const bitmap = await createImageBitmap(blob);
-    const boxes = (await detect(bitmap)).filter(b => Math.min(b.x1 - b.x0, b.y1 - b.y0) >= 8)
-      .sort((a, b) => (b.x1 - b.x0) * (b.y1 - b.y0) - (a.x1 - a.x0) * (a.y1 - a.y0)).slice(0, 12);
-    let sum = 0, n = 0;
-    // 横向きの行として読む（横倒しの文字は縦長の枠になり、読めずに確信度が下がる）
-    for (const b of boxes) { const r = await read(bitmap, b, true); sum += r.text ? r.conf : 0; n++; }
-    bitmap.close();
-    scores.push(n ? sum / n : 0);
+// 読み比べに使う行: 大きい順に12行まで（小さすぎる枠は読めないので除く）
+const topBoxes = boxes => boxes.filter(b => Math.min(b.x1 - b.x0, b.y1 - b.y0) >= 8)
+  .sort((a, b) => (b.x1 - b.x0) * (b.y1 - b.y0) - (a.x1 - a.x0) * (a.y1 - a.y0)).slice(0, 12);
+
+// 向きの判定: 行の枠 boxes を、画像ごと右回りに turns の各角度だけ回した向きで読み、向きごとの平均の確信度を返す。
+// 逆さまや横倒しの文字は確信度が下がるので、いちばん高い向きが正しい向き。
+// 大きい行から読み、はっきり差がついたら残りは読まない
+async function scoreTurns(bitmap, boxes, turns) {
+  const sum = turns.map(() => 0), wins = turns.map(() => 0);
+  let n = 0;
+  for (const b of boxes) {
+    const got = [];
+    for (let k = 0; k < turns.length; k++) { const r = await readTurned(bitmap, b, turns[k]); got.push(r.text ? r.conf : 0); sum[k] += got[k]; }
+    n++;
+    wins[got.indexOf(Math.max(...got))]++;
+    // 4行以上読んで、同じ向きがほぼ毎回勝ち、平均でも大きく離れていれば決まり
+    if (n >= 4) {
+      const best = sum.indexOf(Math.max(...sum)), second = Math.max(...sum.filter((_, i) => i !== best));
+      if (wins[best] >= n - 1 && (sum[best] - second) / n > 0.3) break;
+    }
   }
-  return scores;
+  return sum.map(s => (n ? s / n : 0));
 }
 
-async function handle({ id, blob, orient: cands, lines, rotation }) {
-  if (lines) {
-    try { await load(); self.postMessage({ id, result: await textLines(blob, rotation || 0) }); }
+// 画像の中の行の枠 b を、画像ごと右回りに turn 度回したときの向きで切り出して読む（横書きの行として）
+async function readTurned(bitmap, b, turn) {
+  if (!turn) return read(bitmap, b, true);
+  const bw = b.x1 - b.x0, bh = b.y1 - b.y0, swap = turn % 180 !== 0;
+  const c = canvas(Math.max(1, Math.round(swap ? bh : bw)), Math.max(1, Math.round(swap ? bw : bh))), x = c.getContext('2d');
+  x.translate(c.width / 2, c.height / 2); x.rotate(turn * Math.PI / 180);
+  x.drawImage(bitmap, b.x0, b.y0, bw, bh, -bw / 2, -bh / 2, bw, bh);
+  return read(c, { x0: 0, y0: 0, x1: c.width, y1: c.height }, true);
+}
+
+async function handle({ id, blob, lines, rotation, choose, warm }) {
+  if (warm) {
+    try { await load(); self.postMessage({ id, result: true }); }
     catch (err) { self.postMessage({ id, error: String(err && err.message || err) }); }
     return;
   }
-  if (cands) {
-    try { await load(); self.postMessage({ id, result: await orient(cands) }); }
+  if (lines) {
+    try { await load(); self.postMessage({ id, result: await textLines(blob, rotation || 0, choose || null) }); }
     catch (err) { self.postMessage({ id, error: String(err && err.message || err) }); }
     return;
   }

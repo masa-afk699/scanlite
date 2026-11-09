@@ -66,26 +66,24 @@ function recognizePaddle(blob, onProgress) {
   });
 }
 
-// 向きの候補（画像）ごとに、文字として読めた確かさを返す。使えない端末では null
-export async function orientScores(blobs) {
-  if (paddleFailed) return null;
-  try {
-    return await new Promise((resolve, reject) => {
-      const id = ++seq;
-      jobs.set(id, { resolve, reject, onProgress: () => {} });
-      paddleWorker().postMessage({ id, orient: blobs });
-    });
-  } catch (e) { console.error(e); return null; }
+// 文字の検出・認識のモデルを先に読み込んでおく（カメラを開いたときに呼ぶと、1枚目の補正が早く終わる）
+export function warmUp() {
+  if (paddleFailed) return;
+  const id = ++seq;
+  jobs.set(id, { resolve: () => {}, reject: () => {}, onProgress: () => {} });
+  paddleWorker().postMessage({ id, warm: true });
 }
 
-// 写真の中の文字の行（両端の点と太さ、割合）。使えない端末では null
-export async function textLines(blob, rotation = 0) {
+// 写真の中の文字の行（両端の点と太さ、割合）。使えない端末では null。
+// choose（向きの候補の配列）を渡すと向きの判定もいっしょに行い、{ lines, scores, rotation } を返す
+// （scores は候補ごとの読み取りの確かさ、lines は rotation の向きで検出した行）
+export async function textLines(blob, rotation = 0, choose = null) {
   if (paddleFailed) return null;
   try {
     return await new Promise((resolve, reject) => {
       const id = ++seq;
       jobs.set(id, { resolve, reject, onProgress: () => {} });
-      paddleWorker().postMessage({ id, blob, lines: true, rotation });
+      paddleWorker().postMessage({ id, blob, lines: true, rotation, choose });
     });
   } catch (e) { console.error(e); return null; }
 }
