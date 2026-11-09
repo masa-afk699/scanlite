@@ -539,12 +539,27 @@ function flattenFine(d, W, H) {
 }
 
 // 紙を白・文字の芯を黒にする直線の濃度補正。曲線をかけないので、文字が太らず輪郭もなめらかなまま
-function documentTone(d, Y) {
+function documentTone(d, Y, W, H) {
   const hist = new Uint32Array(256);
   for (let p = 0; p < Y.length; p += 3) hist[Y[p]]++;
   const total = hist.reduce((a, b) => a + b, 0);
   const pct = q => { let acc = 0; for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= total * q) return v; } return 255; };
-  const paper = pct(0.6), black = Math.min(pct(0.004), paper - 90);
+  // 文字の芯の濃さは、文字のある小さな区画ごとに調べた値から決める。画像全体のいちばん暗い所で
+  // 決めると、端に写り込んだ机・影・指のような真っ黒な部分に引っぱられて、文字が灰色のまま残る
+  const G = Math.max(16, Math.round(Math.max(W, H) / 48)), cells = [], ch = new Uint32Array(256);
+  for (let gy = 0; gy + G <= H; gy += G) for (let gx = 0; gx + G <= W; gx += G) {
+    ch.fill(0); let n = 0;
+    for (let y = gy; y < gy + G; y += 2) for (let x = gx; x < gx + G; x += 2) { ch[Y[y * W + x]]++; n++; }
+    let acc = 0, med = 0, ink = 0;
+    for (; med < 256; med++) { acc += ch[med]; if (acc >= n * 0.5) break; }
+    if (med < 200) continue; // 紙の少ない区画（図・帯・紙の外）
+    acc = 0; for (; ink < 256; ink++) { acc += ch[ink]; if (acc >= n * 0.03) break; }
+    if (med - ink > 50) cells.push(ink);
+  }
+  cells.sort((a, b) => a - b);
+  const paper = pct(0.6), darkest = pct(0.004);
+  const core = cells.length >= 12 ? cells[Math.floor(cells.length * 0.15)] : darkest;
+  const black = Math.min(Math.max(darkest, core), paper - 90);
   const white = Math.max(black + 60, paper - 16), k = 255 / (white - black);
   const lut = new Uint8ClampedArray(256);
   // 芯はほぼ黒に、中間調は少し濃く（小さい文字やかすれた文字も読みやすく）
@@ -558,17 +573,18 @@ function documentTone(d, Y) {
 // 紙の白さを保ったまま文字の濃さを広げる。灰色で印刷された行のように、すぐ近くに濃い文字が
 // ある所は元から薄い印刷なので、そのままにする。紙は白（250前後）にそろえてある前提
 function liftFaded(d, W, H) {
-  const G = Math.max(16, Math.round(Math.max(W, H) / 48)), gw = Math.ceil(W / G), gh = Math.ceil(H / G);
+  // 区画は文字1〜2字ぶん。1行の中で一部の字だけ光って薄くなった所も、その字だけ濃くできる
+  const G = Math.max(10, Math.round(Math.max(W, H) / 96)), gw = Math.ceil(W / G), gh = Math.ceil(H / G);
   // 区画ごとの紙の明るさ（中央値）と、文字の濃さとの差（コントラスト）
   const paper = new Float32Array(gw * gh).fill(NaN), con = new Float32Array(gw * gh).fill(NaN), hist = new Uint32Array(256);
   for (let gy = 0; gy < gh; gy++) for (let gx = 0; gx < gw; gx++) {
     hist.fill(0); let n = 0;
-    for (let y = gy * G; y < Math.min(H, gy * G + G); y += 2) for (let x = gx * G; x < Math.min(W, gx * G + G); x += 2) {
+    for (let y = gy * G; y < Math.min(H, gy * G + G); y++) for (let x = gx * G; x < Math.min(W, gx * G + G); x++) {
       const i = (y * W + x) * 4; hist[(d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8]++; n++;
     }
     if (!n) continue;
     let acc = 0, ink = 0, med = 0;
-    for (; ink < 256; ink++) { acc += hist[ink]; if (acc >= n * 0.01) break; }
+    for (; ink < 256; ink++) { acc += hist[ink]; if (acc >= Math.max(2, n * 0.02)) break; }
     acc = 0; for (; med < 256; med++) { acc += hist[med]; if (acc >= n * 0.5) break; }
     if (med < 215) continue; // 紙の部分が少ない区画（図・写真・見出しの帯）
     paper[gy * gw + gx] = med;
@@ -579,20 +595,22 @@ function liftFaded(d, W, H) {
   if (vals.length < 20) return;
   const ref = vals[Math.floor(vals.length * 0.6)]; // ふつうの文字のコントラスト
   if (ref < 40) return; // 全体が淡い（もともと薄い印刷・鉛筆など）は何もしない
-  // すぐ周り（上下左右に1〜2行分）でいちばんはっきりした文字。白飛びの所では一帯の文字がすべて薄い
-  const R = 1, gain = new Float32Array(gw * gh).fill(1);
+  // 文字と紙の差が、ふつうの文字よりはっきり小さい区画を濃くする。
+  // 周り一帯がそろって薄い（強い白飛び）ときは大きく、その区画だけ薄いときは控えめに
+  const R = 2, gain = new Float32Array(gw * gh).fill(1);
   let any = false;
   for (let gy = 0; gy < gh; gy++) for (let gx = 0; gx < gw; gx++) {
-    let m = 0, cnt = 0;
+    const own = con[gy * gw + gx];
+    if (isNaN(own) || own > ref * 0.72) continue;
+    let m = 0, cnt = 0, edge = false;
     for (let yy = Math.max(0, gy - R); yy <= Math.min(gh - 1, gy + R); yy++) for (let xx = Math.max(0, gx - R); xx <= Math.min(gw - 1, gx + R); xx++) {
       const v = con[yy * gw + xx]; if (!isNaN(v)) { m = Math.max(m, v); cnt++; }
+      // 紙でない所（見出しの帯・図）のすぐそばは濃くしない
+      if (Math.abs(yy - gy) <= 1 && Math.abs(xx - gx) <= 1 && isNaN(paper[yy * gw + xx])) edge = true;
     }
-    if (cnt < 4 || m > ref * 0.6) continue; // 文字と紙の差が、ふつうの6割もない所だけ
-    // 紙でない所（見出しの帯・図）のすぐそばは濃くしない
-    let edge = false;
-    for (let yy = Math.max(0, gy - 1); yy <= Math.min(gh - 1, gy + 1); yy++) for (let xx = Math.max(0, gx - 1); xx <= Math.min(gw - 1, gx + 1); xx++) if (isNaN(paper[yy * gw + xx])) edge = true;
     if (edge) continue;
-    gain[gy * gw + gx] = Math.min(8, ref / Math.max(4, m));
+    const all = cnt >= 6 && m <= ref * 0.6;
+    gain[gy * gw + gx] = Math.min(all ? 8 : 3, ref * (all ? 1 : 0.92) / Math.max(4, own));
     any = true;
   }
   if (!any) return;
@@ -622,6 +640,45 @@ function liftFaded(d, W, H) {
     const P = Math.max(150, at(p2, x, y, 250)), i = (y * W + x) * 4;
     for (let ch = 0; ch < 3; ch++) d[i + ch] = Math.max(0, Math.min(255, 250 - (P - d[i + ch]) * k));
   }
+}
+
+// べた塗りの所（紙の白がほとんど見えない、ある程度の広さの暗い面）を見つけ、ざらつきをならす。
+// d と Y を書き換え、べた塗りの画素を 1 にしたマスクを返す（なければ null）
+function smoothFills(d, Y, S, W, H) {
+  const r = Math.max(3, Math.round(Math.max(W, H) / 260)), W1 = W + 1;
+  const integ = f => { const I = new Uint32Array(W1 * (H + 1)); for (let y = 0; y < H; y++) { let rs = 0; for (let x = 0; x < W; x++) { rs += f(y * W + x); I[(y + 1) * W1 + x + 1] = I[y * W1 + x + 1] + rs; } } return I; };
+  const box = (I, x, y, rr) => { const x0 = Math.max(0, x - rr), y0 = Math.max(0, y - rr), x1 = Math.min(W, x + rr + 1), y1 = Math.min(H, y + rr + 1); return [I[y1 * W1 + x1] - I[y0 * W1 + x1] - I[y1 * W1 + x0] + I[y0 * W1 + x0], (x1 - x0) * (y1 - y0)]; };
+  // 候補: 周りの平均が暗く、紙の白い画素がほとんどない
+  const IY = integ(p => Y[p]), IW = integ(p => (Y[p] >= 232 ? 1 : 0));
+  const cand = new Uint8Array(W * H); let any = 0;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const [sy, n] = box(IY, x, y, r), [sw] = box(IW, x, y, r);
+    if (sy / n < 205 && sw < n * 0.18) { cand[y * W + x] = 1; any++; }
+  }
+  if (any < W * H * 0.002) return null;
+  // 広さのあるものだけ（線の詰まった字は周りに紙の白があるので、広い範囲では候補が続かない）
+  const IC = integ(p => cand[p]), core = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { if (!cand[y * W + x]) continue; const [c, n] = box(IC, x, y, r * 2); if (c > n * 0.82) core[y * W + x] = 1; }
+  const IK = integ(p => core[p]), fill = new Uint8Array(W * H); any = 0;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const p = y * W + x; if (cand[p] && Y[p] < 232 && box(IK, x, y, r * 2)[0] > 0) { fill[p] = 1; any++; } }
+  if (!any) return null;
+  // べた塗りの画素だけの平均でならす。平均から大きく離れた画素（白抜きの字・中の線）はそのまま
+  const IF = integ(p => fill[p]), IFY = integ(p => (fill[p] ? Y[p] : 0));
+  const out = new Float32Array(W * H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const p = y * W + x; if (!fill[p]) continue;
+    // 白抜きの字や線は数画素まとまって平均から離れる（3x3平均 S で見る）。ざらつきは1画素ごとにばらつくだけ
+    const [n] = box(IF, x, y, r), [sy] = box(IFY, x, y, r), mean = sy / n, df = Math.abs(S[p] - mean);
+    const t = Math.min(1, Math.max(0.3, (df - 5) / 8)); // 小さいほど強くならす。1: そのまま
+    out[p] = mean + (Y[p] - mean) * t;
+  }
+  for (let p = 0, i = 0; p < fill.length; p++, i += 4) {
+    if (!fill[p]) continue;
+    // 色のついた塗り（色帯・写真）は色を保ち、明るさだけならす
+    const dv = out[p] - Y[p];
+    d[i] += dv; d[i + 1] += dv; d[i + 2] += dv; Y[p] = out[p];
+  }
+  return fill;
 }
 
 // 背景のまだら・縞・薄い汚れを白にし、点状のゴミとページ端の線を消す。
@@ -654,12 +711,16 @@ function cleanDocument(d, W, H, { binarize, fine = false }) {
       d[i] = d[i + 1] = d[i + 2] = S[p] >= hi ? 255 : v;
     }
   } else {
+    // 見出しの帯・図の塗りのような「べた塗り」の所は、印刷の網点や紙のざらつきが輪郭の強調で
+    // まだら・砂目になる。そこは強調せず、ならして元のなめらかな濃淡に戻す（中の白抜き文字は残す）
+    const fill = smoothFills(d, Y, S, W, H);
     // 輪郭を少し締めて、にじんだ文字を細く・くっきりさせる
     for (let p = 0, i = 0; p < Y.length; p++, i += 4) {
+      if (fill && fill[p]) continue;
       const dv = 0.9 * (Y[p] - S[p]);
       if (dv) { d[i] += dv; d[i + 1] += dv; d[i + 2] += dv; }
     }
-    documentTone(d, Y);
+    documentTone(d, Y, W, H);
   }
   // 点状のゴミ（文字にしては小さすぎる暗い点）を消す
   const Y2 = luma(d, W, H), dark = new Uint8Array(W * H);
@@ -1055,6 +1116,95 @@ function blockQuad(rows, cs, pitch) {
   return pts;
 }
 
+// ---------- 行の範囲から、図・見出し・ページ番号まで広げる ----------
+// 紙の端が見つからないとき（白い机に白い紙など）は文字の行から範囲を決めるが、行だけだと
+// 見出しの帯・イラスト・ページ番号が切れてしまう。行の四角形を同じ台形のまま外へ少しずつ広げ、
+// 紙の上にある印刷（周りの紙より暗い所）が続く限り含める。机など紙でない所に出たら止める。
+// sides: 辺ごとにどこまで探すか [上, 右, 下, 左]（1: ふつう。0: 探さず少し余白を足すだけ。見開きの のど側は隣のページの文字が続くので0）
+export function extendToContent(canvas, corners, sides = [1, 1, 1, 1]) {
+  const img = shrink(canvas, 800), { width: w, height: h, data: d } = img;
+  const Y = new Float32Array(w * h);
+  for (let i = 0, p = 0; p < Y.length; i += 4, p++) Y[p] = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+  // 近くの紙の明るさ: 小さな区画の最大値を、となりの区画とならす（文字は消え、影の明暗は残る）
+  const B = 8, bw = Math.ceil(w / B), bh = Math.ceil(h / B), bm = new Float32Array(bw * bh), bg = new Float32Array(bw * bh);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const q = ((y / B) | 0) * bw + ((x / B) | 0); if (Y[y * w + x] > bm[q]) bm[q] = Y[y * w + x]; }
+  for (let by = 0; by < bh; by++) for (let bx = 0; bx < bw; bx++) {
+    const v = [];
+    for (let yy = Math.max(0, by - 1); yy <= Math.min(bh - 1, by + 1); yy++) for (let xx = Math.max(0, bx - 1); xx <= Math.min(bw - 1, bx + 1); xx++) v.push(bm[yy * bw + xx]);
+    v.sort((a, b) => a - b); bg[by * bw + bx] = v[v.length >> 1];
+  }
+  const bgAt = (x, y) => bg[((y / B) | 0) * bw + ((x / B) | 0)];
+  const m = squareToQuad(corners.map(([x, y]) => [x * w, y * h]));
+  const map = (u, v) => { const z = m.g * u + m.h * v + 1; return [(m.a * u + m.b * v + m.c) / z, (m.d * u + m.e * v + m.f) / z]; };
+  // 紙の明るさの基準（四角形の内側）
+  const ref = [];
+  for (let u = 0.05; u < 1; u += 0.05) for (let v = 0.05; v < 1; v += 0.05) { const [x, y] = map(u, v); if (x >= 0 && y >= 0 && x < w && y < h) ref.push(bgAt(x, y)); }
+  if (ref.length < 20) return corners;
+  ref.sort((a, b) => a - b);
+  const paper = ref[ref.length >> 1];
+  if (paper < 80) return corners;
+  const P = corners.map(([x, y]) => [x * w, y * h]);
+  const len = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+  const qw = (len(P[0], P[1]) + len(P[3], P[2])) / 2, qh = (len(P[0], P[3]) + len(P[1], P[2])) / 2;
+  const S = Math.max(qw, qh), gap = S * 0.5, margin = S * 0.03;
+  let u0 = 0, u1 = 1, v0 = 0, v1 = 1;
+  // 1辺ぶん外へたどる。dir: 0=上 1=右 2=下 3=左。返り値はその辺の新しい位置
+  const walk = dir => {
+    const horiz = dir === 0 || dir === 2, unit = horiz ? qh : qw, step = 1.5 / unit;
+    const sgn = dir === 0 || dir === 3 ? -1 : 1, start = [v0, u1, v1, u0][dir];
+    if (!sides[dir]) return start;
+    // 行の範囲の1.5倍より先へは広げない（遠くの物を拾わないように）
+    const limit = 1.5;
+    const a0 = horiz ? u0 : v0, a1 = horiz ? u1 : v1, n = Math.max(60, Math.round((a1 - a0) * (horiz ? qw : qh)));
+    let t = start, lastInk = start, stop = null;
+    const near = S * 0.08 / unit, hist = []; // [位置, 文字があったか] の記録（紙の外に出たときに直前の分を取り消す）
+    for (let k = 1; k < 4000; k++) {
+      t = start + sgn * step * k;
+      let out = 0, dark = 0, ink = 0, lo = n, hi = -1;
+      for (let i = 0; i < n; i++) {
+        const a = a0 + (a1 - a0) * (i + 0.5) / n, [x, y] = horiz ? map(a, t) : map(t, a);
+        if (!(x >= 0 && y >= 0 && x < w && y < h)) { out++; continue; }
+        const b = bgAt(x, y);
+        if (b < paper * 0.78) { dark++; continue; } // 紙より暗い面（机・影・紙の外）
+        // 両端に近い所の暗い点（紙の縁の影・となりのページ）は数えない
+        if (Y[(y | 0) * w + (x | 0)] < b * 0.72 && i > n * 0.04 && i < n * 0.96) { ink++; if (i < lo) lo = i; hi = i; }
+      }
+      if (out > n * 0.5) { stop = t; break; }        // 写真の端
+      if (dark > (n - out) * 0.35) { stop = t; break; } // 紙の外に出た
+      let isInk = ink >= 4 && ink < (n - out) * 0.6;
+      // 本文から離れた所では、ページ番号のような小さなものだけを中身とみなす
+      // （紙の縁の影・机の上の物の縁のような横に長いものは拾わない）
+      if (isInk && Math.abs(t - lastInk) > near && hi - lo > n * 0.25) isInk = false;
+      if (isInk) { lastInk = t; hist.push(t); }
+      if (Math.abs(t - lastInk) * unit > gap * sides[dir] || Math.abs(t - [0, 1, 1, 0][dir]) > limit) break;
+    }
+    // 紙の外（机の上の物・写真の端）に出たときは、そのすぐ手前で拾ったもの（物の縁）を取り消す
+    if (stop !== null) {
+      const cut = S * 0.03 / unit;
+      while (hist.length && Math.abs(stop - hist[hist.length - 1]) < cut) hist.pop();
+      lastInk = hist.length ? hist[hist.length - 1] : start;
+    }
+    stops[dir] = stop;
+    return lastInk;
+  };
+  const stops = [null, null, null, null];
+  for (let round = 0; round < 2; round++) {
+    if (sides[1]) u1 = walk(1);
+    if (sides[3]) u0 = walk(3);
+    if (sides[0]) v0 = walk(0);
+    if (sides[2]) v1 = walk(2);
+  }
+  // 余白を少し足す（紙の外や写真の端は越えない）
+  const pad = (t, dir) => {
+    const sgn = dir === 0 || dir === 3 ? -1 : 1, unit = dir === 0 || dir === 2 ? qh : qw, st = stops[dir];
+    let e = t + sgn * (sides[dir] ? margin : margin * 0.5) / unit;
+    if (st !== null && (e - st) * sgn > 0) e = st - sgn / unit;
+    return sgn < 0 ? Math.min(t, e) : Math.max(t, e);
+  };
+  v0 = pad(v0, 0); u1 = pad(u1, 1); v1 = pad(v1, 2); u0 = pad(u0, 3);
+  return [map(u0, v0), map(u1, v0), map(u1, v1), map(u0, v1)].map(([x, y]) => [Math.min(1, Math.max(0, x / w)), Math.min(1, Math.max(0, y / h))]);
+}
+
 // ---------- 文字の行全体を囲む四角形 ----------
 // 行の向き（長さで重みづけした平均）にそろえた、すべての行を囲む長方形（四隅・割合）
 export function linesSpan(lines, W, H) {
@@ -1267,6 +1417,26 @@ function edgeCurves(canvas, gutter) {
   });
 }
 
+// 折れ線を3次式でなめらかにする（外れた点は1回除いて当てはめ直す）。合わない点が多ければ null
+function smoothLine(P, tol) {
+  const x0 = P[0][0], x1 = P[P.length - 1][0], U = x => (x - x0) / (x1 - x0 || 1) * 2 - 1;
+  const fit = pts => {
+    const M = Array.from({ length: 4 }, () => new Array(4).fill(0)), r = new Array(4).fill(0);
+    for (const [x, y] of pts) { const u = U(x), f = [1, u, u * u, u * u * u]; for (let i = 0; i < 4; i++) { r[i] += f[i] * y; for (let j = 0; j < 4; j++) M[i][j] += f[i] * f[j]; } }
+    for (let i = 2; i < 4; i++) M[i][i] += 1e-6 * pts.length;
+    return solve(M, r);
+  };
+  const at = (c, x) => { const u = U(x); return c[0] + c[1] * u + c[2] * u * u + c[3] * u * u * u; };
+  let c = fit(P);
+  if (!c) return null;
+  const good = P.filter(([x, y]) => Math.abs(y - at(c, x)) <= tol);
+  if (good.length < Math.max(5, P.length * 0.7)) return null;
+  if (good.length < P.length) { c = fit(good); if (!c) return null; }
+  const n = 12, out = [];
+  for (let i = 0; i < n; i++) { const x = x0 + (x1 - x0) * i / (n - 1); out.push([x, at(c, x)]); }
+  return out;
+}
+
 // 紙の反り（本の湾曲）を平らにする。
 // 台形補正した画像の上で、各行の中心線が水平になるよう縦方向に画素をずらす。
 // 紙の曲がり方を「横位置ごとの、上下に比例して変わるずれ」としてなめらかな式で表し、行のない所
@@ -1279,12 +1449,16 @@ function straightenLines(canvas, corners, size, lines, gutter = null) {
   const polys = [];
   const ts = lines.map(l => l.t).sort((a, b) => a - b), tMed = ts[ts.length >> 1] || 0;
   for (const l of lines) {
-    if (!l.pts || l.pts.length < 6 || l.t > tMed * 1.6) continue; // 2行がつながって検出されたものは使わない
-    const P = l.pts.map(toOut);
+    if (!l.pts || l.pts.length < 6 || l.t > tMed * 3) continue;
+    let P = l.pts.map(toOut);
     if (P.some(([x, y]) => x < -W * 0.02 || x > W * 1.02 || y < 0 || y > H)) continue;
     const dx = P[P.length - 1][0] - P[0][0];
     if (Math.abs(dx) < W * (gutter ? 0.1 : 0.2) || Math.abs(P[P.length - 1][1] - P[0][1]) > Math.abs(dx) * 0.3) continue;
     if (dx < 0) P.reverse();
+    // 行の中心線は文字の形（小さい字・句読点）でこまかく上下にぶれる。そのまま合わせると行が波打つので、
+    // なめらかな曲線（3次式）に直してから使う。曲線に乗らない行（2行がつながって段がついたもの等）は使わない
+    P = smoothLine(P, H * 0.006);
+    if (!P) continue;
     polys.push(P);
   }
   if (polys.length < 3) return canvas;
@@ -1397,6 +1571,105 @@ function straightenLines(canvas, corners, size, lines, gutter = null) {
   return out;
 }
 
+// ---------- 行の波打ち・傾きの仕上げ補正（画像そのものから） ----------
+// 文字認識の行の位置だけに頼ると、行の端（のど の近くの急な曲がり）や大きな字・表・見出しの帯で
+// 曲がりが残り、行が波打って見える。そこで画像を細い縦の帯に分け、となりの帯どうしで
+// 「横に並ぶ文字の行・罫線の高さ」がどれだけずれているかを明暗の並びの重なりで測り、
+// そのずれを横につないで、行がまっすぐ水平になるよう縦方向に画素をずらす。
+// 文字のない所（図・余白）は周りの値でなめらかに埋める
+export function levelRows(canvas) {
+  const W = canvas.width, H = canvas.height;
+  const img = shrink(canvas, 1100), { width: w, height: h, data: d } = img, k = W / w;
+  const NS = Math.max(16, Math.min(56, Math.round(w / 18))), sw = w / NS;
+  const bh = Math.max(40, Math.round(h / 7)), stepB = Math.round(bh / 2), NB = Math.max(1, Math.ceil((h - bh) / stepB) + 1);
+  const m = Math.max(3, Math.round(sw * 0.35)); // となりの帯との最大のずれ（約19度まで）
+  // 帯ごとの「暗さ」の縦の並び。ゆるやかな明暗（影・照明むら）は引いて、行の縞だけ残す
+  const prof = [];
+  const win = Math.max(6, Math.round(h / 45));
+  for (let s = 0; s < NS; s++) {
+    const x0 = Math.round(s * sw), x1 = Math.max(x0 + 1, Math.round((s + 1) * sw)), raw = new Float32Array(h);
+    for (let y = 0; y < h; y++) { let a = 0; for (let x = x0; x < x1; x++) { const i = (y * w + x) * 4; a += 255 - (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) / 256; } raw[y] = a / (x1 - x0); }
+    const acc = new Float32Array(h + 1); for (let y = 0; y < h; y++) acc[y + 1] = acc[y] + raw[y];
+    const hp = new Float32Array(h);
+    for (let y = 0; y < h; y++) { const a = Math.max(0, y - win), b = Math.min(h, y + win + 1); hp[y] = raw[y] - (acc[b] - acc[a]) / (b - a); }
+    prof.push(hp);
+  }
+  // となりの帯とのずれ g[s][b]（帯 s+1 の行が帯 s より何画素下にあるか）と、その確かさ
+  const g = new Float32Array((NS - 1) * NB), cf = new Float32Array((NS - 1) * NB);
+  for (let s = 0; s < NS - 1; s++) for (let b = 0; b < NB; b++) {
+    const y0 = Math.min(Math.max(0, h - bh), b * stepB) + m, y1 = Math.min(h, Math.min(Math.max(0, h - bh), b * stepB) + bh) - m;
+    if (y1 - y0 < 20) continue;
+    const A = prof[s], B = prof[s + 1];
+    let ea = 0; for (let y = y0; y < y1; y++) ea += A[y] * A[y];
+    if (ea / (y1 - y0) < 60) continue; // 文字も線もない
+    let best = -2, bi = 0; const sc = new Float32Array(2 * m + 1);
+    for (let dlt = -m; dlt <= m; dlt++) {
+      let ab = 0, eb = 0;
+      for (let y = y0; y < y1; y++) { const v = B[y + dlt]; ab += A[y] * v; eb += v * v; }
+      const c = eb > 0 ? ab / Math.sqrt(ea * eb) : 0; sc[dlt + m] = c;
+      if (c > best) { best = c; bi = dlt; }
+    }
+    if (best < 0.45 || bi === -m || bi === m) continue;
+    const a = sc[bi + m - 1], c0 = sc[bi + m], c = sc[bi + m + 1], den = a - 2 * c0 + c;
+    g[s * NB + b] = bi + (den < 0 ? 0.5 * (a - c) / den : 0); cf[s * NB + b] = (best - 0.45) * Math.min(1, ea / (y1 - y0) / 400);
+  }
+  let known = 0; for (let i = 0; i < cf.length; i++) if (cf[i] > 0) known++;
+  if (known < cf.length * 0.15) return canvas; // 行がほとんどない（写真・図だけ・縦書きなど）
+  // 外れた値を除く: 周り（3x3）の中央値と大きく違うものは使わない
+  for (let s = 0; s < NS - 1; s++) for (let b = 0; b < NB; b++) {
+    if (!cf[s * NB + b]) continue;
+    const v = [];
+    for (let ss = Math.max(0, s - 2); ss <= Math.min(NS - 2, s + 2); ss++) for (let bb = Math.max(0, b - 1); bb <= Math.min(NB - 1, b + 1); bb++) if (cf[ss * NB + bb] > 0) v.push(g[ss * NB + bb]);
+    v.sort((x, y) => x - y);
+    if (v.length >= 4 && Math.abs(g[s * NB + b] - v[v.length >> 1]) > Math.max(1.2, m * 0.25)) cf[s * NB + b] = -1;
+  }
+  for (let i = 0; i < cf.length; i++) if (cf[i] < 0) cf[i] = 0;
+  // 確かさで重みをつけてならし、測れなかった所を周りから埋める
+  let gs = Float32Array.from(g), ws = Float32Array.from(cf);
+  for (let it = 0; it < 4; it++) {
+    const g2 = new Float32Array(gs.length), w2 = new Float32Array(gs.length);
+    for (let s = 0; s < NS - 1; s++) for (let b = 0; b < NB; b++) {
+      let a = 0, ww = 0;
+      for (let ss = Math.max(0, s - 1); ss <= Math.min(NS - 2, s + 1); ss++) for (let bb = Math.max(0, b - 1); bb <= Math.min(NB - 1, b + 1); bb++) {
+        const q = ss * NB + bb, wt = ws[q] * (ss === s && bb === b ? 2 : 1);
+        a += gs[q] * wt; ww += wt;
+      }
+      g2[s * NB + b] = ww > 0 ? a / ww : 0; w2[s * NB + b] = ww / 10;
+    }
+    // 測れた所は元の値も残す（ならしすぎて急な曲がりを消さない）
+    for (let i = 0; i < gs.length; i++) { const c = cf[i]; gs[i] = c > 0 ? (g[i] * c + g2[i] * 0.5 * c + g2[i] * 0.05) / (1.5 * c + 0.05) : g2[i]; ws[i] = Math.max(c, w2[i]); }
+  }
+  // 横につないで、各帯のずれ（中央の帯を基準）にする
+  const off = new Float32Array(NS * NB), mid = NS >> 1;
+  let maxAbs = 0;
+  for (let b = 0; b < NB; b++) {
+    for (let s = mid + 1; s < NS; s++) off[s * NB + b] = off[(s - 1) * NB + b] + gs[(s - 1) * NB + b];
+    for (let s = mid - 1; s >= 0; s--) off[s * NB + b] = off[(s + 1) * NB + b] - gs[s * NB + b];
+    // 全体の上下の位置は変えない（帯ごとの平均を引く）
+    let mean = 0; for (let s = 0; s < NS; s++) mean += off[s * NB + b]; mean /= NS;
+    for (let s = 0; s < NS; s++) { off[s * NB + b] -= mean; maxAbs = Math.max(maxAbs, Math.abs(off[s * NB + b])); }
+  }
+  if (maxAbs * k < Math.max(0.6, H * 0.0005)) return canvas; // すでにまっすぐ
+  const src = ctx2d(canvas).getImageData(0, 0, W, H).data;
+  const out = makeCanvas(W, H), octx = ctx2d(out), dst = octx.createImageData(W, H), o = dst.data;
+  const cb = b => (Math.min(Math.max(0, h - bh), b * stepB) + bh / 2) * k; // 帯の中心の高さ
+  const colOff = new Float32Array(NS);
+  for (let y = 0; y < H; y++) {
+    let b0 = 0; while (b0 < NB - 2 && cb(b0 + 1) < y) b0++;
+    const b1 = Math.min(NB - 1, b0 + 1), t = NB === 1 || b1 === b0 ? 0 : Math.min(1, Math.max(0, (y - cb(b0)) / (cb(b1) - cb(b0))));
+    for (let s = 0; s < NS; s++) colOff[s] = (off[s * NB + b0] * (1 - t) + off[s * NB + b1] * t) * k;
+    for (let x = 0; x < W; x++) {
+      const f = Math.min(NS - 1, Math.max(0, x / W * NS - 0.5)), s0 = Math.min(NS - 2, f | 0), tx = f - s0;
+      const sy = y + colOff[s0] + (colOff[s0 + 1] - colOff[s0]) * tx, oi = (y * W + x) * 4;
+      if (sy < 0 || sy > H - 1.001) { o[oi] = o[oi + 1] = o[oi + 2] = 255; o[oi + 3] = 255; continue; }
+      const y0 = sy | 0, fy = sy - y0, i0 = (y0 * W + x) * 4, i1 = i0 + W * 4;
+      o[oi] = src[i0] + (src[i1] - src[i0]) * fy; o[oi + 1] = src[i0 + 1] + (src[i1 + 1] - src[i0 + 1]) * fy; o[oi + 2] = src[i0 + 2] + (src[i1 + 2] - src[i0 + 2]) * fy; o[oi + 3] = 255;
+    }
+  }
+  octx.putImageData(dst, 0, 0);
+  return out;
+}
+
 // ---------- 見開きの のど（左右のページの境目）を文字の行から求める ----------
 // 左ページの行の右端と右ページの行の左端の間の、行がまったく通らない縦のすき間を探す。
 // 台形補正後の画像の x（画素）を返す。見つからなければ null
@@ -1476,6 +1749,59 @@ export function textBlock(canvas) {
   const L = Math.max(0, x0 + r - m) / w, T = Math.max(0, y0 + r - m) / h, R = Math.min(w, x1 + 1 - r + m) / w, B = Math.min(h, y1 + 1 - r + m) / h;
   if ((R - L) * (B - T) > 0.88) return null;
   return [[L, T], [R, T], [R, B], [L, B]];
+}
+
+// ---------- ページの外の写り込みを消す（仕上げ） ----------
+// 範囲を広めに取ると、ページの縁の外にある机・影・となりのページの端が、黒い帯や灰色のかげりとして
+// 縁に残る。仕上がった画像（紙は白）で、縁に接していて縁の近くだけにとどまる暗いかたまりを白くする。
+// ページの奥まで続くもの（枠の線・端まである図）や、縁から離れたページ番号は中身なので残す
+export function clearEdges(canvas) {
+  const W = canvas.width, H = canvas.height;
+  const img = shrink(canvas, 700), { width: w, height: h, data: d } = img;
+  const dark = new Uint8Array(w * h), gray = new Uint8Array(w * h); let white = 0;
+  for (let p = 0, i = 0; p < dark.length; p++, i += 4) {
+    const v = Math.min(d[i], d[i + 1], d[i + 2]);
+    if (v < 130) dark[p] = 1; else if (v < 238) gray[p] = 1; else white++;
+  }
+  if (white < w * h * 0.5) return; // 紙の白が少ない（写真など）は触らない
+  const deep = 0.09, kill = new Uint8Array(w * h);
+  let any = false;
+  const sweep = (mask, near) => {
+    for (const c of components(mask, w, h)) {
+      let mn = 1, mx = 0;
+      for (const p of c.px) {
+        const x = p % w, y = (p - x) / w, dp = Math.min((x + 0.5) / w, (w - x - 0.5) / w, (y + 0.5) / h, (h - y - 0.5) / h);
+        if (dp < mn) mn = dp; if (dp > mx) mx = dp;
+        if (mx > deep) break;
+      }
+      if (mn > near || mx > deep) continue;
+      for (const p of c.px) kill[p] = 1;
+      any = true;
+    }
+  };
+  // まず濃いかたまり（机・となりのページの端）。縁から少し離れた見出しの帯は残る
+  sweep(dark, 0.018);
+  // 次に薄いかげり（影）。影は濃淡がなだらかで、写真の縁まで続く。見出しの帯の薄い部分や図の塗りは
+  // 輪郭がはっきりしているので、明るさが急に変わる所を境目にして、影だけを縁からたどって消す
+  const val = p => Math.min(d[p * 4], d[p * 4 + 1], d[p * 4 + 2]);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const p = y * w + x;
+    if (kill[p]) { gray[p] = 1; continue; }
+    if (!gray[p]) continue;
+    const v = val(p);
+    const g = Math.max(x > 0 ? Math.abs(v - val(p - 1)) : 0, x < w - 1 ? Math.abs(v - val(p + 1)) : 0, y > 0 ? Math.abs(v - val(p - w)) : 0, y < h - 1 ? Math.abs(v - val(p + w)) : 0);
+    if (g > 26) gray[p] = 0;
+  }
+  sweep(gray, 0.006);
+  if (!any) return;
+  // 縁のぼけた分まで消えるよう、1画素ふくらませる
+  const grown = morph(kill, w, h, 1, true);
+  const ctx = ctx2d(canvas), full = ctx.getImageData(0, 0, W, H), o = full.data;
+  for (let y = 0; y < H; y++) {
+    const sy = Math.min(h - 1, (y * h / H) | 0);
+    for (let x = 0; x < W; x++) if (grown[sy * w + Math.min(w - 1, (x * w / W) | 0)]) { const i = (y * W + x) * 4; o[i] = o[i + 1] = o[i + 2] = 255; }
+  }
+  ctx.putImageData(full, 0, 0);
 }
 
 // ---------- 傾き補正 ----------
@@ -1585,7 +1911,7 @@ export async function processImage(original, opts) {
   let canvas = drawRotated(bitmap, opts.rotation || 0, maxSide);
   bitmap.close?.();
   await tick();
-  let corners = null, perPage = Array.isArray(opts.crop) && !!opts.perPage, fromLines = false, edgeFound = false;
+  let corners = null, perPage = Array.isArray(opts.crop) && !!opts.perPage, fromLines = false, edgeFound = false, extended = false, leveled = false;
   if (opts.crop === 'auto') {
     corners = detectPage(canvas, opts.subject);
     // ページの端がはっきり写っていない（白い机に白い紙、ページが写真からはみ出す等）ときは、
@@ -1618,7 +1944,14 @@ export async function processImage(original, opts) {
         const [l, r] = blocks.slice(0, 2).sort((a, b) => a.cx - b.cx);
         pick = { corners: [l.corners[0], r.corners[1], r.corners[2], l.corners[3]] };
       } else if (blocks.length && (!opts.half || blocks[0].wide)) pick = blocks[0];
-      if (pick) { corners = pick.corners; fromLines = true; }
+      if (pick) {
+        corners = pick.corners; fromLines = true;
+        // 行だけで決めた範囲は、見出しの帯・図・ページ番号が切れないよう、紙の上の印刷が続く所まで広げる
+        if (!pick.done) {
+          corners = extendToContent(canvas, corners, perPage ? (opts.half === 'left' ? [1, 0, 1, 1] : [1, 1, 1, 0]) : [1, 1, 1, 1]);
+          extended = true;
+        }
+      }
     }
   } else if (Array.isArray(opts.crop)) corners = opts.crop;
   const before = { w: canvas.width, h: canvas.height };
@@ -1628,16 +1961,22 @@ export async function processImage(original, opts) {
   const gutter = opts.half && !perPage && corners && opts.lines ? linesGutter(canvas, corners, before, opts.lines) : null;
   if (corners && fromLines) { canvas = straightenLines(canvas, corners, before, opts.lines, gutter); await tick(); }
   if ((opts.half === 'left' || opts.half === 'right') && !perPage) canvas = cropHalf(canvas, opts.half, gutter);
+  // 行の波打ち・傾きを画像から測って仕上げる（横書きの紙のみ。2回かけて残りを詰める）
+  if (opts.subject !== 'screen' && opts.crop === 'auto' && opts.lines && linesVertical(opts.lines) === false) {
+    for (let i = 0; i < 2; i++) { const c2 = levelRows(canvas); if (c2 === canvas) break; canvas = c2; leveled = true; await tick(); }
+  }
   if (opts.moire) { demoire(canvas); await tick(); }
   enhance(canvas, { filter: opts.filter || 'none', fingers: !!opts.fingers, denoise: opts.denoise !== false, evenColor: opts.evenColor !== false });
   await tick();
   let skew = 0;
   // 文字のかたまりに合わせて切り抜き、台形のゆがみも直す（ページの端が見つからなかったとき・余白が多いとき）
-  if (opts.crop === 'auto' && !edgeFound && (fromLines || !perPage) && opts.subject !== 'screen' && opts.filter !== 'none') {
+  if (opts.crop === 'auto' && !edgeFound && !extended && (fromLines || !perPage) && opts.subject !== 'screen' && opts.filter !== 'none') {
     const q = textBlock(canvas);
     if (q) { canvas = warp(canvas, q, Math.max(canvas.width, canvas.height)); await tick(); }
   }
-  if (opts.deskew) { skew = detectSkew(canvas); canvas = rotateBy(canvas, skew); }
+  // 行を水平にそろえ済みなら、全体を回す傾き補正はしない（回すとかえって傾く）
+  if (opts.deskew && !leveled) { skew = detectSkew(canvas); canvas = rotateBy(canvas, skew); }
+  if (opts.crop === 'auto' && opts.subject !== 'screen' && opts.filter !== 'none') clearEdges(canvas);
   const blob = await toJpeg(canvas, 0.86);
   // 一覧表示用の小さな画像（大量のページでも一覧が重くならないように）
   const tk = Math.min(1, 420 / Math.max(canvas.width, canvas.height));
