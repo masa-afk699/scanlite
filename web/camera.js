@@ -7,7 +7,7 @@ const HOLD_MS = 900;   // 止まってから撮影するまでの時間
 
 import { detectPage } from './scan.js';
 
-export function createCamera({ dialog, video, status, shutter, autoToggle, counter, onCapture, guide, torch, subject = () => 'paper' }) {
+export function createCamera({ dialog, video, status, shutter, autoToggle, counter, onCapture, guide, torch, subject = () => 'paper', split = () => false }) {
   let stream = null, timer = null, prev = null, stillSince = 0, needMotion = false, busy = false, shots = 0;
   const probe = document.createElement('canvas');
   probe.width = 80; probe.height = 60;
@@ -36,18 +36,27 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
     await video.play().catch(() => {});
     setupTorch();
     prev = null; stillSince = 0; needMotion = false;
-    say(autoToggle.checked ? 'ページを枠に入れて、手を止めると自動で撮影します' : 'シャッターを押して撮影します');
+    const aim = split() ? '本の綴じ目（のど）を中央の点線に合わせて、' : 'ページを枠に入れて、';
+    say(autoToggle.checked ? aim + '手を止めると自動で撮影します' : aim + 'シャッターを押して撮影します');
     timer = setInterval(watch, 180);
     window.addEventListener('devicemotion', onMotion);
   }
 
   // 撮影したときのスマホの傾き（横持ちかどうか）。向きを決める手がかりにする
-  let tiltX = null;
-  function onMotion(e) { const g = e.accelerationIncludingGravity; if (g && typeof g.x === 'number') tiltX = g.x; }
+  // 横持ちかどうか（見開きの中央線の向きに使う）。向きが変わる境目でちらつかないよう少し幅を持たせる
+  let tiltX = null, landscape = false;
+  function onMotion(e) {
+    const g = e.accelerationIncludingGravity;
+    if (!g || typeof g.x !== 'number') return;
+    tiltX = g.x;
+    const ax = Math.abs(g.x), ay = Math.abs(g.y || 0);
+    if (!landscape && ax > ay * 1.3 && ax > 4) landscape = true;
+    else if (landscape && ay > ax * 1.3 && ay > 4) landscape = false;
+  }
 
   function close() {
     clearInterval(timer); timer = null;
-    window.removeEventListener('devicemotion', onMotion); tiltX = null;
+    window.removeEventListener('devicemotion', onMotion); tiltX = null; landscape = false;
     clearGuide();
     torchOn = false; torch.hidden = true; torch.setAttribute('aria-pressed', 'false');
     stream?.getTracks().forEach(t => t.stop());
@@ -86,14 +95,41 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
     if (guide.width !== Math.round(r.width * dpr)) { guide.width = Math.round(r.width * dpr); guide.height = Math.round(r.height * dpr); }
     const g = guide.getContext('2d');
     g.clearRect(0, 0, guide.width, guide.height);
-    if (!corners) return;
     // 映像は object-fit: contain で表示しているので、その位置に合わせる
     const s = Math.min(guide.width / vw, guide.height / vh), ox = (guide.width - vw * s) / 2, oy = (guide.height - vh * s) / 2;
+    if (split()) drawCenterLine(g, ox, oy, vw * s, vh * s, dpr);
+    if (!corners) return;
     g.beginPath();
     corners.forEach(([x, y], i) => { const px = ox + x * vw * s, py = oy + y * vh * s; i ? g.lineTo(px, py) : g.moveTo(px, py); });
     g.closePath();
     g.fillStyle = 'rgba(184,237,113,0.16)'; g.fill();
     g.lineWidth = 3 * dpr; g.strokeStyle = '#b8ed71'; g.stroke();
+  }
+
+  // 見開き（2ページ）のとき、左右のページの境目（のど）を合わせる中央線を出す。
+  // 横持ちで撮るときは、画面上では横向きの線になる
+  function drawCenterLine(g, x, y, w, h, dpr) {
+    const horiz = landscape;
+    const cx = x + w / 2, cy = y + h / 2, m = (horiz ? w : h) * 0.04;
+    const a = horiz ? [x + m, cy] : [cx, y + m], b = horiz ? [x + w - m, cy] : [cx, y + h - m];
+    g.save();
+    g.lineCap = 'round';
+    g.setLineDash([14 * dpr, 10 * dpr]);
+    g.lineWidth = 5 * dpr; g.strokeStyle = 'rgba(0,0,0,0.45)';
+    g.beginPath(); g.moveTo(...a); g.lineTo(...b); g.stroke();
+    g.lineWidth = 2.5 * dpr; g.strokeStyle = '#fff';
+    g.beginPath(); g.moveTo(...a); g.lineTo(...b); g.stroke();
+    // 両端に三角の目印
+    g.setLineDash([]);
+    g.fillStyle = '#fff';
+    const t = 9 * dpr;
+    for (const [px, py, dir] of [[...a, 1], [...b, -1]]) {
+      g.beginPath();
+      if (horiz) { g.moveTo(px - t * dir, py - t); g.lineTo(px - t * dir, py + t); g.lineTo(px + t * 0.6 * dir, py); }
+      else { g.moveTo(px - t, py - t * dir); g.lineTo(px + t, py - t * dir); g.lineTo(px, py + t * 0.6 * dir); }
+      g.closePath(); g.fill();
+    }
+    g.restore();
   }
 
   // 小さく縮小した映像の前回との差で、動きと静止を判定する
@@ -158,5 +194,5 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
   shutter.onclick = () => take();
   autoToggle.onchange = () => { needMotion = false; stillSince = 0; say(autoToggle.checked ? '手を止めると自動で撮影します' : 'シャッターを押して撮影します'); };
   dialog.addEventListener('close', close);
-  return { open, close };
+  return { open, close, redraw: () => { if (stream) drawGuide(); } };
 }

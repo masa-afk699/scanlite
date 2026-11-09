@@ -169,7 +169,6 @@ async function refresh() {
   $('#batch-button').disabled = !done;
   const root = $('#pages');
   const frag = document.createDocumentFragment();
-  const button = (text, fn, cls) => { const b = document.createElement('button'); b.textContent = text; b.onclick = fn; if (cls) b.className = cls; return b; };
   // 文字で探す: 読み取り済みの文字に含まれるページだけを出す
   const query = $('#search').value.trim();
   const norm = t => (t || '').replace(/\s+/g, '').toLowerCase();
@@ -187,53 +186,38 @@ async function refresh() {
     }
     const card = document.createElement('article');
     card.className = 'page-card';
-    const del = button('削除', async () => { await db.removePage(p.id); await refresh(); }, 'danger');
+    card.dataset.id = p.id;
+    card.classList.toggle('selected', selected.has(p.id));
+    const check = document.createElement('span');
+    check.className = 'page-check';
+    check.setAttribute('aria-hidden', 'true');
+    const label = document.createElement('div');
+    label.className = 'page-meta';
+    label.textContent = `${index + 1}` + (p.half ? (p.half === 'right' ? '　右' : '　左') : '') + (p.ocr ? '　文字✓' : '') + (ready(p) ? '　' + (FILTERS[p.filter || 'none'] || '') : '');
     if (!ready(p)) {
       const ph = document.createElement('div');
       ph.className = 'page-placeholder';
-      ph.textContent = p.failed ? '読み込めませんでした' : '補正待ち…';
-      const tools = document.createElement('div');
-      tools.className = 'page-tools';
-      tools.append(del);
-      card.append(ph, tools);
-      frag.append(card);
-      return;
+      ph.textContent = p.failed ? '読み込めませんでした（長押しで選んで削除）' : '補正待ち…';
+      card.append(ph, label, check);
+    } else {
+      const img = document.createElement('img');
+      const url = URL.createObjectURL(p.thumb || p.blob);
+      thumbUrls.push(url);
+      img.src = url;
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      img.draggable = false;
+      img.alt = `${index + 1}ページ目`;
+      card.append(img, label, check);
     }
-    const img = document.createElement('img');
-    const url = URL.createObjectURL(p.thumb || p.blob);
-    thumbUrls.push(url);
-    img.src = url;
-    img.loading = 'lazy';
-    img.decoding = 'async';
-    img.alt = `${index + 1}ページ目`;
-    img.onclick = () => openViewer(p.id, 'after');
-    const meta = document.createElement('div');
-    meta.className = 'page-meta';
-    const label = document.createElement('span');
-    label.textContent = `${index + 1}` + (p.half ? (p.half === 'right' ? '　右' : '　左') : '') + (p.ocr ? '　文字✓' : '');
-    const select = document.createElement('select');
-    select.setAttribute('aria-label', '補正');
-    for (const [value, text] of Object.entries(FILTERS)) select.add(new Option(text, value, false, value === (p.filter || 'none')));
-    select.onchange = () => reprocess(p, { filter: select.value });
-    meta.append(label, select);
-    const tools = document.createElement('div');
-    tools.className = 'page-tools';
-    tools.append(
-      button('範囲・補正', () => openEditor(p)),
-      button('◀ 前へ', () => move(index, -1)),
-      button('文字', () => openViewer(p.id, 'text')),
-      del,
-    );
-    card.append(img, meta);
     if (snippet) {
       const sn = document.createElement('p');
       sn.className = 'page-snippet';
       const mark = document.createElement('mark'); mark.textContent = snippet.hit;
       sn.append('…' + snippet.before, mark, snippet.after + '…');
-      sn.onclick = () => openViewer(p.id, 'text');
+      sn.dataset.text = '1';
       card.append(sn);
     }
-    card.append(tools);
     frag.append(card);
   });
   const note = $('#search-note');
@@ -241,6 +225,10 @@ async function refresh() {
   if (q) note.textContent = `「${query}」が見つかったページ: ${hits}` + (unread ? `　（文字を読み取っていない ${unread} ページは対象外です。「まとめて設定」でOCRを「する」にすると探せます）` : '');
   $('#text-export').disabled = !done;
   root.replaceChildren(frag);
+  // 消えたページは選択からも外す
+  for (const id of [...selected]) if (!pages.some(p => p.id === id)) selected.delete(id);
+  $('#pages-hint').hidden = !pages.length || selecting();
+  showSelection();
   showStorage();
 }
 
@@ -282,14 +270,160 @@ async function reprocess(page, change, { quiet = false } = {}) {
   if (!quiet) { await refresh(); runBackgroundOcr(); }
 }
 
-// 並び順は created で管理する（IDは変えない）
-async function move(index, delta) {
-  const j = index + delta;
-  if (j < 0 || j >= pages.length) return;
-  const a = pages[index], b = pages[j];
-  [a.created, b.created] = [b.created, a.created];
-  await db.putPage(a); await db.putPage(b);
+// ---------- ページの選択（長押しで選び、選んだページだけを編集する） ----------
+// 一覧のページには編集ボタンを置かない（うっかり押さないように）。
+// 長押しで選択を始め、選択中はタップで選ぶ・外す。編集は画面下のバーから行う。
+const selected = new Set();
+let selectMode = false;
+const selecting = () => selectMode;
+const selectedPages = () => pages.filter(p => selected.has(p.id));
+
+function startSelect(id) {
+  if (!selectMode) {
+    selectMode = true;
+    // スマホの「戻る」で選択をやめられるように
+    try { history.pushState({ scanliteSelect: true }, ''); } catch {}
+  }
+  selected.add(id);
+  navigator.vibrate?.(25);
+  paintSelection();
+}
+function endSelect({ fromHistory = false } = {}) {
+  if (!selectMode) return;
+  selectMode = false;
+  selected.clear();
+  paintSelection();
+  if (!fromHistory && history.state?.scanliteSelect) history.back();
+}
+window.addEventListener('popstate', () => { if (selectMode) endSelect({ fromHistory: true }); });
+function toggleSelect(id) {
+  if (selected.has(id)) selected.delete(id); else selected.add(id);
+  if (!selected.size) endSelect(); else paintSelection();
+}
+// 一覧を作り直さずに、選択の見た目とバーだけを更新する
+function paintSelection() {
+  document.querySelectorAll('#pages .page-card').forEach(c => c.classList.toggle('selected', selected.has(Number(c.dataset.id))));
+  $('#pages-hint').hidden = !pages.length || selectMode;
+  showSelection();
+}
+function showSelection() {
+  const bar = $('#select-bar');
+  bar.hidden = !selectMode;
+  document.body.classList.toggle('selecting', selectMode);
+  if (!selectMode) return;
+  const list = selectedPages(), usable = list.filter(ready);
+  $('#select-count').textContent = `${list.length}枚を選択中`;
+  $('#select-all').textContent = list.length === pages.length ? '全部はずす' : '全部選ぶ';
+  $('#sel-edit').disabled = !usable.length;
+  $('#sel-rotate').disabled = !usable.length;
+  $('#sel-settings').disabled = !usable.length;
+  const allReady = usable.length === list.length && list.length > 0;
+  const first = pages.findIndex(p => selected.has(p.id)), last = pages.length - 1 - [...pages].reverse().findIndex(p => selected.has(p.id));
+  $('#sel-up').disabled = !allReady || first <= 0 || list.length === pages.length;
+  $('#sel-down').disabled = !allReady || last >= pages.length - 1 || list.length === pages.length;
+  $('#sel-delete').disabled = !list.length;
+}
+
+// 長押しの判定（指を少し動かしたらスクロールとみなしてやめる）
+{
+  const root = $('#pages');
+  let timer = null, start = null, fired = false;
+  const cancel = () => { clearTimeout(timer); timer = null; };
+  root.addEventListener('pointerdown', e => {
+    const card = e.target.closest('.page-card');
+    if (!card || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    fired = false;
+    start = [e.clientX, e.clientY];
+    cancel();
+    timer = setTimeout(() => {
+      timer = null;
+      fired = true;
+      const id = Number(card.dataset.id);
+      if (selectMode) toggleSelect(id); else startSelect(id);
+    }, 450);
+  });
+  root.addEventListener('pointermove', e => { if (timer && start && Math.hypot(e.clientX - start[0], e.clientY - start[1]) > 10) cancel(); });
+  root.addEventListener('pointerup', cancel);
+  root.addEventListener('pointercancel', cancel);
+  root.addEventListener('scroll', cancel, { passive: true });
+  // 長押しで出る「画像を保存」などのメニューを出さない
+  root.addEventListener('contextmenu', e => { if (e.target.closest('.page-card')) e.preventDefault(); });
+  root.addEventListener('click', e => {
+    const card = e.target.closest('.page-card');
+    if (!card) return;
+    if (fired) { fired = false; return; } // 長押しの直後のクリックは無視
+    const id = Number(card.dataset.id), page = pages.find(p => p.id === id);
+    if (!page) return;
+    if (selectMode) { toggleSelect(id); return; }
+    if (ready(page)) openViewer(id, e.target.closest('.page-snippet') ? 'text' : 'after');
+  });
+}
+
+$('#select-done').onclick = () => endSelect();
+$('#select-all').onclick = () => {
+  if (selected.size === pages.length) { endSelect(); return; }
+  pages.forEach(p => selected.add(p.id));
+  paintSelection();
+};
+
+// 選んだページを前後へ動かす（並び順は created で管理する。IDは変えない）
+async function moveSelected(delta) {
+  const order = [...pages], times = order.map(p => p.created);
+  const idx = order.map((_, i) => i);
+  if (delta < 0) idx.forEach(i => { if (i > 0 && selected.has(order[i].id) && !selected.has(order[i - 1].id)) [order[i - 1], order[i]] = [order[i], order[i - 1]]; });
+  else idx.reverse().forEach(i => { if (i < order.length - 1 && selected.has(order[i].id) && !selected.has(order[i + 1].id)) [order[i + 1], order[i]] = [order[i], order[i + 1]]; });
+  for (let i = 0; i < order.length; i++) {
+    if (order[i].created === times[i]) continue;
+    order[i].created = times[i];
+    await db.putPage(order[i]);
+  }
   await refresh();
+}
+$('#sel-up').onclick = () => moveSelected(-1);
+$('#sel-down').onclick = () => moveSelected(1);
+
+$('#sel-delete').onclick = async () => {
+  const list = selectedPages();
+  if (!list.length || !confirm(`選んだ ${list.length} ページを削除しますか？（元に戻せません）`)) return;
+  for (const p of list) await db.removePage(p.id);
+  endSelect();
+  await refresh();
+};
+
+// 選んだページを順番に「範囲・補正」で直す
+let editQueue = [];
+$('#sel-edit').onclick = () => {
+  editQueue = selectedPages().filter(ready).map(p => p.id);
+  openNextEdit();
+};
+async function openNextEdit() {
+  while (editQueue.length) {
+    const page = await db.getPage(editQueue.shift());
+    if (page && ready(page)) { await openEditor(page, editQueue.length); return; }
+  }
+}
+
+$('#sel-rotate').onclick = async () => {
+  const list = selectedPages().filter(ready);
+  await eachInLanes(list, p => reprocess(p, { rotation: ((p.rotation || 0) + 90) % 360, crop: 'auto' }, { quiet: true }), '回転しています');
+  await refresh();
+  runBackgroundOcr();
+};
+
+// ワーカーの数だけ同時に処理する
+async function eachInLanes(list, fn, text) {
+  let next = 0, done = 0;
+  const lane = async () => {
+    while (next < list.length) {
+      const p = list[next++];
+      await fn(p);
+      done++;
+      if (text) setBusy(`${text}… ${done}/${list.length}`);
+    }
+  };
+  if (text) setBusy(`${text}… 0/${list.length}`);
+  try { await Promise.all(Array.from({ length: scanBroken ? 1 : SCAN_POOL }, lane)); }
+  finally { showPending(); }
 }
 
 // ---------- 取り込み（撮影・写真選択） ----------
@@ -381,6 +515,7 @@ const camera = createCamera({
   onCapture: (blob, info) => enqueue([blob], info),
   guide: $('#camera-guide'), torch: $('#camera-torch'),
   subject: () => (mode === 'screen' ? 'screen' : 'paper'),
+  split: () => mode !== 'screen' && $('#opt-split').checked,
 });
 $('#camera-auto').checked = prefs.get('autoShutter', true);
 $('#camera-auto').addEventListener('change', e => prefs.set('autoShutter', e.target.checked));
@@ -397,7 +532,8 @@ document.querySelectorAll('#camera-pages button').forEach(b => b.onclick = () =>
   $('#opt-split').checked = on;
   prefs.set('split', on);
   syncCameraBar();
-  $('#camera-status').textContent = on ? '見開きを撮ると、左右2ページに分けて保存します' : '1ページずつ保存します';
+  $('#camera-status').textContent = on ? '本の綴じ目（のど）を中央の点線に合わせてください。左右2ページに分けて保存します' : '1ページずつ保存します';
+  camera.redraw();
 });
 $('#camera-button').onclick = () => {
   if (!navigator.mediaDevices?.getUserMedia) { $('#camera-input').click(); return; }
@@ -409,7 +545,10 @@ $('#camera-button').onclick = () => {
 let edit = null;
 const editCanvas = $('#edit-canvas');
 
-async function openEditor(page) {
+async function openEditor(page, remaining = 0) {
+  const index = pages.findIndex(x => x.id === page.id);
+  $('#edit-title').textContent = '範囲と補正' + (index >= 0 ? `（${index + 1}ページ目）` : '');
+  $('#edit-apply').textContent = remaining ? `この設定で補正して次へ（残り ${remaining}）` : 'この設定で補正';
   const bitmap = await decode(page.original || page.blob);
   const corners = Array.isArray(page.crop) ? page.crop : page.crop === 'auto' ? (page.corners || FULL_FRAME) : FULL_FRAME;
   edit = { page, bitmap, rotation: page.rotation || 0, corners: corners.map(c => [...c]), drag: -1 };
@@ -487,28 +626,58 @@ $('#edit-auto').onclick = () => { edit.corners = detectPage(edit.base, optionsOf
 $('#edit-full').onclick = () => { edit.corners = FULL_FRAME.map(c => [...c]); drawEditor(); };
 $('#edit-apply').onclick = async () => {
   const { page, rotation, corners, bitmap } = edit;
+  const change = {
+    rotation, half: $('#opt-half').value || null,
+    deskew: $('#opt-deskew').checked, fingers: $('#opt-fingers').checked, denoise: $('#opt-denoise').checked,
+    evenColor: $('#opt-even').checked, moire: $('#opt-moire').checked, filter: $('#opt-filter').value,
+  };
   $('#edit-dialog').close();
   bitmap.close?.();
   edit = null;
   const full = corners.every((c, i) => Math.abs(c[0] - FULL_FRAME[i][0]) < 0.002 && Math.abs(c[1] - FULL_FRAME[i][1]) < 0.002);
-  await reprocess(page, {
-    rotation, crop: full ? 'none' : corners, half: $('#opt-half').value || null,
-    deskew: $('#opt-deskew').checked, fingers: $('#opt-fingers').checked, denoise: $('#opt-denoise').checked,
-    evenColor: $('#opt-even').checked, moire: $('#opt-moire').checked, filter: $('#opt-filter').value,
-  });
+  change.crop = full ? 'none' : corners;
+  // 補正は裏で進め、選んだページが残っていればすぐ次のページを開く
+  editJobs.push(reprocess(page, change, { quiet: true }).catch(e => console.error(e)));
+  await openNextEdit();
+  if (!$('#edit-dialog').open) finishEdits();
 };
-$('#edit-dialog').addEventListener('close', () => { if (edit) { edit.bitmap.close?.(); edit = null; } });
+let editJobs = [];
+async function finishEdits() {
+  if (!editJobs.length) return;
+  const jobs = editJobs;
+  editJobs = [];
+  await Promise.all(jobs);
+  showPending();
+  await refresh();
+  runBackgroundOcr();
+}
+// ×や「戻る」で閉じたときは、残りのページの編集をやめる
+$('#edit-dialog .close').addEventListener('click', () => { editQueue = []; });
+$('#edit-dialog').addEventListener('cancel', () => { editQueue = []; });
+$('#edit-dialog').addEventListener('close', () => {
+  if (edit) { edit.bitmap.close?.(); edit = null; }
+  if (!editQueue.length) setTimeout(() => { if (!$('#edit-dialog').open) finishEdits(); }, 0);
+});
 
 // ---------- まとめて設定 ----------
 document.querySelectorAll('select.tri').forEach(sel => {
   sel.replaceChildren(new Option('そのまま', ''), new Option('する', '1'), new Option('しない', '0'));
 });
-$('#batch-button').onclick = () => {
+// targets: null なら文書の全ページ、配列なら選んだページだけ
+let batchTargets = null;
+function openBatch(targets) {
+  batchTargets = targets;
   document.querySelectorAll('#batch-dialog select').forEach(sel => { sel.value = ''; });
   $('#batch-apply').disabled = false;
-  $('#batch-apply').textContent = '全ページに適用';
+  $('#batch-title').textContent = targets ? '選んだページの設定' : 'まとめて設定';
+  $('#batch-note').textContent = targets
+    ? `選んだ ${targets.length} ページに同じ設定をかけます。「そのまま」の項目は変えません。`
+    : 'この文書の全ページに同じ設定をかけます。次から撮るページにも使います。「そのまま」の項目は変えません。';
+  $('#batch-apply').textContent = targets ? `選んだ ${targets.length} ページに適用` : '全ページに適用';
   $('#batch-dialog').showModal();
-};
+}
+$('#batch-button').onclick = () => openBatch(null);
+$('#sel-settings').onclick = () => openBatch(selectedPages().filter(ready));
 $('#batch-apply').onclick = async () => {
   const tri = id => ({ '': undefined, '1': true, '0': false })[$(id).value];
   const change = {};
@@ -519,28 +688,24 @@ $('#batch-apply').onclick = async () => {
   const crop = tri('#batch-crop');
   if (crop !== undefined) change.crop = crop ? 'auto' : 'none';
   const ocr = tri('#batch-ocr');
-  // 次から撮るページにも同じ設定を使う
-  const key = mode === 'screen' ? 'defaults.screen' : 'defaults';
-  prefs.set(key, { ...prefs.get(key, {}), ...change });
-  if (ocr !== undefined) prefs.set('autoOcr', ocr);
+  if (!batchTargets) {
+    // 全ページに適用したときは、次から撮るページにも同じ設定を使う
+    const key = mode === 'screen' ? 'defaults.screen' : 'defaults';
+    prefs.set(key, { ...prefs.get(key, {}), ...change });
+    if (ocr !== undefined) prefs.set('autoOcr', ocr);
+  }
   const btn = $('#batch-apply');
   btn.disabled = true;
   const needImage = Object.keys(change).length > 0;
-  const list = pages.filter(ready);
-  // ワーカーの数だけ同時に補正する
-  let next = 0, done = 0;
-  const lane = async () => {
-    while (next < list.length) {
-      const p = list[next++];
-      if (ocr !== undefined) p.wantOcr = ocr;
-      if (needImage) await reprocess(p, change, { quiet: true });
-      else await db.putPage(p);
-      done++;
-      if (needImage) btn.textContent = `補正しています… ${done}/${list.length}`;
-    }
-  };
+  const list = batchTargets || pages.filter(ready);
+  let done = 0;
   if (needImage) btn.textContent = `補正しています… 0/${list.length}`;
-  await Promise.all(Array.from({ length: needImage && !scanBroken ? SCAN_POOL : 1 }, lane));
+  await eachInLanes(list, async p => {
+    if (ocr !== undefined) p.wantOcr = ocr;
+    if (needImage) await reprocess(p, change, { quiet: true });
+    else await db.putPage(p);
+    if (needImage) btn.textContent = `補正しています… ${++done}/${list.length}`;
+  });
   $('#batch-dialog').close();
   await refresh();
   runBackgroundOcr();

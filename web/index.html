@@ -65,15 +65,27 @@
       <button id="text-export" type="button" disabled>文字を書き出す</button>
     </section>
     <p id="search-note" class="search-note" hidden></p>
+    <p id="pages-hint" class="pages-hint" hidden>ページを<strong>長押し</strong>すると選べます。選んだページだけを編集・並べ替え・削除できます。</p>
     <section id="pages" class="pages" aria-live="polite"></section>
+    <div id="select-bar" class="select-bar" role="toolbar" aria-label="選んだページの操作" hidden>
+      <div class="select-head"><strong id="select-count">0枚を選択中</strong><button id="select-all" type="button">全部選ぶ</button><button id="select-done" type="button">選択をやめる</button></div>
+      <div class="select-actions">
+        <button id="sel-edit" type="button">範囲・補正</button>
+        <button id="sel-rotate" type="button">↻ 回転</button>
+        <button id="sel-settings" type="button">色・補正の設定</button>
+        <button id="sel-up" type="button">◀ 前へ</button>
+        <button id="sel-down" type="button">後ろへ ▶</button>
+        <button id="sel-delete" type="button" class="danger">削除</button>
+      </div>
+    </div>
     <p id="storage" class="privacy-note storage" hidden></p>
     <p class="privacy-note">写真・PDF・認識テキストはすべてこのスマホの中で処理・保存します。<br>サーバーや外部サービスには送信しません（文字認識も端末内で動作）。</p>
-    <p class="privacy-note app-version">バージョン v22（2026-11-10）</p>
+    <p class="privacy-note app-version">バージョン v23（2026-11-10）</p>
 
     <dialog id="camera-dialog" class="camera-dialog">
       <video id="camera-video" playsinline muted></video>
       <canvas id="camera-guide" class="camera-guide" aria-hidden="true"></canvas>
-      <div class="camera-top"><span class="camera-info"><span id="camera-mode" class="mode-chip">本</span><span id="camera-count">0枚</span><span class="mode-chip version-chip">v22</span></span><span class="camera-switches"><button id="camera-torch" class="auto-toggle" type="button" hidden aria-pressed="false">ライト</button><label class="auto-toggle"><input type="checkbox" id="camera-auto" checked> 自動撮影</label></span></div>
+      <div class="camera-top"><span class="camera-info"><span id="camera-mode" class="mode-chip">本</span><span id="camera-count">0枚</span><span class="mode-chip version-chip">v23</span></span><span class="camera-switches"><button id="camera-torch" class="auto-toggle" type="button" hidden aria-pressed="false">ライト</button><label class="auto-toggle"><input type="checkbox" id="camera-auto" checked> 自動撮影</label></span></div>
       <div id="camera-pages" class="page-switch" role="radiogroup" aria-label="1回の撮影で保存するページ数">
         <button type="button" data-pages="1" role="radio" aria-checked="true">1ページ</button><button type="button" data-pages="2" role="radio" aria-checked="false">2ページ（見開き）</button>
       </div>
@@ -144,8 +156,8 @@
 
     <dialog id="batch-dialog" class="batch-dialog">
       <form method="dialog"><button class="close" aria-label="閉じる">×</button></form>
-      <h2>まとめて設定</h2>
-      <p class="dialog-note">この文書の全ページに同じ設定をかけます。「そのまま」の項目は変えません。</p>
+      <h2 id="batch-title">まとめて設定</h2>
+      <p id="batch-note" class="dialog-note">この文書の全ページに同じ設定をかけます。「そのまま」の項目は変えません。</p>
       <div class="batch-grid">
         <label>色<select id="batch-filter"><option value="">そのまま</option><option value="color">カラー</option><option value="gray">グレースケール</option><option value="bw">白黒</option><option value="screen">画面向け</option><option value="none">補正なし</option></select></label>
         <label>色ムラ補正<select id="batch-even" class="tri"></select></label>
@@ -160,7 +172,7 @@
       <button id="batch-apply" class="dark-button" type="button">全ページに適用</button>
     </dialog>
 
-    <dialog id="edit-dialog" class="edit-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2>範囲と補正</h2><p class="dialog-note">四隅の丸をドラッグして、ページの範囲に合わせます。</p><div class="edit-stage"><canvas id="edit-canvas"></canvas></div><div class="edit-row"><button id="edit-rotate" type="button">↺ 回転</button><button id="edit-auto" type="button">自動検出</button><button id="edit-full" type="button">切り抜かない</button></div><div class="edit-options"><label><input type="checkbox" id="opt-deskew"> 傾きを補正</label><label><input type="checkbox" id="opt-fingers"> 指を消す</label><label><input type="checkbox" id="opt-denoise"> ノイズを除去</label><label><input type="checkbox" id="opt-even"> 色ムラを補正</label><label><input type="checkbox" id="opt-moire"> モアレを除去</label><label>色 <select id="opt-filter"></select></label><label class="wide">見開き <select id="opt-half"><option value="">分けない</option><option value="right">右ページだけ</option><option value="left">左ページだけ</option></select></label></div><button id="edit-apply" class="dark-button" type="button">この設定で補正</button></dialog>
+    <dialog id="edit-dialog" class="edit-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2 id="edit-title">範囲と補正</h2><p class="dialog-note">四隅の丸をドラッグして、ページの範囲に合わせます。</p><div class="edit-stage"><canvas id="edit-canvas"></canvas></div><div class="edit-row"><button id="edit-rotate" type="button">↺ 回転</button><button id="edit-auto" type="button">自動検出</button><button id="edit-full" type="button">切り抜かない</button></div><div class="edit-options"><label><input type="checkbox" id="opt-deskew"> 傾きを補正</label><label><input type="checkbox" id="opt-fingers"> 指を消す</label><label><input type="checkbox" id="opt-denoise"> ノイズを除去</label><label><input type="checkbox" id="opt-even"> 色ムラを補正</label><label><input type="checkbox" id="opt-moire"> モアレを除去</label><label>色 <select id="opt-filter"></select></label><label class="wide">見開き <select id="opt-half"><option value="">分けない</option><option value="right">右ページだけ</option><option value="left">左ページだけ</option></select></label></div><button id="edit-apply" class="dark-button" type="button">この設定で補正</button></dialog>
   </main>
   <script src="app.js" type="module"></script>
 </body>
