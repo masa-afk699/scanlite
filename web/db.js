@@ -1,12 +1,13 @@
-// 端末内の保存（IndexedDB）。文書（docs）とページ（pages）を持つ。
+// 端末内の保存（IndexedDB）。フォルダ（folders）・文書（docs）・ページ（pages）を持つ。
 const DB_NAME = 'scanlite-local';
 
 const dbPromise = new Promise((resolve, reject) => {
-  const req = indexedDB.open(DB_NAME, 2);
+  const req = indexedDB.open(DB_NAME, 3);
   req.onupgradeneeded = () => {
     const db = req.result;
     if (!db.objectStoreNames.contains('pages')) db.createObjectStore('pages', { keyPath: 'id', autoIncrement: true });
     if (!db.objectStoreNames.contains('docs')) db.createObjectStore('docs', { keyPath: 'id', autoIncrement: true });
+    if (!db.objectStoreNames.contains('folders')) db.createObjectStore('folders', { keyPath: 'id', autoIncrement: true });
   };
   req.onsuccess = () => resolve(req.result);
   req.onerror = () => reject(req.error);
@@ -36,4 +37,14 @@ export const addDoc = d => run('docs', 'readwrite', s => s.add(d));
 export async function removeDoc(id) {
   for (const p of await pagesOf(id)) await removePage(p.id);
   await run('docs', 'readwrite', s => s.delete(id));
+}
+
+// フォルダ: 文書をまとめる入れ物。文書は folderId で所属を持つ（なしなら「フォルダなし」）
+export const allFolders = async () => (await run('folders', 'readonly', s => s.getAll())).sort((a, b) => a.name.localeCompare(b.name, 'ja') || a.id - b.id);
+export const addFolder = f => run('folders', 'readwrite', s => s.add(f));
+export const putFolder = f => run('folders', 'readwrite', s => s.put(f));
+// フォルダを消しても中の文書は消さず、「フォルダなし」に戻す
+export async function removeFolder(id) {
+  for (const d of await allDocs()) if (d.folderId === id) { delete d.folderId; await putDoc(d); }
+  await run('folders', 'readwrite', s => s.delete(id));
 }

@@ -20,10 +20,17 @@
       <span class="local-badge">端末内で処理</span>
     </header>
 
+    <section class="docbar folderbar" aria-label="フォルダ">
+      <select id="folder-select" aria-label="フォルダを選ぶ"></select>
+      <button id="folder-new" type="button">＋ フォルダ</button>
+      <button id="folder-rename" type="button" hidden>名前</button>
+      <button id="folder-delete" type="button" class="danger" hidden>削除</button>
+    </section>
     <section class="docbar" aria-label="文書">
       <select id="doc-select" aria-label="文書を選ぶ"></select>
       <button id="doc-new" type="button">＋ 新規</button>
       <button id="doc-rename" type="button">名前</button>
+      <button id="doc-move" type="button">移動</button>
       <button id="doc-delete" type="button" class="danger">削除</button>
     </section>
 
@@ -65,7 +72,19 @@
       <button id="text-export" type="button" disabled>文字を書き出す</button>
     </section>
     <p id="search-note" class="search-note" hidden></p>
+    <p id="pages-hint" class="pages-hint" hidden>ページを<strong>長押し</strong>すると選べます。選んだページだけを編集・並べ替え・削除できます。</p>
     <section id="pages" class="pages" aria-live="polite"></section>
+    <div id="select-bar" class="select-bar" role="toolbar" aria-label="選んだページの操作" hidden>
+      <div class="select-head"><strong id="select-count">0枚を選択中</strong><button id="select-all" type="button">全部選ぶ</button><button id="select-done" type="button">選択をやめる</button></div>
+      <div class="select-actions">
+        <button id="sel-edit" type="button">範囲・補正</button>
+        <button id="sel-rotate" type="button">↻ 回転</button>
+        <button id="sel-settings" type="button">色・補正の設定</button>
+        <button id="sel-up" type="button">◀ 前へ</button>
+        <button id="sel-down" type="button">後ろへ ▶</button>
+        <button id="sel-delete" type="button" class="danger">削除</button>
+      </div>
+    </div>
     <p id="storage" class="privacy-note storage" hidden></p>
     <p class="privacy-note">写真・PDF・認識テキストはすべてこのスマホの中で処理・保存します。<br>サーバーや外部サービスには送信しません（文字認識も端末内で動作）。</p>
     <p class="privacy-note app-version">バージョン v24（2026-11-10）</p>
@@ -79,9 +98,21 @@
       </div>
       <p id="camera-status" class="camera-status"></p>
       <div class="camera-bottom">
-        <span></span>
+        <button id="camera-dest" class="camera-dest" type="button" aria-label="保存先を変える"><small>保存先</small><span id="camera-dest-name"></span></button>
         <button id="camera-shutter" class="shutter" type="button" aria-label="撮影"></button>
         <form method="dialog"><button class="camera-done">完了</button></form>
+      </div>
+    </dialog>
+
+    <dialog id="dest-dialog" class="dest-dialog">
+      <form method="dialog"><button class="close" aria-label="閉じる">×</button></form>
+      <h2 id="dest-title">保存先を選ぶ</h2>
+      <p id="dest-note" class="dialog-note"></p>
+      <p class="dest-label">フォルダ</p>
+      <div id="dest-folders" class="dest-list"></div>
+      <div id="dest-docs-area">
+        <p class="dest-label">文書（ここに撮影したページが入ります）</p>
+        <div id="dest-docs" class="dest-list"></div>
       </div>
     </dialog>
 
@@ -144,8 +175,8 @@
 
     <dialog id="batch-dialog" class="batch-dialog">
       <form method="dialog"><button class="close" aria-label="閉じる">×</button></form>
-      <h2>まとめて設定</h2>
-      <p class="dialog-note">この文書の全ページに同じ設定をかけます。「そのまま」の項目は変えません。</p>
+      <h2 id="batch-title">まとめて設定</h2>
+      <p id="batch-note" class="dialog-note">この文書の全ページに同じ設定をかけます。「そのまま」の項目は変えません。</p>
       <div class="batch-grid">
         <label>色<select id="batch-filter"><option value="">そのまま</option><option value="color">カラー</option><option value="gray">グレースケール</option><option value="bw">白黒</option><option value="screen">画面向け</option><option value="none">補正なし</option></select></label>
         <label>色ムラ補正<select id="batch-even" class="tri"></select></label>
@@ -160,7 +191,7 @@
       <button id="batch-apply" class="dark-button" type="button">全ページに適用</button>
     </dialog>
 
-    <dialog id="edit-dialog" class="edit-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2>範囲と補正</h2><p class="dialog-note">四隅の丸をドラッグして、ページの範囲に合わせます。</p><div class="edit-stage"><canvas id="edit-canvas"></canvas></div><div class="edit-row"><button id="edit-rotate" type="button">↺ 回転</button><button id="edit-auto" type="button">自動検出</button><button id="edit-full" type="button">切り抜かない</button></div><div class="edit-options"><label><input type="checkbox" id="opt-deskew"> 傾きを補正</label><label><input type="checkbox" id="opt-fingers"> 指を消す</label><label><input type="checkbox" id="opt-denoise"> ノイズを除去</label><label><input type="checkbox" id="opt-even"> 色ムラを補正</label><label><input type="checkbox" id="opt-moire"> モアレを除去</label><label>色 <select id="opt-filter"></select></label><label class="wide">見開き <select id="opt-half"><option value="">分けない</option><option value="right">右ページだけ</option><option value="left">左ページだけ</option></select></label></div><button id="edit-apply" class="dark-button" type="button">この設定で補正</button></dialog>
+    <dialog id="edit-dialog" class="edit-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2 id="edit-title">範囲と補正</h2><p class="dialog-note">四隅の丸をドラッグして、ページの範囲に合わせます。</p><div class="edit-stage"><canvas id="edit-canvas"></canvas></div><div class="edit-row"><button id="edit-rotate" type="button">↺ 回転</button><button id="edit-auto" type="button">自動検出</button><button id="edit-full" type="button">切り抜かない</button></div><div class="edit-options"><label><input type="checkbox" id="opt-deskew"> 傾きを補正</label><label><input type="checkbox" id="opt-fingers"> 指を消す</label><label><input type="checkbox" id="opt-denoise"> ノイズを除去</label><label><input type="checkbox" id="opt-even"> 色ムラを補正</label><label><input type="checkbox" id="opt-moire"> モアレを除去</label><label>色 <select id="opt-filter"></select></label><label class="wide">見開き <select id="opt-half"><option value="">分けない</option><option value="right">右ページだけ</option><option value="left">左ページだけ</option></select></label></div><button id="edit-apply" class="dark-button" type="button">この設定で補正</button></dialog>
   </main>
   <script src="app.js" type="module"></script>
 </body>
