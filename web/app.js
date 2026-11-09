@@ -113,30 +113,101 @@ function setBusy(text) {
 }
 const showPending = () => setBusy(pending ? `画像を補正しています…（残り ${pending} 枚）` : '');
 
-// ---------- 文書 ----------
-async function loadDocs() {
+// ---------- フォルダと文書 ----------
+// フォルダは文書をまとめる入れ物。表示中のフォルダ: 'all'（すべて）/ 'none'（フォルダなし）/ フォルダのid
+let folders = [], folderView = prefs.get('folder', 'all');
+const folderName = id => folders.find(f => f.id === id)?.name;
+const inFolder = (d, view) => view === 'all' || (view === 'none' ? !folderName(d.folderId) : d.folderId === view);
+// 文書がないフォルダを表示したときは、そのフォルダに新しい文書を1つ用意する
+async function ensureDocIn(view) {
+  if (docs.some(d => inFolder(d, view))) return;
+  const doc = { name: defaultDocName(), created: Date.now() };
+  if (typeof view === 'number') doc.folderId = view;
+  await db.addDoc(doc);
   docs = await db.allDocs();
-  if (!docs.length) {
-    await db.addDoc({ name: defaultDocName(), created: Date.now() });
-    docs = await db.allDocs();
-  }
-  if (!docs.some(d => d.id === docId)) docId = prefs.get('doc', null);
-  if (!docs.some(d => d.id === docId)) docId = docs[docs.length - 1].id;
+}
+async function loadDocs() {
+  folders = await db.allFolders();
+  if (typeof folderView === 'number' && !folderName(folderView)) folderView = 'all';
+  docs = await db.allDocs();
+  await ensureDocIn(folderView);
+  const shown = docs.filter(d => inFolder(d, folderView));
+  if (!shown.some(d => d.id === docId)) docId = prefs.get('doc', null);
+  if (!shown.some(d => d.id === docId)) docId = shown[shown.length - 1].id;
   prefs.set('doc', docId);
+  prefs.set('folder', folderView);
+  const fsel = $('#folder-select');
+  fsel.replaceChildren(
+    new Option(`📁 すべて（${docs.length}）`, 'all', false, folderView === 'all'),
+    ...folders.map(f => new Option(`📁 ${f.name}（${docs.filter(d => d.folderId === f.id).length}）`, f.id, false, f.id === folderView)),
+    new Option(`📁 フォルダなし（${docs.filter(d => !folderName(d.folderId)).length}）`, 'none', false, folderView === 'none'),
+  );
+  $('#folder-rename').hidden = $('#folder-delete').hidden = typeof folderView !== 'number';
   const sel = $('#doc-select');
-  sel.replaceChildren(...docs.map(d => new Option(d.name, d.id, false, d.id === docId)));
+  const opt = d => new Option(d.name, d.id, false, d.id === docId);
+  if (folderView === 'all' && folders.length) {
+    // すべて表示のときはフォルダごとにまとめて並べる
+    const groups = [...folders.map(f => [f.name, docs.filter(d => d.folderId === f.id)]), ['フォルダなし', docs.filter(d => !folderName(d.folderId))]];
+    sel.replaceChildren(...groups.filter(([, list]) => list.length).map(([label, list]) => {
+      const g = document.createElement('optgroup'); g.label = label; g.append(...list.map(opt)); return g;
+    }));
+  } else sel.replaceChildren(...shown.map(opt));
 }
 const currentDoc = () => docs.find(d => d.id === docId);
 function defaultDocName() {
   const d = new Date();
   return `スキャン ${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
+// 「フォルダ › 文書」の表示
+const destLabel = doc => (folderName(doc?.folderId) ? `${folderName(doc.folderId)} › ` : '') + (doc?.name || '');
+async function newFolder() {
+  const name = prompt('新しいフォルダの名前（例: 本のタイトル、授業名）', '');
+  if (!name || !name.trim()) return null;
+  return db.addFolder({ name: name.trim(), created: Date.now() });
+}
+async function newDocIn(folderId, ask = true) {
+  let name = defaultDocName();
+  if (ask) { name = prompt('新しい文書の名前', name); if (name === null) return null; }
+  const doc = { name: name.trim() || defaultDocName(), created: Date.now() };
+  if (folderId != null) doc.folderId = folderId;
+  return db.addDoc(doc);
+}
+
+$('#folder-select').onchange = async e => {
+  const v = e.target.value;
+  folderView = v === 'all' || v === 'none' ? v : Number(v);
+  docId = null;
+  await refresh();
+};
+$('#folder-new').onclick = async () => {
+  const id = await newFolder();
+  if (id == null) return;
+  folderView = id; docId = null;
+  await refresh();
+};
+$('#folder-rename').onclick = async () => {
+  const f = folders.find(x => x.id === folderView);
+  const name = f && prompt('フォルダの名前', f.name);
+  if (!name || !name.trim()) return;
+  f.name = name.trim();
+  await db.putFolder(f);
+  await refresh();
+};
+$('#folder-delete').onclick = async () => {
+  const f = folders.find(x => x.id === folderView);
+  if (!f) return;
+  const n = docs.filter(d => d.folderId === f.id).length;
+  if (!confirm(`フォルダ「${f.name}」を削除しますか？\n中の文書（${n}件）とページは消さずに「フォルダなし」に移します。`)) return;
+  await db.removeFolder(f.id);
+  folderView = 'all';
+  await refresh();
+};
 
 $('#doc-select').onchange = async e => { docId = Number(e.target.value); prefs.set('doc', docId); await refresh(); };
 $('#doc-new').onclick = async () => {
-  const name = prompt('新しい文書の名前', defaultDocName());
-  if (name === null) return;
-  docId = await db.addDoc({ name: name.trim() || defaultDocName(), created: Date.now() });
+  const id = await newDocIn(typeof folderView === 'number' ? folderView : null);
+  if (id == null) return;
+  docId = id;
   await refresh();
 };
 $('#doc-rename').onclick = async () => {
@@ -147,6 +218,7 @@ $('#doc-rename').onclick = async () => {
   await db.putDoc(doc);
   await refresh();
 };
+$('#doc-move').onclick = () => openDest('move');
 $('#doc-delete').onclick = async () => {
   const doc = currentDoc();
   if (!confirm(`「${doc.name}」とそのページ（${pages.length}枚）を削除しますか？`)) return;
@@ -154,6 +226,63 @@ $('#doc-delete').onclick = async () => {
   docId = null;
   await refresh();
 };
+
+// ---------- 保存先を選ぶ画面（撮影中の保存先の切り替え・文書の移動） ----------
+// kind: 'camera' = フォルダと文書を選んで、以後の撮影をそこに保存 / 'move' = 今の文書を別のフォルダへ移す
+let dest = null;
+function openDest(kind) {
+  dest = { kind, folder: currentDoc()?.folderId ?? null };
+  if (!folderName(dest.folder)) dest.folder = null;
+  $('#dest-title').textContent = kind === 'move' ? '文書をフォルダに移す' : '保存先を選ぶ';
+  $('#dest-note').textContent = kind === 'move'
+    ? `「${currentDoc().name}」を入れるフォルダを選んでください。`
+    : 'これから撮るページの保存先です。撮影の途中でも切り替えられます。';
+  $('#dest-docs-area').hidden = kind === 'move';
+  drawDest();
+  $('#dest-dialog').showModal();
+}
+function drawDest() {
+  const item = (text, on, fn, cls = '') => {
+    const b = document.createElement('button');
+    b.type = 'button'; b.textContent = text; b.className = cls + (on ? ' on' : ''); b.onclick = fn;
+    if (on) b.setAttribute('aria-current', 'true');
+    return b;
+  };
+  const pick = async folder => {
+    if (dest.kind === 'move') {
+      const doc = currentDoc();
+      if (folder == null) delete doc.folderId; else doc.folderId = folder;
+      await db.putDoc(doc);
+      // 移した先のフォルダを表示する（すべて表示中ならそのまま）
+      if (folderView !== 'all') folderView = folder ?? 'none';
+      $('#dest-dialog').close();
+      await refresh();
+      return;
+    }
+    dest.folder = folder;
+    drawDest();
+  };
+  $('#dest-folders').replaceChildren(
+    ...folders.map(f => item(f.name, dest.folder === f.id, () => pick(f.id))),
+    item('フォルダなし', dest.folder == null, () => pick(null)),
+    item('＋ 新しいフォルダ', false, async () => { const id = await newFolder(); if (id == null) return; folders = await db.allFolders(); await pick(id); }, 'add'),
+  );
+  if (dest.kind === 'move') return;
+  const choose = async id => {
+    docId = id;
+    // 撮影画面で選んだ保存先を、ホーム画面の表示にも合わせる
+    if (folderView !== 'all') folderView = dest.folder ?? 'none';
+    $('#dest-dialog').close();
+    await refresh();
+    syncCameraBar();
+    $('#camera-status').textContent = `「${destLabel(currentDoc())}」に保存します`;
+  };
+  const list = docs.filter(d => (dest.folder == null ? !folderName(d.folderId) : d.folderId === dest.folder)).reverse();
+  $('#dest-docs').replaceChildren(
+    item('＋ 新しい文書', false, async () => { const id = await newDocIn(dest.folder); if (id != null) await choose(id); }, 'add'),
+    ...list.map(d => item(d.name, d.id === docId, () => choose(d.id))),
+  );
+}
 
 // ---------- ページ一覧 ----------
 const ready = p => !p.waiting && !p.failed;
@@ -379,6 +508,7 @@ const camera = createCamera({
   dialog: $('#camera-dialog'), video: $('#camera-video'), status: $('#camera-status'),
   shutter: $('#camera-shutter'), autoToggle: $('#camera-auto'), counter: $('#camera-count'),
   onCapture: (blob, info) => enqueue([blob], info),
+  paused: () => $('#dest-dialog').open,
   guide: $('#camera-guide'), torch: $('#camera-torch'),
   subject: () => (mode === 'screen' ? 'screen' : 'paper'),
 });
@@ -388,6 +518,7 @@ $('#camera-auto').addEventListener('change', e => prefs.set('autoShutter', e.tar
 function syncCameraBar() {
   $('#camera-mode').textContent = { book: '本', document: '書類', screen: '画面' }[mode];
   $('#camera-pages').hidden = mode === 'screen';
+  $('#camera-dest-name').textContent = destLabel(currentDoc());
   const two = $('#opt-split').checked;
   document.querySelectorAll('#camera-pages button').forEach(b => b.setAttribute('aria-checked', String((b.dataset.pages === '2') === two)));
 }
@@ -404,6 +535,7 @@ $('#camera-button').onclick = () => {
   syncCameraBar();
   camera.open();
 };
+$('#camera-dest').onclick = () => openDest('camera');
 
 // ---------- 範囲・補正の調整画面 ----------
 let edit = null;

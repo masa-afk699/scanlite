@@ -7,7 +7,7 @@ const HOLD_MS = 900;   // 止まってから撮影するまでの時間
 
 import { detectPage } from './scan.js';
 
-export function createCamera({ dialog, video, status, shutter, autoToggle, counter, onCapture, guide, torch, subject = () => 'paper' }) {
+export function createCamera({ dialog, video, status, shutter, autoToggle, counter, onCapture, guide, torch, subject = () => 'paper', paused = () => false }) {
   let stream = null, timer = null, prev = null, stillSince = 0, needMotion = false, busy = false, shots = 0;
   const probe = document.createElement('canvas');
   probe.width = 80; probe.height = 60;
@@ -99,6 +99,8 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
   // 小さく縮小した映像の前回との差で、動きと静止を判定する
   function watch() {
     if (!video.videoWidth || busy) return;
+    // 保存先を選んでいる間は自動撮影しない（選び終えたら、もう一度動きを待つ）
+    if (paused()) { prev = null; stillSince = 0; needMotion = shots > 0; return; }
     if (++tickCount % 2 === 0) drawGuide();
     pctx.drawImage(video, 0, 0, 80, 60);
     const d = pctx.getImageData(0, 0, 80, 60).data, cur = new Uint8Array(80 * 60);
@@ -137,7 +139,7 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
   }
 
   async function take() {
-    if (busy || !stream) return;
+    if (busy || !stream || paused()) return;
     busy = true;
     try {
       if (!video.videoWidth) return;

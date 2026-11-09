@@ -20,10 +20,17 @@
       <span class="local-badge">端末内で処理</span>
     </header>
 
+    <section class="docbar folderbar" aria-label="フォルダ">
+      <select id="folder-select" aria-label="フォルダを選ぶ"></select>
+      <button id="folder-new" type="button">＋ フォルダ</button>
+      <button id="folder-rename" type="button" hidden>名前</button>
+      <button id="folder-delete" type="button" class="danger" hidden>削除</button>
+    </section>
     <section class="docbar" aria-label="文書">
       <select id="doc-select" aria-label="文書を選ぶ"></select>
       <button id="doc-new" type="button">＋ 新規</button>
       <button id="doc-rename" type="button">名前</button>
+      <button id="doc-move" type="button">移動</button>
       <button id="doc-delete" type="button" class="danger">削除</button>
     </section>
 
@@ -68,20 +75,32 @@
     <section id="pages" class="pages" aria-live="polite"></section>
     <p id="storage" class="privacy-note storage" hidden></p>
     <p class="privacy-note">写真・PDF・認識テキストはすべてこのスマホの中で処理・保存します。<br>サーバーや外部サービスには送信しません（文字認識も端末内で動作）。</p>
-    <p class="privacy-note app-version">バージョン v22（2026-11-10）</p>
+    <p class="privacy-note app-version">バージョン v23（2026-11-10）</p>
 
     <dialog id="camera-dialog" class="camera-dialog">
       <video id="camera-video" playsinline muted></video>
       <canvas id="camera-guide" class="camera-guide" aria-hidden="true"></canvas>
-      <div class="camera-top"><span class="camera-info"><span id="camera-mode" class="mode-chip">本</span><span id="camera-count">0枚</span><span class="mode-chip version-chip">v22</span></span><span class="camera-switches"><button id="camera-torch" class="auto-toggle" type="button" hidden aria-pressed="false">ライト</button><label class="auto-toggle"><input type="checkbox" id="camera-auto" checked> 自動撮影</label></span></div>
+      <div class="camera-top"><span class="camera-info"><span id="camera-mode" class="mode-chip">本</span><span id="camera-count">0枚</span><span class="mode-chip version-chip">v23</span></span><span class="camera-switches"><button id="camera-torch" class="auto-toggle" type="button" hidden aria-pressed="false">ライト</button><label class="auto-toggle"><input type="checkbox" id="camera-auto" checked> 自動撮影</label></span></div>
       <div id="camera-pages" class="page-switch" role="radiogroup" aria-label="1回の撮影で保存するページ数">
         <button type="button" data-pages="1" role="radio" aria-checked="true">1ページ</button><button type="button" data-pages="2" role="radio" aria-checked="false">2ページ（見開き）</button>
       </div>
       <p id="camera-status" class="camera-status"></p>
       <div class="camera-bottom">
-        <span></span>
+        <button id="camera-dest" class="camera-dest" type="button" aria-label="保存先を変える"><small>保存先</small><span id="camera-dest-name"></span></button>
         <button id="camera-shutter" class="shutter" type="button" aria-label="撮影"></button>
         <form method="dialog"><button class="camera-done">完了</button></form>
+      </div>
+    </dialog>
+
+    <dialog id="dest-dialog" class="dest-dialog">
+      <form method="dialog"><button class="close" aria-label="閉じる">×</button></form>
+      <h2 id="dest-title">保存先を選ぶ</h2>
+      <p id="dest-note" class="dialog-note"></p>
+      <p class="dest-label">フォルダ</p>
+      <div id="dest-folders" class="dest-list"></div>
+      <div id="dest-docs-area">
+        <p class="dest-label">文書（ここに撮影したページが入ります）</p>
+        <div id="dest-docs" class="dest-list"></div>
       </div>
     </dialog>
 
