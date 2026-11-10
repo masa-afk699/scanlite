@@ -212,10 +212,11 @@ async function scoreTurns(bitmap, boxes, turns) {
     for (let k = 0; k < turns.length; k++) { const r = await readTurned(bitmap, b, turns[k]); got.push(r.text ? r.conf : 0); sum[k] += got[k]; }
     n++;
     wins[got.indexOf(Math.max(...got))]++;
-    // 4行以上読んで、同じ向きがほぼ毎回勝ち、平均でも大きく離れていれば決まり
-    if (n >= 4) {
+    // 4行以上読んで、同じ向きがほぼ毎回勝ち、平均でも大きく離れていれば決まり。
+    // 差がとても大きい（ほかの向きではほとんど読めない）ときは2行で決める
+    if (n >= 2) {
       const best = sum.indexOf(Math.max(...sum)), second = Math.max(...sum.filter((_, i) => i !== best));
-      if (wins[best] >= n - 1 && (sum[best] - second) / n > 0.3) break;
+      if (n >= 4 ? wins[best] >= n - 1 && (sum[best] - second) / n > 0.3 : wins[best] === n && (sum[best] - second) / n > 0.6) break;
     }
   }
   return sum.map(s => (n ? s / n : 0));

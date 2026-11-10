@@ -25,27 +25,31 @@ const MODE_TEXT = {
 const SCAN_POOL = Math.max(1, Math.min(2, (navigator.hardwareConcurrency || 2) - 2));
 const scanWorkers = [];
 let scanSeq = 0, scanBroken = typeof OffscreenCanvas === 'undefined';
+function newScanWorker() {
+  const w = new Worker(new URL('./scan-worker.js', import.meta.url), { type: 'module' });
+  w.jobs = new Map();
+  w.onmessage = ({ data: { id, result, error, second } }) => {
+    const job = w.jobs.get(id); if (!job) return;
+    if (second !== undefined) return job.onSecond?.(second, w);
+    w.jobs.delete(id);
+    error ? job.reject(new Error(error)) : job.resolve(result);
+  };
+  w.onerror = e => { scanBroken = true; for (const j of w.jobs.values()) j.reject(new Error(e.message || 'worker error')); w.jobs.clear(); };
+  return w;
+}
 function scanWorker(busy = null) {
   // いちばん空いているワーカーを使う（busy は今まさに使っているワーカー。なるべく避ける）
-  if (scanWorkers.length < SCAN_POOL) {
-    const w = new Worker(new URL('./scan-worker.js', import.meta.url), { type: 'module' });
-    w.jobs = new Map();
-    w.onmessage = ({ data: { id, result, error, second } }) => {
-      const job = w.jobs.get(id); if (!job) return;
-      if (second !== undefined) return job.onSecond?.(second, w);
-      w.jobs.delete(id);
-      error ? job.reject(new Error(error)) : job.resolve(result);
-    };
-    w.onerror = e => { scanBroken = true; for (const j of w.jobs.values()) j.reject(new Error(e.message || 'worker error')); w.jobs.clear(); };
-    scanWorkers.push(w);
-  }
+  if (scanWorkers.length < SCAN_POOL) scanWorkers.push(newScanWorker());
   const load = w => w.jobs.size + (w === busy ? 1 : 0);
   return scanWorkers.reduce((a, b) => (load(b) < load(a) ? b : a));
 }
-async function inWorker(op, blob, opts, here, extra = {}, onSecond = null, busy = null) {
+// 撮影直後の下準備（向きの見当・保存用の大きさへの縮小）は、補正中のワーカーの後ろで待たないよう、
+// 専用のワーカーで行う（補正している間に次の写真の下準備が進む）
+let prepWorker = null;
+async function inWorker(op, blob, opts, here, extra = {}, onSecond = null, busy = null, prep = false) {
   if (!scanBroken) {
     try {
-      const w = scanWorker(busy);
+      const w = prep ? (prepWorker = prepWorker || newScanWorker()) : scanWorker(busy);
       return await new Promise((resolve, reject) => {
         const id = ++scanSeq;
         w.jobs.set(id, { resolve, reject, onSecond });
@@ -60,7 +64,7 @@ async function inWorker(op, blob, opts, here, extra = {}, onSecond = null, busy 
   return here();
 }
 const processImage = (blob, opts) => inWorker('process', blob, opts, () => processHere(blob, opts));
-const limitOriginal = blob => inWorker('limit', blob, null, () => limitHere(blob));
+const limitOriginal = blob => inWorker('limit', blob, null, () => limitHere(blob), {}, null, null, true);
 // 見開きの左右のページ（同じ写真・同じ設定）をまとめて補正する。範囲・台形・紙の反りの補正は1回だけ行い、
 // のどで切り分けたあとの仕上げは、左右を2つのワーカーで同時に行う。返り値: [1ページ目, 2ページ目] の Promise
 function processSpread(blob, optsA, optsB) {
@@ -86,15 +90,15 @@ function processSpread(blob, optsA, optsB) {
 const rotationCache = new Map();
 let lastTurn = null;
 const tiltTurn = p => (typeof p.tilt === 'number' && Math.abs(p.tilt) > 1.5 ? (p.tilt > 0 ? 270 : 90) : null);
-function decideRotation(p) {
+function decideRotation(p, blob = p.original) {
   const key = p.capture;
   if (!rotationCache.has(key)) {
     rotationCache.set(key, (async () => {
       const split = !!p.half;
-      const g = await inWorker('orient', p.original, { split }, () => orientCandidates(p.original, split));
+      const g = await inWorker('orient', blob, { split }, () => orientCandidates(blob, split), {}, null, null, true);
       if (!g.need) return 0;
       const turns = [0, 90, 270], guess = lastTurn ?? tiltTurn(p) ?? 90;
-      const r = await textLines(p.original, guess, turns);
+      const r = await textLines(blob, guess, turns);
       if (r && r.scores) {
         const s = r.scores, best = s.indexOf(Math.max(...s)), other = Math.max(...s.filter((_, i) => i !== best));
         if (s[best] - other > 0.02) {
@@ -121,11 +125,11 @@ function rememberLines(p, rotation, lines) {
   linesCache.set(linesKey(p, rotation), lines);
   if (linesCache.size > 50) linesCache.delete(linesCache.keys().next().value);
 }
-async function ensureLines(p) {
+async function ensureLines(p, blob = p.original) {
   if (p.crop !== 'auto' || p.mode === 'screen') return;
   if (p.lines && p.linesRotation === (p.rotation || 0)) return;
   const key = linesKey(p, p.rotation || 0);
-  if (!linesCache.has(key)) rememberLines(p, p.rotation || 0, textLines(p.original, p.rotation || 0));
+  if (!linesCache.has(key)) rememberLines(p, p.rotation || 0, textLines(blob, p.rotation || 0));
   p.lines = await linesCache.get(key);
   p.linesRotation = p.rotation || 0;
 }
@@ -628,9 +632,13 @@ function sizedOriginal(p) {
 }
 // 補正の下準備: 元写真の大きさ・向き・文字の行（どれも撮影ごとに1回だけ求め、結果を覚えておく）
 async function preparePage(p) {
-  if (!p.sized) { p.original = await sizedOriginal(p); p.sized = true; }
-  if (p.autoRotate) { p.rotation = await decideRotation(p); p.autoRotate = false; }
-  await ensureLines(p);
+  // 向きの判定と文字の行の検出は、保存用の大きさにする前の写真からすぐに始める（行の位置は割合なので
+  // 大きさによらない）。縮小はその間に別に進める
+  const raw = p.original, turn = p.autoRotate ? decideRotation(p, raw) : null, sized = p.sized ? null : sizedOriginal(p);
+  if (turn) { p.rotation = await turn; p.autoRotate = false; }
+  const lines = ensureLines(p, raw);
+  if (sized) { p.original = await sized; p.sized = true; }
+  await lines;
 }
 
 let working = false;
