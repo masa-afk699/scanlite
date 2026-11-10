@@ -1,6 +1,8 @@
 // 画像補正の処理一式。すべて端末内（ブラウザー）で計算し、外部には何も送らない。
 // 対象: ページ端の検出と台形補正、傾き補正、明るさの均一化、ノイズ除去、指の消去。
 
+import { findPage } from './page.js';
+
 export const MAX_SIDE = 2400;
 const tick = () => new Promise(r => setTimeout(r, 0));
 
@@ -77,8 +79,11 @@ function components(mask, w, h) {
       const p = stack.pop(), x = p % w, y = (p - x) / w;
       px.push(p);
       if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y;
-      const nb = [x > 0 ? p - 1 : -1, x < w - 1 ? p + 1 : -1, y > 0 ? p - w : -1, y < h - 1 ? p + w : -1];
-      for (const q of nb) if (q >= 0 && mask[q] && label[q] < 0) { label[q] = id; stack.push(q); }
+      // となりの4画素（配列を作らずに調べる。画素ごとに通るので）
+      if (x > 0 && mask[p - 1] && label[p - 1] < 0) { label[p - 1] = id; stack.push(p - 1); }
+      if (x < w - 1 && mask[p + 1] && label[p + 1] < 0) { label[p + 1] = id; stack.push(p + 1); }
+      if (y > 0 && mask[p - w] && label[p - w] < 0) { label[p - w] = id; stack.push(p - w); }
+      if (y < h - 1 && mask[p + w] && label[p + w] < 0) { label[p + w] = id; stack.push(p + w); }
     }
     comps.push({ px, minX, minY, maxX, maxY });
   }
@@ -647,20 +652,22 @@ function liftFaded(d, W, H) {
 function smoothFills(d, Y, S, W, H) {
   const r = Math.max(3, Math.round(Math.max(W, H) / 260)), W1 = W + 1;
   const integ = f => { const I = new Uint32Array(W1 * (H + 1)); for (let y = 0; y < H; y++) { let rs = 0; for (let x = 0; x < W; x++) { rs += f(y * W + x); I[(y + 1) * W1 + x + 1] = I[y * W1 + x + 1] + rs; } } return I; };
-  const box = (I, x, y, rr) => { const x0 = Math.max(0, x - rr), y0 = Math.max(0, y - rr), x1 = Math.min(W, x + rr + 1), y1 = Math.min(H, y + rr + 1); return [I[y1 * W1 + x1] - I[y0 * W1 + x1] - I[y1 * W1 + x0] + I[y0 * W1 + x0], (x1 - x0) * (y1 - y0)]; };
+  // 区画の合計（返り値）と画素数（boxN）。配列を作らない（画素ごとに呼ぶので）
+  let boxN = 0;
+  const box = (I, x, y, rr) => { const x0 = x > rr ? x - rr : 0, y0 = y > rr ? y - rr : 0, x1 = x + rr + 1 < W ? x + rr + 1 : W, y1 = y + rr + 1 < H ? y + rr + 1 : H; boxN = (x1 - x0) * (y1 - y0); return I[y1 * W1 + x1] - I[y0 * W1 + x1] - I[y1 * W1 + x0] + I[y0 * W1 + x0]; };
   // 候補: 周りの平均が暗く、紙の白い画素がほとんどない
   const IY = integ(p => Y[p]), IW = integ(p => (Y[p] >= 232 ? 1 : 0));
   const cand = new Uint8Array(W * H); let any = 0;
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-    const [sy, n] = box(IY, x, y, r), [sw] = box(IW, x, y, r);
+    const sy = box(IY, x, y, r), n = boxN, sw = box(IW, x, y, r);
     if (sy / n < 205 && sw < n * 0.18) { cand[y * W + x] = 1; any++; }
   }
   if (any < W * H * 0.002) return null;
   // 広さのあるものだけ（線の詰まった字は周りに紙の白があるので、広い範囲では候補が続かない）
   const IC = integ(p => cand[p]), core = new Uint8Array(W * H);
-  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { if (!cand[y * W + x]) continue; const [c, n] = box(IC, x, y, r * 2); if (c > n * 0.82) core[y * W + x] = 1; }
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { if (!cand[y * W + x]) continue; const c = box(IC, x, y, r * 2); if (c > boxN * 0.82) core[y * W + x] = 1; }
   const IK = integ(p => core[p]), fill = new Uint8Array(W * H); any = 0;
-  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const p = y * W + x; if (cand[p] && Y[p] < 232 && box(IK, x, y, r * 2)[0] > 0) { fill[p] = 1; any++; } }
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const p = y * W + x; if (cand[p] && Y[p] < 232 && box(IK, x, y, r * 2) > 0) { fill[p] = 1; any++; } }
   if (!any) return null;
   // べた塗りの画素だけの平均でならす。平均から大きく離れた画素（白抜きの字・中の線）はそのまま
   const IF = integ(p => fill[p]), IFY = integ(p => (fill[p] ? Y[p] : 0));
@@ -668,7 +675,7 @@ function smoothFills(d, Y, S, W, H) {
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
     const p = y * W + x; if (!fill[p]) continue;
     // 白抜きの字や線は数画素まとまって平均から離れる（3x3平均 S で見る）。ざらつきは1画素ごとにばらつくだけ
-    const [n] = box(IF, x, y, r), [sy] = box(IFY, x, y, r), mean = sy / n, df = Math.abs(S[p] - mean);
+    const n = box(IF, x, y, r), sy = box(IFY, x, y, r), mean = sy / n, df = Math.abs(S[p] - mean);
     const t = Math.min(1, Math.max(0.3, (df - 5) / 8)); // 小さいほど強くならす。1: そのまま
     out[p] = mean + (Y[p] - mean) * t;
   }
@@ -733,7 +740,8 @@ function cleanDocument(d, W, H, { binarize, fine = false }) {
   const R = Math.max(6, Math.round(Math.max(W, H) / 120));
   // 文字とみなす芯の濃さ。紙の写真では薄い灰色の印刷や光って薄くなった文字も残す
   const coreMax = fine ? 150 : 185;
-  for (const c of components(dark, W, H)) {
+  const comps = components(dark, W, H);
+  for (const c of comps) {
     // 小さすぎて周りに何もない点、または濃い芯のない薄いまだら（画面の縞・ざらつき）は文字ではない
     let core = 255;
     for (const p of c.px) if (Y2[p] < core) core = Y2[p];
@@ -744,7 +752,8 @@ function cleanDocument(d, W, H, { binarize, fine = false }) {
   // ページの端にかかった暗いかたまり（影になった指・のどの奥・本の外の机など）を消す。
   // 文字は端に接しないので、端に接していて文字より大きく、中まで詰まった暗い部分だけを対象にする
   const big = Math.max(W, H) / 50;
-  for (const c of components(dark, W, H)) {
+  // （点を消してもかたまりの形は変わらないので、さきほどのかたまりをそのまま使う）
+  for (const c of comps) {
     if (c.minX > 1 && c.minY > 1 && c.maxX < W - 2 && c.maxY < H - 2) continue;
     const bw = c.maxX - c.minX + 1, bh = c.maxY - c.minY + 1;
     if (Math.max(bw, bh) < big || c.px.length > W * H * 0.06 || c.px.length < bw * bh * 0.3) continue;
@@ -1357,6 +1366,53 @@ function projector(corners, size, W, H) {
   };
 }
 
+// 紙の端の外を白にする。outline: 辺ごと [上,右,下,左] の、写真の上での紙の境目の点（割合）。
+// 切り出したあとの画像に写し、境目の外側（画像の縁の側）を塗る。点のない所は両隣の点から直線でつなぐ
+function whitenOutside(canvas, corners, size, outline) {
+  if (!outline || !outline.some(Boolean)) return;
+  const W = canvas.width, H = canvas.height, toOut = projector(corners, size, W, H);
+  if (!toOut) return;
+  const ctx = ctx2d(canvas), img = ctx.getImageData(0, 0, W, H), d = img.data;
+  outline.forEach((pts, side) => {
+    if (!pts) return;
+    const horizontal = side === 0 || side === 2;
+    // (位置, 縁までの距離) の並び。上: (x, y)、下: (x, H-y)、左: (y, x)、右: (y, W-x)
+    let P = pts.map(toOut).map(([x, y]) => horizontal ? [x, side === 0 ? y : H - 1 - y] : [y, side === 3 ? x : W - 1 - x]);
+    P = P.filter(([a, b]) => b > -2 && b < (horizontal ? H : W) * 0.08).sort((p, q) => p[0] - q[0]);
+    if (P.length < 6) return;
+    // 細かなぶれをならす（5点の中央値）
+    const vals = P.map((_, i) => { const s = P.slice(Math.max(0, i - 2), i + 3).map(p => p[1]).sort((a, b) => a - b); return s[s.length >> 1]; });
+    const N = horizontal ? W : H;
+    let k = 0;
+    for (let a = 0; a < N; a++) {
+      while (k < P.length - 1 && P[k + 1][0] < a) k++;
+      let depth;
+      if (a <= P[0][0]) depth = vals[0];
+      else if (a >= P[P.length - 1][0]) depth = vals[vals.length - 1];
+      else { const t = (a - P[k][0]) / (P[k + 1][0] - P[k][0] || 1); depth = vals[k] + (vals[k + 1] - vals[k]) * t; }
+      const n = Math.floor(depth - 1);
+      for (let b = 0; b < n; b++) {
+        const x = horizontal ? a : side === 3 ? b : W - 1 - b, y = horizontal ? (side === 0 ? b : H - 1 - b) : a;
+        const i = (y * W + x) * 4; d[i] = d[i + 1] = d[i + 2] = 255;
+      }
+    }
+  });
+  ctx.putImageData(img, 0, 0);
+}
+
+// 文字の行の範囲（切り出したページの上の割合 [x0, y0, x1, y1]、少し広め）
+function lineBoxes(lines, corners, size) {
+  const to = size && lines ? projector(corners, size, 1, 1) : null;
+  if (!to) return null;
+  const out = [];
+  for (const l of lines) {
+    const P = [l.a, l.b, ...(l.pts || [])].map(to), pad = l.t * 2;
+    const xs = P.map(p => p[0]), ys = P.map(p => p[1]);
+    out.push([Math.min(...xs) - pad, Math.min(...ys) - pad, Math.max(...xs) + pad, Math.max(...ys) + pad]);
+  }
+  return out;
+}
+
 // 小さな連立一次方程式（正規方程式）を解く
 function solve(M, v) {
   const n = v.length, a = M.map((r, i) => [...r, v[i]]);
@@ -1441,7 +1497,7 @@ function smoothLine(P, tol) {
 // 台形補正した画像の上で、各行の中心線が水平になるよう縦方向に画素をずらす。
 // 紙の曲がり方を「横位置ごとの、上下に比例して変わるずれ」としてなめらかな式で表し、行のない所
 // （見出しの帯・図・ページの上下の端）にも延ばす。行のある所は、行そのものの曲がりに合わせる
-function straightenLines(canvas, corners, size, lines, gutter = null) {
+function straightenLines(canvas, corners, size, lines, gutter = null, smoothOnly = false) {
   const W = canvas.width, H = canvas.height;
   const toOut = projector(corners, size, W, H);
   if (!toOut) return canvas;
@@ -1509,7 +1565,10 @@ function straightenLines(canvas, corners, size, lines, gutter = null) {
         coef = solve(M, r) || coef;
       }
       // 行のない所では、行で見た最大のずれを大きく超えないようにする
-      return (x, y) => { if (!coef) return 0; const f = basis(Math.min(x1, Math.max(x0, x)), y); let e = 0; for (let k = 0; k < NP; k++) e += f[k] * coef[k]; return Math.max(-lim, Math.min(lim, e)); };
+      // 行や帯のない上下の端では、式を延ばさずに、いちばん外の行の所の値を使う（延ばすと大きくずれやすい）
+      let yLo = 0, yHi = H;
+      if (smoothOnly && mine.length) { yLo = Infinity; yHi = -Infinity; for (const [, y] of mine) { yLo = Math.min(yLo, y); yHi = Math.max(yHi, y); } }
+      return (x, y) => { if (!coef) return 0; const f = basis(Math.min(x1, Math.max(x0, x)), Math.min(yHi, Math.max(yLo, y))); let e = 0; for (let k = 0; k < NP; k++) e += f[k] * coef[k]; return Math.max(-lim, Math.min(lim, e)); };
     });
     return (x, y) => models[gutter && x >= gutter ? 1 : 0](x, y);
   };
@@ -1545,7 +1604,9 @@ function straightenLines(canvas, corners, size, lines, gutter = null) {
   const fade = H * 0.06;
   const offAt = (c, y) => {
     const l = cols[c], x = colX[c], base = model(x, y);
-    if (!l.length) return base;
+    // 正確に切り出したページは、なめらかな式だけを使う（行ごとの細かい合わせ込みは、短い行や大きな字の
+    // 行の端で列ごとのずれが食い違い、字が裂けたように見えるため。残る細かな波打ちは levelRows で直す）
+    if (!l.length || smoothOnly) return base;
     const res = ([b, o]) => o - model(x, b);
     if (y <= l[0][0]) return base + res(l[0]) * Math.max(0, 1 - (l[0][0] - y) / fade);
     if (y >= l[l.length - 1][0]) { const b = l[l.length - 1]; return base + res(b) * Math.max(0, 1 - (y - b[0]) / fade); }
@@ -1755,7 +1816,7 @@ export function textBlock(canvas) {
 // 範囲を広めに取ると、ページの縁の外にある机・影・となりのページの端が、黒い帯や灰色のかげりとして
 // 縁に残る。仕上がった画像（紙は白）で、縁に接していて縁の近くだけにとどまる暗いかたまりを白くする。
 // ページの奥まで続くもの（枠の線・端まである図）や、縁から離れたページ番号は中身なので残す
-export function clearEdges(canvas) {
+export function clearEdges(canvas, protect = null) {
   const W = canvas.width, H = canvas.height;
   const img = shrink(canvas, 700), { width: w, height: h, data: d } = img;
   const dark = new Uint8Array(w * h), gray = new Uint8Array(w * h); let white = 0;
@@ -1766,7 +1827,7 @@ export function clearEdges(canvas) {
   if (white < w * h * 0.5) return; // 紙の白が少ない（写真など）は触らない
   const deep = 0.09, kill = new Uint8Array(w * h);
   let any = false;
-  const sweep = (mask, near) => {
+  const sweep = (mask, near, keep = null) => {
     for (const c of components(mask, w, h)) {
       let mn = 1, mx = 0;
       for (const p of c.px) {
@@ -1775,12 +1836,20 @@ export function clearEdges(canvas) {
         if (mx > deep) break;
       }
       if (mn > near || mx > deep) continue;
+      // 正確に切り出したページでは、小さなかたまり（ページ番号など）も残す
+      if (keep && (c.px.length < w * h * 0.001 || c.px.some(p => keep[p]))) continue;
       for (const p of c.px) kill[p] = 1;
       any = true;
     }
   };
   // まず濃いかたまり（机・となりのページの端）。縁から少し離れた見出しの帯は残る
-  sweep(dark, 0.018);
+  // protect（文字の行の範囲）にかかるかたまりは、見出しの帯などの印刷なので残す
+  let keep = null;
+  if (protect) {
+    keep = new Uint8Array(w * h);
+    for (const [x0, y0, x1, y1] of protect) for (let y = Math.max(0, Math.floor(y0 * h)); y <= Math.min(h - 1, Math.ceil(y1 * h)); y++) for (let x = Math.max(0, Math.floor(x0 * w)); x <= Math.min(w - 1, Math.ceil(x1 * w)); x++) keep[y * w + x] = 1;
+  }
+  sweep(dark, protect ? 0.015 : 0.018, keep);
   // 次に薄いかげり（影）。影は濃淡がなだらかで、写真の縁まで続く。見出しの帯の薄い部分や図の塗りは
   // 輪郭がはっきりしているので、明るさが急に変わる所を境目にして、影だけを縁からたどって消す
   const val = p => Math.min(d[p * 4], d[p * 4 + 1], d[p * 4 + 2]);
@@ -1914,6 +1983,11 @@ export async function processImage(original, opts) {
 // 別のスレッドで仕上げてもらう（このときの返り値の second は null）。
 // 左右で範囲を別々に求めるとき（行のかたまりから1ページずつ求めるとき）は、2ページ目を最初から処理する
 export async function processSpread(original, optsA, optsB, onSecond = null) {
+  // 文字の行からページを左右別々に求めるとき（ふつうはこちら）は、2ページ目を最初から別のスレッドで並行して補正する
+  if (onSecond && usesFindPage(optsA)) {
+    onSecond(null);
+    return { first: await processImage(original, optsA), second: null };
+  }
   const s = await pageGeometry(original, optsA);
   if (!s.split) {
     const first = await finishPage(s.canvas, optsA, s.state);
@@ -1934,6 +2008,8 @@ export async function finishHalf(image, opts, state) {
   return finishPage(c, opts, state);
 }
 
+const usesFindPage = opts => opts.crop === 'auto' && opts.subject !== 'screen' && !!opts.lines && opts.lines.length >= 4;
+
 // 範囲の検出・台形の補正・紙の反りの補正まで（見開きは、のどで切り分ける前の画像を返す）
 async function pageGeometry(original, opts) {
   const bitmap = await decode(original);
@@ -1942,8 +2018,14 @@ async function pageGeometry(original, opts) {
   let canvas = drawRotated(bitmap, opts.rotation || 0, maxSide);
   bitmap.close?.();
   await tick();
-  let corners = null, perPage = Array.isArray(opts.crop) && !!opts.perPage, fromLines = false, edgeFound = false, extended = false;
-  if (opts.crop === 'auto') {
+  let corners = null, perPage = Array.isArray(opts.crop) && !!opts.perPage, fromLines = false, edgeFound = false, extended = false, exact = false;
+  // 文字の行がわかっているときは、行でページを決め、紙の端・のどの直線から四辺を選ぶ（page.js）。
+  // 見開きは左右のページを別々に求める（本の左右のページは傾きも台形のゆがみも違うので）
+  const found = usesFindPage(opts) ? findPage(canvas, linesMain(opts.lines, canvas), { side: opts.half || null }) : null;
+  if (found) {
+    corners = found.corners; fromLines = true; edgeFound = true; extended = true; exact = true;
+    perPage = !!opts.half;
+  } else if (opts.crop === 'auto') {
     corners = detectPage(canvas, opts.subject);
     // ページの端がはっきり写っていない（白い机に白い紙、ページが写真からはみ出す等）ときは、
     // 本文の行の並びからページの範囲と台形のゆがみを求める。見開きは左右のページを別々に求める
@@ -1986,21 +2068,27 @@ async function pageGeometry(original, opts) {
     }
   } else if (Array.isArray(opts.crop)) corners = opts.crop;
   const before = { w: canvas.width, h: canvas.height };
-  if (corners) { canvas = warp(canvas, corners, maxSide); await tick(); }
+  if (corners) {
+    canvas = warp(canvas, corners, maxSide); await tick();
+    // 紙の端が曲がっていて、切り出した四角形の内側に机などが入りこんだ所を白にする
+    if (found) whitenOutside(canvas, corners, before, found.outline);
+  }
   // 紙の反りで曲がった行をまっすぐにする（行の位置がわかっているとき）
   // 見開きの左右の境目は、文字の行のすき間から求める（のどの影がはっきりしない・中央からずれているときも正しく分ける）
   const gutter = opts.half && !perPage && corners && opts.lines ? linesGutter(canvas, corners, before, opts.lines) : null;
-  if (corners && fromLines) { canvas = straightenLines(canvas, corners, before, opts.lines, gutter); await tick(); }
+  if (corners && fromLines) { canvas = straightenLines(canvas, corners, before, opts.lines, gutter, exact); await tick(); }
   const split = (opts.half === 'left' || opts.half === 'right') && !perPage;
-  return { canvas, gutter, split, state: { corners, perPage, fromLines, edgeFound, extended } };
+  return { canvas, gutter, split, state: { corners, perPage, fromLines, edgeFound, extended, exact, size: before } };
 }
 
 // 切り出したページの仕上げ（行の波打ち・明るさ・色・文字のくっきり・傾き・端の掃除）
-async function finishPage(canvas, opts, { corners, perPage, fromLines, edgeFound, extended }) {
+async function finishPage(canvas, opts, state) {
+  const { corners, perPage, fromLines, edgeFound, extended, exact, size } = state;
   let leveled = false;
-  // 行の波打ち・傾きを画像から測って仕上げる（横書きの紙のみ。2回かけて残りを詰める）
+  // 行の波打ち・傾きを画像から測って仕上げる（横書きの紙のみ。2回かけて残りを詰める。
+  // 紙の端から正確に切り出して反りも直したページは、残りが小さいので1回）
   if (opts.subject !== 'screen' && opts.crop === 'auto' && opts.lines && linesVertical(opts.lines) === false) {
-    for (let i = 0; i < 2; i++) { const c2 = levelRows(canvas); if (c2 === canvas) break; canvas = c2; leveled = true; await tick(); }
+    for (let i = 0; i < (state.exact ? 1 : 2); i++) { const c2 = levelRows(canvas); if (c2 === canvas) break; canvas = c2; leveled = true; await tick(); }
   }
   if (opts.moire) { demoire(canvas); await tick(); }
   enhance(canvas, { filter: opts.filter || 'none', fingers: !!opts.fingers, denoise: opts.denoise !== false, evenColor: opts.evenColor !== false });
@@ -2013,7 +2101,9 @@ async function finishPage(canvas, opts, { corners, perPage, fromLines, edgeFound
   }
   // 行を水平にそろえ済みなら、全体を回す傾き補正はしない（回すとかえって傾く）
   if (opts.deskew && !leveled) { skew = detectSkew(canvas); canvas = rotateBy(canvas, skew); }
-  if (opts.crop === 'auto' && opts.subject !== 'screen' && opts.filter !== 'none') clearEdges(canvas);
+  // 端の掃除（机・隣のページの切れ端・影を消す）。紙の端・のどで正確に切り出したときは、文字の行がかかる
+  // かたまり（ページの端に接する見出しの帯など）は残す
+  if (opts.crop === 'auto' && opts.subject !== 'screen' && opts.filter !== 'none') clearEdges(canvas, exact ? lineBoxes(opts.lines, corners, size) : null);
   const blob = await toJpeg(canvas, 0.86);
   // 一覧表示用の小さな画像（大量のページでも一覧が重くならないように）
   const tk = Math.min(1, 420 / Math.max(canvas.width, canvas.height));
