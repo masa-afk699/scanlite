@@ -362,6 +362,92 @@ export function estimateBackground(canvas) {
   return b.getImageData(0, 0, W, H).data;
 }
 
+// 紙の写真の「紙だけの明るさ」を、影の形に沿って細かく求める（返り値は画像と同じ大きさの RGBA）。
+// 小さな区画ごとに紙の明るさ（明るいほうの画素）を取り、暗い所を「閉じる」（最大値→最小値）処理で
+// 文字・見出しの帯・図の塗りを紙の明るさで埋める。閉じる処理は、ページの端へ向かってだんだん暗くなる影
+// （単調な明るさの変化）はそのまま残すので、影の所まで紙が白くそろう（ぼかすだけだと影の縁が灰色に残る）。
+// 広い暗い面（大きな写真・黒い図）は紙の明るさの半分より暗いので、周りの紙の明るさで埋める
+function paperBackground(d, W, H) {
+  const G = Math.max(4, Math.round(Math.max(W, H) / 256)), gw = Math.ceil(W / G), gh = Math.ceil(H / G), n = gw * gh;
+  const ch = [new Float32Array(n), new Float32Array(n), new Float32Array(n)], lum = new Float32Array(n);
+  const hist = new Uint16Array(64);
+  for (let gy = 0; gy < gh; gy++) for (let gx = 0; gx < gw; gx++) {
+    const x0 = gx * G, y0 = gy * G, x1 = Math.min(W, x0 + G), y1 = Math.min(H, y0 + G);
+    hist.fill(0); let cnt = 0;
+    // 1画素おきに調べる（紙の明るさを知るには十分で、4倍速い）
+    for (let y = y0; y < y1; y += 2) for (let x = x0, i = (y * W + x0) * 4; x < x1; x += 2, i += 8) { hist[(d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 10]++; cnt++; }
+    // 明るいほうから1割の画素（紙）の平均の色
+    let acc = 0, t = 63; for (; t > 0; t--) { acc += hist[t]; if (acc >= cnt * 0.1) break; }
+    let r = 0, g = 0, b = 0, m = 0;
+    for (let y = y0; y < y1; y += 2) for (let x = x0, i = (y * W + x0) * 4; x < x1; x += 2, i += 8) {
+      if (((d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 10) < t) continue;
+      r += d[i]; g += d[i + 1]; b += d[i + 2]; m++;
+    }
+    const c = gy * gw + gx; ch[0][c] = r / m; ch[1][c] = g / m; ch[2][c] = b / m;
+    // 紙の外を白で塗った所（whitenOutside）は紙の明るさに使わない（影になった紙の縁が灰色に残るので）
+    let lo = 0; while (lo < 63 && !hist[lo]) lo++;
+    if (lo >= 62) ch[0][c] = ch[1][c] = ch[2][c] = 0;
+  }
+  // 1次元の最大値・最小値（半径 R）を横・縦にかける
+  const R = Math.max(3, Math.round(Math.max(gw, gh) * 0.05)), tmp = new Float32Array(n);
+  const pass = (a, max) => {
+    for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+      let v = a[y * gw + x];
+      for (let k = Math.max(0, x - R), e = Math.min(gw - 1, x + R); k <= e; k++) { const u = a[y * gw + k]; if (max ? u > v : u < v) v = u; }
+      tmp[y * gw + x] = v;
+    }
+    for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+      let v = tmp[y * gw + x];
+      for (let k = Math.max(0, y - R), e = Math.min(gh - 1, y + R); k <= e; k++) { const u = tmp[k * gw + x]; if (max ? u > v : u < v) v = u; }
+      a[y * gw + x] = v;
+    }
+  };
+  // 紙の明るさの半分より暗い所は紙ではない（大きな写真・黒い図・写り込んだ机・画面の枠）。周りの紙の明るさで埋める。
+  // 閉じる処理の前にも埋める（写真の縁の暗い所に続く帯などは、閉じる処理では「谷」にならず消えないので）
+  const fill = () => {
+    for (let c = 0; c < n; c++) lum[c] = 0.299 * ch[0][c] + 0.587 * ch[1][c] + 0.114 * ch[2][c];
+    const ref = Array.from(lum).sort((a, b) => a - b)[Math.floor(n * 0.95)];
+    let todo = [];
+    for (let c = 0; c < n; c++) if (!(lum[c] >= ref * 0.5)) todo.push(c);
+    if (todo.length === n) return false;
+    const ok = new Uint8Array(n).fill(1);
+    for (const c of todo) ok[c] = 0;
+    while (todo.length) {
+      const done = [], rest = [];
+      for (const c of todo) {
+        const x = c % gw, y = (c - x) / gw;
+        let s0 = 0, s1 = 0, s2 = 0, m = 0;
+        for (let yy = Math.max(0, y - 1); yy <= Math.min(gh - 1, y + 1); yy++) for (let xx = Math.max(0, x - 1); xx <= Math.min(gw - 1, x + 1); xx++) {
+          const q = yy * gw + xx; if (!ok[q]) continue;
+          s0 += ch[0][q]; s1 += ch[1][q]; s2 += ch[2][q]; m++;
+        }
+        if (m) { ch[0][c] = s0 / m; ch[1][c] = s1 / m; ch[2][c] = s2 / m; done.push(c); } else rest.push(c);
+      }
+      for (const c of done) ok[c] = 1;
+      todo = rest;
+    }
+    return true;
+  };
+  if (!fill()) return null;
+  for (const a of ch) { pass(a, true); pass(a, false); }
+  fill();
+  // 区画の境目が見えないよう軽くぼかして、画像の大きさに広げる
+  const small = makeCanvas(gw, gh), sx = ctx2d(small), img = sx.createImageData(gw, gh);
+  const blur = a => {
+    const r = 2;
+    for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) { let s = 0, m = 0; for (let k = Math.max(0, x - r), e = Math.min(gw - 1, x + r); k <= e; k++) { s += a[y * gw + k]; m++; } tmp[y * gw + x] = s / m; }
+    for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) { let s = 0, m = 0; for (let k = Math.max(0, y - r), e = Math.min(gh - 1, y + r); k <= e; k++) { s += tmp[k * gw + x]; m++; } a[y * gw + x] = s / m; }
+  };
+  for (let k = 0; k < 3; k++) { blur(ch[k]); for (let c = 0; c < n; c++) img.data[c * 4 + k] = ch[k][c]; }
+  for (let c = 0; c < n; c++) img.data[c * 4 + 3] = 255;
+  sx.putImageData(img, 0, 0);
+  // 区画の中心が区画の値になるよう、半区画ずらして広げる
+  const big = makeCanvas(W, H), bx = ctx2d(big);
+  bx.imageSmoothingQuality = 'high';
+  bx.drawImage(small, 0, 0, gw * G, gh * G);
+  return bx.getImageData(0, 0, W, H).data;
+}
+
 // ---------- 指の検出 ----------
 // 肌色で、ページの縁に接している領域を「指」とみなす。返り値は縮小マスクとそのサイズ
 export function detectFingers(canvas) {
@@ -578,13 +664,14 @@ function documentTone(d, Y, W, H) {
 // 紙の白さを保ったまま文字の濃さを広げる。灰色で印刷された行のように、すぐ近くに濃い文字が
 // ある所は元から薄い印刷なので、そのままにする。紙は白（250前後）にそろえてある前提
 function liftFaded(d, W, H) {
-  // 区画は文字1〜2字ぶん。1行の中で一部の字だけ光って薄くなった所も、その字だけ濃くできる
-  const G = Math.max(10, Math.round(Math.max(W, H) / 96)), gw = Math.ceil(W / G), gh = Math.ceil(H / G);
+  // 区画は2行ほど。字ごとに濃さを変えると、同じ行の中で一部の字だけ太く濃く見えてムラになるので、
+  // 周り一帯（数行・十数字）の中でいちばんはっきりした文字に合わせて、その一帯をそろって濃くする
+  const G = Math.max(12, Math.round(Math.max(W, H) / 40)), gw = Math.ceil(W / G), gh = Math.ceil(H / G);
   // 区画ごとの紙の明るさ（中央値）と、文字の濃さとの差（コントラスト）
   const paper = new Float32Array(gw * gh).fill(NaN), con = new Float32Array(gw * gh).fill(NaN), hist = new Uint32Array(256);
   for (let gy = 0; gy < gh; gy++) for (let gx = 0; gx < gw; gx++) {
     hist.fill(0); let n = 0;
-    for (let y = gy * G; y < Math.min(H, gy * G + G); y++) for (let x = gx * G; x < Math.min(W, gx * G + G); x++) {
+    for (let y = gy * G; y < Math.min(H, gy * G + G); y += 2) for (let x = gx * G; x < Math.min(W, gx * G + G); x += 2) {
       const i = (y * W + x) * 4; hist[(d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8]++; n++;
     }
     if (!n) continue;
@@ -600,22 +687,25 @@ function liftFaded(d, W, H) {
   if (vals.length < 20) return;
   const ref = vals[Math.floor(vals.length * 0.6)]; // ふつうの文字のコントラスト
   if (ref < 40) return; // 全体が淡い（もともと薄い印刷・鉛筆など）は何もしない
-  // 文字と紙の差が、ふつうの文字よりはっきり小さい区画を濃くする。
-  // 周り一帯がそろって薄い（強い白飛び）ときは大きく、その区画だけ薄いときは控えめに
+  // 周り一帯の文字が、ふつうの文字よりはっきり薄い所だけを濃くする（光の映り込み・ピンぼけで薄い一帯）。
+  // 濃さは一帯でいちばんはっきりした文字に合わせるので、一帯の中の字どうしの濃さの違い（太字・灰色の印刷）は保つ
   const R = 2, gain = new Float32Array(gw * gh).fill(1);
   let any = false;
   for (let gy = 0; gy < gh; gy++) for (let gx = 0; gx < gw; gx++) {
     const own = con[gy * gw + gx];
-    if (isNaN(own) || own > ref * 0.72) continue;
-    let m = 0, cnt = 0, edge = false;
+    if (isNaN(own)) continue;
+    let edge = false;
+    const near = [];
     for (let yy = Math.max(0, gy - R); yy <= Math.min(gh - 1, gy + R); yy++) for (let xx = Math.max(0, gx - R); xx <= Math.min(gw - 1, gx + R); xx++) {
-      const v = con[yy * gw + xx]; if (!isNaN(v)) { m = Math.max(m, v); cnt++; }
+      const v = con[yy * gw + xx]; if (!isNaN(v)) near.push(v);
       // 紙でない所（見出しの帯・図）のすぐそばは濃くしない
       if (Math.abs(yy - gy) <= 1 && Math.abs(xx - gx) <= 1 && isNaN(paper[yy * gw + xx])) edge = true;
     }
-    if (edge) continue;
-    const all = cnt >= 6 && m <= ref * 0.6;
-    gain[gy * gw + gx] = Math.min(all ? 8 : 3, ref * (all ? 1 : 0.92) / Math.max(4, own));
+    // 一帯の文字のはっきりさ（濃い点「●」や太字の数か所に引っぱられないよう、上から1/4の値）
+    near.sort((a, b) => a - b);
+    const m = near[Math.floor(near.length * 0.75)];
+    if (edge || m > ref * 0.88) continue;
+    gain[gy * gw + gx] = Math.min(6, ref / Math.max(4, m));
     any = true;
   }
   if (!any) return;
@@ -638,7 +728,14 @@ function liftFaded(d, W, H) {
     const g = (xx, yy) => { const v = arr[yy * gw + xx]; return isNaN(v) ? dflt : v; };
     return (g(x0, y0) * (1 - tx) + g(x1, y0) * tx) * (1 - ty) + (g(x0, y1) * (1 - tx) + g(x1, y1) * tx) * ty;
   };
+  // 濃くする区画のまわりだけを処理する（ほかは何もしないので、画素ごとの補間を省く）
+  const busy = new Uint8Array(gw * gh);
+  for (let gy = 0; gy < gh; gy++) for (let gx = 0; gx < gw; gx++) {
+    if (!(g2[gy * gw + gx] > 1.01)) continue;
+    for (let yy = Math.max(0, gy - 1); yy <= Math.min(gh - 1, gy + 1); yy++) for (let xx = Math.max(0, gx - 1); xx <= Math.min(gw - 1, gx + 1); xx++) busy[yy * gw + xx] = 1;
+  }
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (!busy[((y / G) | 0) * gw + ((x / G) | 0)]) continue;
     const k = at(g2, x, y, 1);
     if (k <= 1.01) continue;
     // 紙の明るさを白(250)に、文字との差を k 倍に
@@ -651,23 +748,42 @@ function liftFaded(d, W, H) {
 // d と Y を書き換え、べた塗りの画素を 1 にしたマスクを返す（なければ null）
 function smoothFills(d, Y, S, W, H) {
   const r = Math.max(3, Math.round(Math.max(W, H) / 260)), W1 = W + 1;
-  const integ = f => { const I = new Uint32Array(W1 * (H + 1)); for (let y = 0; y < H; y++) { let rs = 0; for (let x = 0; x < W; x++) { rs += f(y * W + x); I[(y + 1) * W1 + x + 1] = I[y * W1 + x + 1] + rs; } } return I; };
+  const integ = (f, w = W, h = H) => { const w1 = w + 1, I = new Uint32Array(w1 * (h + 1)); for (let y = 0; y < h; y++) { let rs = 0; for (let x = 0; x < w; x++) { rs += f(y * w + x); I[(y + 1) * w1 + x + 1] = I[y * w1 + x + 1] + rs; } } return I; };
   // 区画の合計（返り値）と画素数（boxN）。配列を作らない（画素ごとに呼ぶので）
   let boxN = 0;
-  const box = (I, x, y, rr) => { const x0 = x > rr ? x - rr : 0, y0 = y > rr ? y - rr : 0, x1 = x + rr + 1 < W ? x + rr + 1 : W, y1 = y + rr + 1 < H ? y + rr + 1 : H; boxN = (x1 - x0) * (y1 - y0); return I[y1 * W1 + x1] - I[y0 * W1 + x1] - I[y1 * W1 + x0] + I[y0 * W1 + x0]; };
-  // 候補: 周りの平均が暗く、紙の白い画素がほとんどない
-  const IY = integ(p => Y[p]), IW = integ(p => (Y[p] >= 232 ? 1 : 0));
-  const cand = new Uint8Array(W * H); let any = 0;
-  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-    const sy = box(IY, x, y, r), n = boxN, sw = box(IW, x, y, r);
-    if (sy / n < 205 && sw < n * 0.18) { cand[y * W + x] = 1; any++; }
+  const boxIn = (I, w, h, x, y, rr) => { const w1 = w + 1, x0 = x > rr ? x - rr : 0, y0 = y > rr ? y - rr : 0, x1 = x + rr + 1 < w ? x + rr + 1 : w, y1 = y + rr + 1 < h ? y + rr + 1 : h; boxN = (x1 - x0) * (y1 - y0); return I[y1 * w1 + x1] - I[y0 * w1 + x1] - I[y1 * w1 + x0] + I[y0 * w1 + x0]; };
+  const box = (I, x, y, rr) => boxIn(I, W, H, x, y, rr);
+  // べた塗りの場所の見当は、縦横半分の大きさで付ける（広いものを探すので細かさは要らず、4倍速い）
+  const w = W >> 1, h = H >> 1, rs = Math.max(2, Math.round(r / 2)), Ys = new Uint8Array(w * h), Ws = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const p = 2 * y * W + 2 * x, a = Y[p], b = Y[p + 1], c = Y[p + W], e = Y[p + W + 1];
+    Ys[y * w + x] = (a + b + c + e + 2) >> 2;
+    Ws[y * w + x] = (a >= 232) + (b >= 232) + (c >= 232) + (e >= 232);
   }
-  if (any < W * H * 0.002) return null;
+  // 候補: 周りの平均が暗く、紙の白い画素がほとんどない
+  const IY = integ(p => Ys[p], w, h), IW = integ(p => Ws[p], w, h);
+  const cand = new Uint8Array(w * h); let any = 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const sy = boxIn(IY, w, h, x, y, rs), n = boxN, sw = boxIn(IW, w, h, x, y, rs);
+    if (sy / n < 205 && sw < n * 4 * 0.18) { cand[y * w + x] = 1; any++; }
+  }
+  if (any < w * h * 0.002) return null;
   // 広さのあるものだけ（線の詰まった字は周りに紙の白があるので、広い範囲では候補が続かない）
-  const IC = integ(p => cand[p]), core = new Uint8Array(W * H);
-  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { if (!cand[y * W + x]) continue; const c = box(IC, x, y, r * 2); if (c > boxN * 0.82) core[y * W + x] = 1; }
-  const IK = integ(p => core[p]), fill = new Uint8Array(W * H); any = 0;
-  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const p = y * W + x; if (cand[p] && Y[p] < 232 && box(IK, x, y, r * 2) > 0) { fill[p] = 1; any++; } }
+  const IC = integ(p => cand[p], w, h), core = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { if (!cand[y * w + x]) continue; const c = boxIn(IC, w, h, x, y, rs * 2); if (c > boxN * 0.82) core[y * w + x] = 1; }
+  // 字の詰まった所（太い字が続く所）も小さなかたまりとして残ることがある。それをならすと、その字だけ
+  // 太く・にじんで見えるので、見出しの帯や図の塗りのように広いものだけにする
+  for (const c of components(core, w, h)) {
+    if (Math.min(c.maxX - c.minX, c.maxY - c.minY) * 2 >= r * 3 && c.px.length * 4 >= (r * 6) ** 2) continue;
+    for (const p of c.px) core[p] = 0;
+  }
+  const IK = integ(p => core[p], w, h), fill = new Uint8Array(W * H); any = 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    if (!cand[y * w + x] || boxIn(IK, w, h, x, y, rs * 2) <= 0) continue;
+    for (let yy = 2 * y; yy < Math.min(H, 2 * y + 2 + (y === h - 1 ? H & 1 : 0)); yy++) for (let xx = 2 * x; xx < Math.min(W, 2 * x + 2 + (x === w - 1 ? W & 1 : 0)); xx++) {
+      const p = yy * W + xx; if (Y[p] < 232) { fill[p] = 1; any++; }
+    }
+  }
   if (!any) return null;
   // べた塗りの画素だけの平均でならす。平均から大きく離れた画素（白抜きの字・中の線）はそのまま
   const IF = integ(p => fill[p]), IFY = integ(p => (fill[p] ? Y[p] : 0));
@@ -842,7 +958,7 @@ function removeColorBlotches(d, W, H) {
       const Y = 0.299 * r + 0.587 * gg + 0.114 * b;
       const pcb = -0.168736 * r - 0.331264 * gg + 0.5 * b, pcr = 0.5 * r - 0.418688 * gg - 0.081312 * b;
       // 周辺の色の濃さ。薄い色（ムラ）は0に、濃い色はそのまま
-      const local = Math.hypot(sb[g], sr[g]), own = Math.hypot(pcb, pcr);
+      const local = Math.sqrt(sb[g] * sb[g] + sr[g] * sr[g]), own = Math.sqrt(pcb * pcb + pcr * pcr);
       const strength = Math.max(local, own * 0.6);
       let k = Math.min(1, Math.max(0, (strength - 9) / 16));
       if (Y > 215) k *= Math.max(0, (245 - Y) / 30); // 明るい紙の部分はより強く無彩色に
@@ -925,7 +1041,7 @@ export function enhance(canvas, { filter, fingers, denoise, evenColor = true }) 
       }
     }
   } else if (filter !== 'none') {
-    const bg = estimateBackground(canvas);
+    const bg = paperBackground(d, W, H) || estimateBackground(canvas);
     // gray/color はなめらかに、bw は文字をくっきり（ほぼ2値）にする
     const gamma = filter === 'gray' ? 1.6 : 1.35, lut = new Uint8ClampedArray(256);
     for (let i = 0; i < 256; i++) {
