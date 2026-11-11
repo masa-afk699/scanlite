@@ -36,3 +36,6 @@
 .select-head{display:flex;align-items:center;gap:8px;margin-bottom:9px}.select-head strong{flex:1;font-size:14px}.select-head button{border:0;background:#ffffff1f;color:#fff;border-radius:99px;padding:7px 12px;font:inherit;font-size:12px}
 .select-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.select-actions button{border:0;background:#fff;color:#172a23;border-radius:11px;padding:11px 4px;font:inherit;font-size:13px;font-weight:700}.select-actions button:disabled{opacity:.35}.select-actions .danger{background:#f6dcd8;color:#8e2f25}
 body.selecting .shell{padding-bottom:calc(150px + env(safe-area-inset-bottom))}
+.select-actions{grid-template-columns:repeat(4,minmax(0,1fr))}.select-actions button{padding:11px 2px}
+.camera-dialog.one-hand .shutter{position:fixed;right:calc(18px + env(safe-area-inset-right));top:60%;transform:translateY(-50%);width:84px;height:84px;z-index:3;box-shadow:0 2px 14px #0008}
+.camera-dialog.one-hand .camera-bottom form{grid-column:3}

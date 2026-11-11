@@ -486,6 +486,7 @@ function showSelection() {
   $('#sel-edit').disabled = !usable.length;
   $('#sel-rotate').disabled = !usable.length;
   $('#sel-settings').disabled = !usable.length;
+  $('#sel-copy').disabled = !usable.length;
   const allReady = usable.length === list.length && list.length > 0;
   const first = pages.findIndex(p => selected.has(p.id)), last = pages.length - 1 - [...pages].reverse().findIndex(p => selected.has(p.id));
   $('#sel-up').disabled = !allReady || first <= 0 || list.length === pages.length;
@@ -550,6 +551,48 @@ async function moveSelected(delta) {
 }
 $('#sel-up').onclick = () => moveSelected(-1);
 $('#sel-down').onclick = () => moveSelected(1);
+
+// 選んだページの補正後の画像を、Claude などほかのアプリに貼る・渡す。
+// 1枚ならクリップボードにコピー（貼り付けで使える）。複数ならスマホの共有画面で渡す先のアプリを選ぶ。
+// どちらも本人が操作したときだけ、本人が選んだ先に画像が渡る（アプリから勝手に送ることはない）
+async function toPng(blob) {
+  const bmp = await createImageBitmap(blob);
+  const c = document.createElement('canvas');
+  c.width = bmp.width; c.height = bmp.height;
+  c.getContext('2d').drawImage(bmp, 0, 0);
+  bmp.close?.();
+  return new Promise(r => c.toBlob(r, 'image/png'));
+}
+async function copyImage(blob) {
+  if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') return false;
+  try {
+    // クリップボードに入れられる画像は PNG だけ。変換が終わるのを待つ Promise ごと渡す（押した操作のうちに書き込むため）
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': toPng(blob) })]);
+    return true;
+  } catch { return false; }
+}
+$('#sel-copy').onclick = async () => {
+  const list = selectedPages().filter(ready);
+  if (!list.length) return;
+  const base = (currentDoc()?.name || 'scan').replace(/[\\/:*?"<>|]/g, '_');
+  const files = list.map((p, i) => {
+    const n = pages.indexOf(p) + 1;
+    const ext = (p.blob.type || '').includes('png') ? 'png' : 'jpg';
+    return new File([p.blob], `${base}-p${n}.${ext}`, { type: p.blob.type || 'image/jpeg' });
+  });
+  if (list.length === 1 && await copyImage(list[0].blob)) {
+    $('#select-count').textContent = 'コピーしました。貼りたい所で長押し→貼り付け';
+    setTimeout(showSelection, 3500);
+    return;
+  }
+  if (navigator.canShare && navigator.canShare({ files })) {
+    try { await navigator.share({ files }); } catch {}
+    return;
+  }
+  alert(list.length > 1
+    ? 'このブラウザーでは複数の画像をまとめて渡せません。1枚ずつ選んでコピーしてください。'
+    : 'このブラウザーでは画像をコピーできませんでした。');
+};
 
 $('#sel-delete').onclick = async () => {
   const list = selectedPages();
@@ -734,6 +777,8 @@ function syncCameraBar() {
   $('#camera-dest-name').textContent = destLabel(currentDoc());
   const two = $('#opt-split').checked;
   document.querySelectorAll('#camera-pages button').forEach(b => b.setAttribute('aria-checked', String((b.dataset.pages === '2') === two)));
+  // 見開き（2ページ）のときは、右手の親指で押せるようにシャッターを画面の右側に置く
+  $('#camera-dialog').classList.toggle('one-hand', mode !== 'screen' && two);
 }
 // 撮影中でも「1ページ」「2ページ（見開き）」をいつでも切り替えられる
 document.querySelectorAll('#camera-pages button').forEach(b => b.onclick = () => {
