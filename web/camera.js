@@ -7,7 +7,7 @@ const HOLD_MS = 900;   // 止まってから撮影するまでの時間
 
 import { detectPage } from './scan.js';
 
-export function createCamera({ dialog, video, status, shutter, autoToggle, counter, onCapture, guide, torch, subject = () => 'paper', split = () => false, paused = () => false }) {
+export function createCamera({ dialog, video, status, shutter, autoToggle, counter, onCapture, guide, torch, thumb, subject = () => 'paper', split = () => false, order = () => 'rtl', paused = () => false }) {
   let stream = null, timer = null, prev = null, stillSince = 0, needMotion = false, busy = false, shots = 0;
   const probe = document.createElement('canvas');
   probe.width = 80; probe.height = 60;
@@ -16,7 +16,8 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
   const say = t => { status.textContent = t; };
 
   async function open() {
-    shots = 0; counter.textContent = '0枚';
+    shots = 0; counter.textContent = '0';
+    if (thumb) { if (thumb.src) URL.revokeObjectURL(thumb.src); thumb.removeAttribute('src'); thumb.hidden = true; }
     dialog.showModal();
     say('カメラを起動しています…');
     try {
@@ -41,7 +42,7 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
     await video.play().catch(() => {});
     setupTorch();
     prev = null; stillSince = 0; needMotion = false; sharpMax = 0;
-    const aim = split() ? '本の綴じ目（のど）を中央の点線に合わせて、' : 'ページを枠に入れて、';
+    const aim = split() ? '本の綴じ目（のど）を点線に合わせて、' : 'ページを枠に入れて、';
     say(autoToggle.checked ? aim + '手を止めると自動で撮影します' : aim + 'シャッターを押して撮影します');
     timer = setInterval(watch, 180);
     window.addEventListener('devicemotion', onMotion);
@@ -63,7 +64,7 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
     clearInterval(timer); timer = null;
     window.removeEventListener('devicemotion', onMotion); tiltX = null; landscape = false;
     clearGuide();
-    torchOn = false; torch.hidden = true; torch.setAttribute('aria-pressed', 'false');
+    torchOn = false; torch.disabled = true; torch.setAttribute('aria-pressed', 'false');
     stream?.getTracks().forEach(t => t.stop());
     stream = null; video.srcObject = null;
     if (dialog.open) dialog.close();
@@ -74,7 +75,7 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
   function setupTorch() {
     const track = stream?.getVideoTracks()[0];
     const caps = track?.getCapabilities ? track.getCapabilities() : {};
-    torch.hidden = !caps.torch;
+    torch.disabled = !caps.torch;
   }
   torch.onclick = async () => {
     const track = stream?.getVideoTracks()[0];
@@ -102,38 +103,53 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
     g.clearRect(0, 0, guide.width, guide.height);
     // 映像は object-fit: contain で表示しているので、その位置に合わせる
     const s = Math.min(guide.width / vw, guide.height / vh), ox = (guide.width - vw * s) / 2, oy = (guide.height - vh * s) / 2;
-    if (split()) drawCenterLine(g, ox, oy, vw * s, vh * s, dpr);
-    if (!corners) return;
-    g.beginPath();
-    corners.forEach(([x, y], i) => { const px = ox + x * vw * s, py = oy + y * vh * s; i ? g.lineTo(px, py) : g.moveTo(px, py); });
-    g.closePath();
-    g.fillStyle = 'rgba(184,237,113,0.16)'; g.fill();
-    g.lineWidth = 3 * dpr; g.strokeStyle = '#b8ed71'; g.stroke();
+    const two = split();
+    if (corners) {
+      // 見つけた紙の範囲を、緑がかった色で塗って縁取る
+      g.beginPath();
+      corners.forEach(([x, y], i) => { const px = ox + x * vw * s, py = oy + y * vh * s; i ? g.lineTo(px, py) : g.moveTo(px, py); });
+      g.closePath();
+      g.fillStyle = 'rgba(92,196,168,0.55)'; g.fill();
+      g.lineWidth = 3 * dpr; g.lineJoin = 'round'; g.strokeStyle = '#4fb79b'; g.stroke();
+    }
+    const box = corners && corners.map(([x, y]) => [ox + x * vw * s, oy + y * vh * s]);
+    if (two) drawSpread(g, ox, oy, vw * s, vh * s, dpr, box);
   }
 
-  // 見開き（2ページ）のとき、左右のページの境目（のど）を合わせる中央線を出す。
-  // 横持ちで撮るときは、画面上では横向きの線になる
-  function drawCenterLine(g, x, y, w, h, dpr) {
+  // 見開き（2ページ）のとき、左右のページの境目（のど）を合わせる点線と、
+  // 保存される順番（1・2）を各ページの上に出す。横持ちで撮るときは、画面上では横向きの線になり、
+  // 数字も持っている向きから読めるように回す
+  function drawSpread(g, x, y, w, h, dpr, box) {
     const horiz = landscape;
-    const cx = x + w / 2, cy = y + h / 2, m = (horiz ? w : h) * 0.04;
-    const a = horiz ? [x + m, cy] : [cx, y + m], b = horiz ? [x + w - m, cy] : [cx, y + h - m];
+    const cx = x + w / 2, cy = y + h / 2;
     g.save();
-    g.lineCap = 'round';
-    g.setLineDash([14 * dpr, 10 * dpr]);
-    g.lineWidth = 5 * dpr; g.strokeStyle = 'rgba(0,0,0,0.45)';
-    g.beginPath(); g.moveTo(...a); g.lineTo(...b); g.stroke();
-    g.lineWidth = 2.5 * dpr; g.strokeStyle = '#fff';
-    g.beginPath(); g.moveTo(...a); g.lineTo(...b); g.stroke();
-    // 両端に三角の目印
-    g.setLineDash([]);
+    g.setLineDash([16 * dpr, 12 * dpr]);
+    g.lineWidth = 3 * dpr; g.strokeStyle = '#fff';
+    g.shadowColor = 'rgba(0,0,0,0.45)'; g.shadowBlur = 3 * dpr;
+    g.beginPath();
+    if (horiz) { g.moveTo(0, cy); g.lineTo(guide.width, cy); } else { g.moveTo(cx, 0); g.lineTo(cx, guide.height); }
+    g.stroke();
+    g.restore();
+    if (!box) return;
+    // 画面の 前半（左／上）と 後半（右／下）が、紙の上ではどちらのページか
+    // 縦持ち: 前半＝左ページ。横持ち: tilt>0 のときページの上が画面の右（前半＝左ページ）、tilt<0 は逆
+    const up = horiz ? ((tiltX ?? 1) > 0 ? 1 : -1) : 0;
+    const firstIsLeft = !horiz || up > 0;
+    const leftNo = order() === 'rtl' ? 2 : 1;
+    const nums = firstIsLeft ? [leftNo, 3 - leftNo] : [3 - leftNo, leftNo];
+    // 数字は、紙の範囲の端と点線のあいだの真ん中に置く
+    const xs = box.map(p => p[0]), ys = box.map(p => p[1]);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    const spots = horiz ? [[(x0 + x1) / 2, (y0 + cy) / 2], [(x0 + x1) / 2, (cy + y1) / 2]] : [[(x0 + cx) / 2, (y0 + y1) / 2], [(cx + x1) / 2, (y0 + y1) / 2]];
+    const size = Math.min(x1 - x0, y1 - y0) * 0.16;
+    g.save();
     g.fillStyle = '#fff';
-    const t = 9 * dpr;
-    for (const [px, py, dir] of [[...a, 1], [...b, -1]]) {
-      g.beginPath();
-      if (horiz) { g.moveTo(px - t * dir, py - t); g.lineTo(px - t * dir, py + t); g.lineTo(px + t * 0.6 * dir, py); }
-      else { g.moveTo(px - t, py - t * dir); g.lineTo(px + t, py - t * dir); g.lineTo(px, py + t * 0.6 * dir); }
-      g.closePath(); g.fill();
-    }
+    g.font = `300 ${Math.round(Math.max(24 * dpr, size))}px system-ui, sans-serif`;
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.shadowColor = 'rgba(0,0,0,0.25)'; g.shadowBlur = 4 * dpr;
+    spots.forEach(([px, py], i) => {
+      g.save(); g.translate(px, py); g.rotate(up * Math.PI / 2); g.fillText(String(nums[i]), 0, 0); g.restore();
+    });
     g.restore();
   }
 
@@ -214,12 +230,14 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
       if (!video.videoWidth) return;
       // 押した瞬間に反応を返してから、画像を保存する
       shots++;
-      counter.textContent = `${shots}枚`;
+      counter.textContent = String(shots);
       // 音は鳴らさず、振動で撮影を知らせる（映像のフレームを使うのでシャッター音も出ない）
       navigator.vibrate?.([60, 40, 60]);
       dialog.classList.remove('flash'); void dialog.offsetWidth; dialog.classList.add('flash');
       const blob = await grab();
-      if (!blob) { shots--; counter.textContent = `${shots}枚`; return; }
+      if (!blob) { shots--; counter.textContent = String(shots); return; }
+      // 左下に今撮った写真を小さく出す
+      if (thumb) { if (thumb.src) URL.revokeObjectURL(thumb.src); thumb.src = URL.createObjectURL(blob); thumb.hidden = false; }
       onCapture(blob, { tilt: tiltX });
       needMotion = true; stillSince = 0;
       say(autoToggle.checked ? '撮影しました。次のページをめくってください' : '撮影しました');

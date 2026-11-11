@@ -767,28 +767,43 @@ const camera = createCamera({
   guide: $('#camera-guide'), torch: $('#camera-torch'),
   subject: () => (mode === 'screen' ? 'screen' : 'paper'),
   split: () => mode !== 'screen' && $('#opt-split').checked,
+  order: () => $('#opt-order').value,
+  thumb: $('#camera-thumb-img'),
 });
 $('#camera-auto').checked = prefs.get('autoShutter', true);
 $('#camera-auto').addEventListener('change', e => prefs.set('autoShutter', e.target.checked));
 // 撮影中でも見開き（2ページ同時）に切り替えられるボタン。今のモードも表示して取り違えを防ぐ
+const ORDER_SAY = { rtl: '右のページを先に保存します（縦書きの本）', ltr: '左のページを先に保存します（横書きの本）' };
 function syncCameraBar() {
   $('#camera-mode').textContent = { book: '本', document: '書類', screen: '画面' }[mode];
   $('#camera-pages').hidden = mode === 'screen';
   $('#camera-dest-name').textContent = destLabel(currentDoc());
   const two = $('#opt-split').checked;
-  document.querySelectorAll('#camera-pages button').forEach(b => b.setAttribute('aria-checked', String((b.dataset.pages === '2') === two)));
-  // 見開き（2ページ）のときは、右手の親指で押せるようにシャッターを画面の右側に置く
-  $('#camera-dialog').classList.toggle('one-hand', mode !== 'screen' && two);
+  document.querySelectorAll('#camera-pages button[data-pages]').forEach(b => b.setAttribute('aria-checked', String((b.dataset.pages === '2') === two)));
+  // 見開きのときだけ、ページの順番（左右どちらが先か）を切り替える丸いボタンを出す。表示は紙の上の並び（左|右）に付く番号
+  const order = $('#opt-order').value, nums = $('#camera-order').querySelectorAll('span');
+  $('#camera-order').hidden = !two;
+  nums[0].textContent = order === 'rtl' ? '2' : '1';
+  nums[1].textContent = order === 'rtl' ? '1' : '2';
+  $('#camera-order').setAttribute('aria-label', 'ページの順番: ' + ORDER_SAY[order]);
 }
 // 撮影中でも「1ページ」「2ページ（見開き）」をいつでも切り替えられる
-document.querySelectorAll('#camera-pages button').forEach(b => b.onclick = () => {
+document.querySelectorAll('#camera-pages button[data-pages]').forEach(b => b.onclick = () => {
   const on = b.dataset.pages === '2';
   $('#opt-split').checked = on;
   prefs.set('split', on);
   syncCameraBar();
-  $('#camera-status').textContent = on ? '本の綴じ目（のど）を中央の点線に合わせてください。左右2ページに分けて保存します' : '1ページずつ保存します';
+  $('#camera-status').textContent = on ? '本の綴じ目（のど）を点線に合わせてください。左右2ページに分けて保存します' : '1ページずつ保存します';
   camera.redraw();
 });
+$('#camera-order').onclick = () => {
+  const order = $('#opt-order').value === 'rtl' ? 'ltr' : 'rtl';
+  $('#opt-order').value = order;
+  prefs.set('order', order);
+  syncCameraBar();
+  $('#camera-status').textContent = ORDER_SAY[order];
+  camera.redraw();
+};
 $('#camera-button').onclick = () => {
   if (!navigator.mediaDevices?.getUserMedia) { $('#camera-input').click(); return; }
   syncCameraBar();
