@@ -72,7 +72,7 @@
       <button id="text-export" type="button" disabled>文字を書き出す</button>
     </section>
     <p id="search-note" class="search-note" hidden></p>
-    <p id="pages-hint" class="pages-hint" hidden>ページを<strong>長押し</strong>すると選べます。選んだページだけを編集・並べ替え・コピー・削除できます。</p>
+    <p id="pages-hint" class="pages-hint" hidden>ページを<strong>長押し</strong>すると選べます。選んだページだけを編集・並べ替え・削除したり、Claude などに貼るためにコピーしたりできます。</p>
     <section id="pages" class="pages" aria-live="polite"></section>
     <div id="select-bar" class="select-bar" role="toolbar" aria-label="選んだページの操作" hidden>
       <div class="select-head"><strong id="select-count">0枚を選択中</strong><button id="select-all" type="button">全部選ぶ</button><button id="select-done" type="button">選択をやめる</button></div>
@@ -80,7 +80,7 @@
         <button id="sel-edit" type="button">範囲・補正</button>
         <button id="sel-rotate" type="button">↻ 回転</button>
         <button id="sel-settings" type="button">色・補正</button>
-        <button id="sel-copy" type="button">コピー</button>
+        <button id="sel-copy" type="button">コピー・送る</button>
         <button id="sel-up" type="button">◀ 前へ</button>
         <button id="sel-down" type="button">後ろへ ▶</button>
         <button id="sel-delete" type="button" class="danger">削除</button>
@@ -112,7 +112,7 @@
       <p class="dest-label">フォルダ</p>
       <div id="dest-folders" class="dest-list"></div>
       <div id="dest-docs-area">
-        <p id="dest-docs-label" class="dest-label">文書（ここに撮影したページが入ります）</p>
+        <p class="dest-label">文書（ここに撮影したページが入ります）</p>
         <div id="dest-docs" class="dest-list"></div>
       </div>
     </dialog>
