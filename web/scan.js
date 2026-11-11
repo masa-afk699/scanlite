@@ -734,13 +734,22 @@ function liftFaded(d, W, H) {
     if (!(g2[gy * gw + gx] > 1.01)) continue;
     for (let yy = Math.max(0, gy - 1); yy <= Math.min(gh - 1, gy + 1); yy++) for (let xx = Math.max(0, gx - 1); xx <= Math.min(gw - 1, gx + 1); xx++) busy[yy * gw + xx] = 1;
   }
+  // 差を何倍にもすると、写真のざらつきも同じだけ強まり、文字がかすれた・すかすかの見た目になる。
+  // 倍率が大きい所ほど、まわり3x3の平均（ざらつきをならした値）を使う
+  const src = d.slice();
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
     if (!busy[((y / G) | 0) * gw + ((x / G) | 0)]) continue;
     const k = at(g2, x, y, 1);
     if (k <= 1.01) continue;
     // 紙の明るさを白(250)に、文字との差を k 倍に
-    const P = Math.max(150, at(p2, x, y, 250)), i = (y * W + x) * 4;
-    for (let ch = 0; ch < 3; ch++) d[i + ch] = Math.max(0, Math.min(255, 250 - (P - d[i + ch]) * k));
+    const P = Math.max(150, at(p2, x, y, 250)), i = (y * W + x) * 4, mix = Math.min(0.7, (k - 1) * 0.35);
+    const x0 = x > 0 ? -4 : 0, x1 = x < W - 1 ? 4 : 0, y0 = y > 0 ? -W * 4 : 0, y1 = y < H - 1 ? W * 4 : 0;
+    for (let ch = 0; ch < 3; ch++) {
+      const c = i + ch;
+      const m = (src[c + y0 + x0] + src[c + y0] + src[c + y0 + x1] + src[c + x0] + src[c] + src[c + x1] + src[c + y1 + x0] + src[c + y1] + src[c + y1 + x1]) / 9;
+      const v = src[c] * (1 - mix) + m * mix;
+      d[c] = Math.max(0, Math.min(255, 250 - (P - v) * k));
+    }
   }
 }
 
@@ -804,12 +813,47 @@ function smoothFills(d, Y, S, W, H) {
   return fill;
 }
 
+// 半径 r の箱形の平均（横→縦の累積和）
+function boxBlur(Y, W, H, r) {
+  const t = new Float32Array(W * H), o = new Float32Array(W * H);
+  for (let y = 0; y < H; y++) {
+    const row = y * W; let acc = 0;
+    for (let x = -r; x <= r; x++) acc += Y[row + Math.min(W - 1, Math.max(0, x))];
+    for (let x = 0; x < W; x++) {
+      t[row + x] = acc / (2 * r + 1);
+      acc += Y[row + Math.min(W - 1, x + r + 1)] - Y[row + Math.max(0, x - r)];
+    }
+  }
+  for (let x = 0; x < W; x++) {
+    let acc = 0;
+    for (let y = -r; y <= r; y++) acc += t[Math.min(H - 1, Math.max(0, y)) * W + x];
+    for (let y = 0; y < H; y++) {
+      o[y * W + x] = acc / (2 * r + 1);
+      acc += t[Math.min(H - 1, y + r + 1) * W + x] - t[Math.max(0, y - r) * W + x];
+    }
+  }
+  return o;
+}
+
 // 背景のまだら・縞・薄い汚れを白にし、点状のゴミとページ端の線を消す。
 // binarize: 文字を黒・背景を白にくっきり分ける（白黒）
 function cleanDocument(d, W, H, { binarize, fine = false }) {
   // 画面の細かい縞を打ち消す処理。紙の写真では薄い・ぼけた文字まで紙と見なして消してしまうので使わない
   if (fine) flattenFine(d, W, H);
   else liftFaded(d, W, H);
+  // 文字の線の中のざらつき（ぼけた写真を端末が強調したときの細かいすじ）を、明るさの3x3メディアンでならす。
+  // 線の輪郭は動かないので、細い字もやせない。紙の上の明るい所はあとで白にするので、暗い所だけ
+  if (!fine && !binarize) {
+    const Y0 = luma(d, W, H), buf = new Uint8ClampedArray(9);
+    for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+      const p = y * W + x;
+      if (Y0[p] > 225) continue;
+      buf[0] = Y0[p - W - 1]; buf[1] = Y0[p - W]; buf[2] = Y0[p - W + 1]; buf[3] = Y0[p - 1]; buf[4] = Y0[p];
+      buf[5] = Y0[p + 1]; buf[6] = Y0[p + W - 1]; buf[7] = Y0[p + W]; buf[8] = Y0[p + W + 1];
+      const dv = median9(buf) - Y0[p];
+      if (dv) { const i = p * 4; d[i] += dv; d[i + 1] += dv; d[i + 2] += dv; }
+    }
+  }
   const Y = luma(d, W, H);
   // 3x3平均で判定する（細かい縞やJPEGのざらつきに引っぱられないように）
   const S = new Uint8ClampedArray(W * H), row = new Uint16Array(W * H);
@@ -837,10 +881,14 @@ function cleanDocument(d, W, H, { binarize, fine = false }) {
     // 見出しの帯・図の塗りのような「べた塗り」の所は、印刷の網点や紙のざらつきが輪郭の強調で
     // まだら・砂目になる。そこは強調せず、ならして元のなめらかな濃淡に戻す（中の白抜き文字は残す）
     const fill = smoothFills(d, Y, S, W, H);
-    // 輪郭を少し締めて、にじんだ文字を細く・くっきりさせる
+    // 輪郭を少し締めて、にじんだ文字を細く・くっきりさせる。手ぶれ・ピンぼけで数画素にじんだ文字は、
+    // 3x3 の強調だけでは戻らないので、少し広い範囲（半径 R2）との差も足す。紙のざらつきを強めないよう、
+    // 差の小さい所（紙のむら）には足さない
+    const R2 = Math.max(2, Math.round(Math.max(W, H) / 900)), B = boxBlur(Y, W, H, R2);
     for (let p = 0, i = 0; p < Y.length; p++, i += 4) {
       if (fill && fill[p]) continue;
-      const dv = 0.9 * (Y[p] - S[p]);
+      const wide = Y[p] - B[p], k = Math.min(1, Math.max(0, (Math.abs(wide) - 6) / 10));
+      const dv = 0.9 * (Y[p] - S[p]) + 0.7 * k * wide;
       if (dv) { d[i] += dv; d[i + 1] += dv; d[i + 2] += dv; }
     }
     documentTone(d, Y, W, H);

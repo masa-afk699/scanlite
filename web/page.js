@@ -253,10 +253,33 @@ export function findPage(canvas, lines, { side: half = null, debug = null } = {}
       }
     }
     dark.sort((a, b) => a - b); darkW.sort((a, b) => a - b);
+    // beyond: 線の外側（文字の高さの3倍ほどまで）に、また紙（紙と同じ色みで明るい所）が出てくる割合。
+    // 印刷の枠・表の罫線・見出しの帯の外は紙に戻る。紙の端の外は机・影で、紙の色には戻らない
+    let back2 = 0, nb2 = 0;
+    const reach = Math.max(12, 3 * em, S * 0.03), st2 = Math.max(2, (a1 - a0) / 40);
+    for (let t = a0; t <= a1; t += st2) {
+      const p = horizontal ? pointAtU(ln, t) : pointAtV(ln, t);
+      if (!p) continue;
+      // 内側のすぐそばの紙の明るさ・色み（影で暗くなった所でも比べられるように）。紙でなければ数えない
+      let ry = -1, rc = 0;
+      for (let s = 3; s <= reach; s += 2) {
+        const y1 = sample(Y, w, h, p[0] + ix * s, p[1] + iy * s), c1 = sample(C, w, h, p[0] + ix * s, p[1] + iy * s);
+        if (y1 > ry && Math.abs(c1 - Pc) < 12) { ry = y1; rc = c1; }
+      }
+      if (ry < P * 0.5) continue;
+      let seen = false, inside = false;
+      for (let s = 4; s <= reach; s += 2) {
+        const y2 = sample(Y, w, h, p[0] - ix * s, p[1] - iy * s);
+        if (!(y2 === y2)) break;
+        inside = true;
+        if (y2 > ry * 0.9 && Math.abs(sample(C, w, h, p[0] - ix * s, p[1] - iy * s) - rc) < 6) { seen = true; break; }
+      }
+      if (inside) { nb2++; if (seen) back2++; }
+    }
     // shade: 線の上が紙より暗い度合い（のどの影）。両側が紙のときだけ数える（図の黒い部分を除く）
     const pct = a => P - a[Math.floor(a.length * 0.8)];
     const shade = dark.length && n && both / n > 0.7 ? Math.min(pct(dark), 2 * pct(darkW)) : 0;
-    return { support: n ? ok / n : 0, shade: Math.min(shade, P * 0.4) };
+    return { support: n ? ok / n : 0, shade: Math.min(shade, P * 0.4), beyond: nb2 ? back2 / nb2 : 1 };
   }
   // 直線がかたまりの文字をどちら側に置くか（内側=正）。いちばん近い点までの距離
   const sideDist = (ln, ls, inPt) => {
@@ -276,13 +299,24 @@ export function findPage(canvas, lines, { side: half = null, debug = null } = {}
   // あれば別のページ、なければ同じページの段組や図のまわりの文字とみなしてまとめる
   const groups = pageGroups(L, e1, Math.max(3 * em, w * 0.015));
   const pages = [{ lines: groups[0].lines.slice(), u0: groups[0].u0, u1: groups[0].u1, weight: groups[0].weight }];
+  const cu = U([w / 2, h / 2]);
+  // 見開き撮影では、のどを画面中央の線に合わせて撮るので、写真の中央に近いすき間を左右のページの境とする
+  // （のどの影が薄く、図の多いページで、2ページが1つにまとまってしまうのを防ぐ）
+  let forceAt = -1;
+  if (half) {
+    let bd = Infinity;
+    for (let i = 1; i < groups.length; i++) {
+      const g0 = groups[i - 1].u1, g1 = groups[i].u0, d = Math.abs((g0 + g1) / 2 - cu);
+      if (g1 - g0 > 1.5 * em && d < w * 0.12 && d < bd) { bd = d; forceAt = i; }
+    }
+  }
   for (let i = 1; i < groups.length; i++) {
     const a = pages[pages.length - 1], b = groups[i];
     const ba = boxOf(a.lines), bb = boxOf(b.lines);
     const va = Math.min(ba.v0, bb.v0), vb = Math.max(ba.v1, bb.v1);
     const inPt = at(ba.u0, (ba.v0 + ba.v1) / 2);
-    let sep = false;
-    for (const ln of vCands) {
+    let sep = i === forceAt;
+    if (forceAt < 0) for (const ln of vCands) {
       const p = pointAtV(ln, (va + vb) / 2);
       if (!p || U(p) < a.u1 - em || U(p) > b.u0 + em) continue;
       if (L.some(l => crosses(ln, l))) continue;
@@ -297,7 +331,6 @@ export function findPage(canvas, lines, { side: half = null, debug = null } = {}
     if (sep) pages.push({ lines: b.lines.slice(), u0: b.u0, u1: b.u1, weight: b.weight });
     else { a.lines.push(...b.lines); a.u1 = Math.max(a.u1, b.u1); a.weight += b.weight; }
   }
-  const cu = U([w / 2, h / 2]);
   const pScore = g => g.weight * Math.max(0.1, 1 - 0.9 * Math.abs((g.u0 + g.u1) / 2 - cu) / (w / 2));
   let target, leftN = null, rightN = null;
   if (half) {
@@ -472,21 +505,51 @@ export function findPage(canvas, lines, { side: half = null, debug = null } = {}
       const inner = side === 1 ? u1 : u0, nbBox = boxOf(nb.lines), lim = side === 1 ? nbBox.u0 : nbBox.u1;
       const mid = (inner + lim) / 2, half2 = Math.max(em, Math.abs(lim - inner) / 2);
       let best = null, bs = -Infinity;
-      for (const c of list) {
-        const s = Math.max(c.support * 2, c.shade / 10);
-        if (s < 0.8) continue;
-        const sc = s - Math.abs(c.pos - mid) / half2;
+      const lo = Math.min(inner, lim) - em * 0.5, hi = Math.max(inner, lim) + em * 0.5;
+      // のどは行とほぼ直交し、上から下まで両ページの文字のすき間の中を通る。影・段差（s）と、直線の強さ（ハフ変換の票）、
+      // すき間の中央への近さで選ぶ（印刷の細い枠線は本文のすぐ横にあり、票も少ない）
+      const ok = list.filter(c => {
+        if (Math.abs(c.ln.nx * e1[0] + c.ln.ny * e1[1]) < Math.cos(4 * RAD) || c.shade < -5) return false;
+        const pt = pointAtV(c.ln, v0), pb = pointAtV(c.ln, v1);
+        return pt && pb && U(pt) >= lo && U(pt) <= hi && U(pb) >= lo && U(pb) <= hi;
+      });
+      const vmax = Math.max(1, ...ok.map(c => c.ln.votes || 0));
+      for (const c of ok) {
+        const s = Math.min(2, Math.max(c.support * 2, c.shade / 10)), v = (c.ln.votes || 0) / vmax;
+        if (s < 0.8 && v < 0.5) continue;
+        const sc = v + 0.5 * s - 0.7 * Math.abs(c.pos - mid) / half2;
         if (sc > bs) { bs = sc; best = c; }
       }
       if (best) chosen = best.ln;
       else {
-        // 影が見えなければ、すき間の中央を通り、行頭の線と同じ向きの線
-        const f = fallback(side), pm = at(mid, (v0 + v1) / 2);
-        chosen = { nx: f.nx, ny: f.ny, rho: f.nx * pm[0] + f.ny * pm[1] };
+        // 影が見えなければ、両ページの文字のすき間の中央を高さごとに求め、それを通る線（左右のページで同じ線になる）
+        const lp = side === 1 ? target : nb.lines, rp = side === 1 ? nb.lines : target;
+        const vb0 = Math.max(v0, nbBox.v0), vb1 = Math.min(v1, nbBox.v1), bin = Math.max(2 * em, (vb1 - vb0) / 40), mids = [];
+        for (let vb = vb0; vb < vb1; vb += bin) {
+          let mx = -Infinity, mn = Infinity;
+          for (const l of lp) for (const p of l.all) { const v = V(p); if (v >= vb && v < vb + bin) mx = Math.max(mx, U(p) + l.th / 2); }
+          for (const l of rp) for (const p of l.all) { const v = V(p); if (v >= vb && v < vb + bin) mn = Math.min(mn, U(p) - l.th / 2); }
+          if (!(mx > -Infinity && mn < Infinity && mn > mx)) continue;
+          mids.push(at((mx + mn) / 2, vb + bin / 2));
+        }
+        let gl = null;
+        for (const pts of [mids]) {
+          if (gl || pts.length < 5) continue;
+          gl = fit(pts, em);
+          const vs = pts.map(V);
+          if (gl && (Math.max(...vs) - Math.min(...vs) < (vb1 - vb0) * 0.4 || !near(gl, e1))) gl = null;
+        }
+        if (gl) chosen = gl;
+        else {
+          const f = fallback(side), pm = at(mid, (v0 + v1) / 2);
+          chosen = { nx: f.nx, ny: f.ny, rho: f.nx * pm[0] + f.ny * pm[1] };
+        }
       }
       kind = 'gutter';
     } else {
-      const good = list.filter(c => c.support >= 0.35).sort((a, b) => a.dist - b.dist);
+      // 本文にいちばん近い、外が紙に戻らない境目（印刷の枠や表の罫線で止まらないように）。なければ従来どおり
+      let good = list.filter(c => c.support >= 0.3 && c.beyond < 0.4).sort((a, b) => a.dist - b.dist);
+      if (!good.length) good = list.filter(c => c.support >= 0.35).sort((a, b) => a.dist - b.dist);
       if (good.length) { chosen = good[0].ln; kind = 'edge'; }
     }
     if (!chosen) {
