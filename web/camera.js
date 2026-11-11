@@ -32,10 +32,15 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
       say('カメラを使えませんでした。ブラウザーの設定でカメラを許可してください。');
       return;
     }
+    // ピントは合わせ続ける（対応している端末だけ）
+    try {
+      const track = stream.getVideoTracks()[0], caps = track.getCapabilities ? track.getCapabilities() : {};
+      if (caps.focusMode && caps.focusMode.includes('continuous')) await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+    } catch {}
     video.srcObject = stream;
     await video.play().catch(() => {});
     setupTorch();
-    prev = null; stillSince = 0; needMotion = false;
+    prev = null; stillSince = 0; needMotion = false; sharpMax = 0;
     const aim = split() ? '本の綴じ目（のど）を中央の点線に合わせて、' : 'ページを枠に入れて、';
     say(autoToggle.checked ? aim + '手を止めると自動で撮影します' : aim + 'シャッターを押して撮影します');
     timer = setInterval(watch, 180);
@@ -132,6 +137,26 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
     g.restore();
   }
 
+  // 映像の中央部分のくっきり具合（細かい明暗の差の大きさ）。手ぶれ・ピンぼけのフレームでは小さくなる
+  const sharpCanvas = document.createElement('canvas');
+  sharpCanvas.width = 240; sharpCanvas.height = 180;
+  const sctx = sharpCanvas.getContext('2d', { willReadFrequently: true });
+  let sharpMax = 0;
+  function sharpness() {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    // 中央の 1/3 ほどを等倍に近い細かさで見る（縮小すると ぼけ が見えなくなるので）
+    const cw = Math.min(vw, 720), ch = Math.min(vh, 540);
+    sctx.drawImage(video, (vw - cw) / 2, (vh - ch) / 2, cw, ch, 0, 0, 240, 180);
+    const d = sctx.getImageData(0, 0, 240, 180).data;
+    let e = 0;
+    for (let y = 1; y < 179; y++) for (let x = 1; x < 239; x++) {
+      const i = (y * 240 + x) * 4, c = d[i + 1];
+      const g = Math.abs(4 * c - d[i - 3] - d[i + 5] - d[i - 959] - d[i + 961]);
+      e += g * g;
+    }
+    return e / (238 * 178);
+  }
+
   // 小さく縮小した映像の前回との差で、動きと静止を判定する
   function watch() {
     if (!video.videoWidth || busy) return;
@@ -149,13 +174,21 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
     if (!autoToggle.checked) return;
     const now = performance.now();
     if (diff > MOTION) {
-      needMotion = false; stillSince = 0;
+      needMotion = false; stillSince = 0; sharpMax = 0;
       say('動きを検出しました。手を止めてください');
     } else if (!needMotion && diff < STILL) {
-      if (!stillSince) stillSince = now;
-      else if (now - stillSince > HOLD_MS) take();
+      // 止まっている間のくっきり具合を見て、ピントが合いぶれていないフレームで撮る
+      // （ピント合わせの途中や、わずかに揺れたフレームは、文字がぼやけて仕上がりがかすれるので）
+      const sh = sharpness();
+      if (!stillSince) { stillSince = now; sharpMax = sh; }
+      else {
+        sharpMax = Math.max(sharpMax, sh);
+        const held = now - stillSince;
+        if (held > HOLD_MS && (sh >= sharpMax * 0.9 || held > HOLD_MS * 3)) take();
+        else if (held > HOLD_MS) say('ピントを合わせています…');
+      }
     } else if (diff >= STILL) {
-      stillSince = 0;
+      stillSince = 0; sharpMax = 0;
     }
   }
 
