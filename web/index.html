@@ -88,20 +88,34 @@
     </div>
     <p id="storage" class="privacy-note storage" hidden></p>
     <p class="privacy-note">写真・PDF・認識テキストはすべてこのスマホの中で処理・保存します。<br>サーバーや外部サービスには送信しません（文字認識も端末内で動作）。</p>
-    <p class="privacy-note app-version">バージョン v31（2026-11-11）</p>
+    <p class="privacy-note app-version">バージョン v32（2026-11-11）</p>
 
     <dialog id="camera-dialog" class="camera-dialog">
-      <video id="camera-video" playsinline muted></video>
-      <canvas id="camera-guide" class="camera-guide" aria-hidden="true"></canvas>
-      <div class="camera-top"><span class="camera-info"><span id="camera-mode" class="mode-chip">本</span><span id="camera-count">0枚</span><span class="mode-chip version-chip">v31</span></span><span class="camera-switches"><button id="camera-torch" class="auto-toggle" type="button" hidden aria-pressed="false">ライト</button><label class="auto-toggle"><input type="checkbox" id="camera-auto" checked> 自動撮影</label></span></div>
-      <div id="camera-pages" class="page-switch" role="radiogroup" aria-label="1回の撮影で保存するページ数">
-        <button type="button" data-pages="1" role="radio" aria-checked="true">1ページ</button><button type="button" data-pages="2" role="radio" aria-checked="false">2ページ（見開き）</button>
+      <div class="camera-head">
+        <form method="dialog"><button class="cam-round" aria-label="撮影を終える"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg></button></form>
+        <span class="camera-info"><span id="camera-mode">本</span><span class="version-chip">v32</span></span>
+        <span class="cam-round-spacer"></span>
       </div>
-      <p id="camera-status" class="camera-status"></p>
+      <div class="camera-view">
+        <video id="camera-video" playsinline muted></video>
+        <canvas id="camera-guide" class="camera-guide" aria-hidden="true"></canvas>
+        <div class="camera-tools">
+          <button id="camera-torch" class="cam-tool" type="button" disabled aria-pressed="false" aria-label="ライト"><svg viewBox="0 0 24 24"><path d="M13 2L5 14h6l-1 8 8-12h-6z"/></svg><small>ライト</small></button>
+          <label class="cam-tool"><input type="checkbox" id="camera-auto" checked><b class="auto-mark">AUTO<br>SCAN</b><small>自動撮影</small></label>
+        </div>
+        <p id="camera-status" class="camera-status"></p>
+        <div id="camera-pages" class="page-switch" role="radiogroup" aria-label="1回の撮影で保存するページ数">
+          <button id="camera-order" class="order-button" type="button" aria-label="ページの順番"><span>1</span><i></i><span>2</span></button>
+          <button type="button" data-pages="1" role="radio" aria-checked="true">1ページ</button><button type="button" data-pages="2" role="radio" aria-checked="false">2ページ</button>
+        </div>
+      </div>
       <div class="camera-bottom">
-        <button id="camera-dest" class="camera-dest" type="button" aria-label="保存先を変える"><small>保存先</small><span id="camera-dest-name"></span></button>
-        <button id="camera-shutter" class="shutter" type="button" aria-label="撮影"></button>
-        <form method="dialog"><button class="camera-done">完了</button></form>
+        <button id="camera-dest" class="camera-dest" type="button" aria-label="保存先を変える"><svg viewBox="0 0 24 24"><path d="M3 6.5A1.5 1.5 0 014.5 5H9l2 2.5h8.5A1.5 1.5 0 0121 9v8.5a1.5 1.5 0 01-1.5 1.5h-15A1.5 1.5 0 013 17.5z"/></svg><span id="camera-dest-name"></span><svg class="chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
+        <div class="camera-row">
+          <form method="dialog" class="thumb-form"><button id="camera-thumb" class="camera-thumb" aria-label="撮ったページを見る"><img id="camera-thumb-img" alt="" hidden><span id="camera-count" class="count-badge">0</span></button></form>
+          <button id="camera-shutter" class="shutter" type="button" aria-label="撮影"></button>
+          <form method="dialog" class="done-form"><button class="camera-done" aria-label="完了"><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg><small>完了</small></button></form>
+        </div>
       </div>
     </dialog>
 
