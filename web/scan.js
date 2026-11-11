@@ -930,6 +930,13 @@ function cleanDocument(d, W, H, { binarize, fine = false }) {
     const depthFrac = Math.min(c.minX <= 1 ? (c.maxX + 1) / W : 1, c.maxX >= W - 2 ? (W - c.minX) / W : 1,
       c.minY <= 1 ? (c.maxY + 1) / H : 1, c.maxY >= H - 2 ? (H - c.minY) / H : 1);
     if (depthFrac > 0.4) continue;
+    // 端に接する長さにくらべて、ページの奥へ3倍以上のびているものは、端まで届いた見出しの帯や枠（印刷）。
+    // 机・影・のどの奥は端にそって広がり、指は幅の2倍ほどまでしか入りこまない
+    let cx = 0, cy = 0;
+    const rowHit = new Set(), colHit = new Set();
+    for (const p of c.px) { const x = p % W, y = (p - x) / W; if (x <= 1 || x >= W - 2) rowHit.add(y); if (y <= 1 || y >= H - 2) colHit.add(x); }
+    cx = rowHit.size; cy = colHit.size;
+    if ((!cx || bw > 3 * cx) && (!cy || bh > 3 * cy)) continue;
     for (const p of c.px) d[p * 4] = d[p * 4 + 1] = d[p * 4 + 2] = 255;
   }
   // 線の判定は薄いグレーも含める（かすれた縁の線も消せるように）
@@ -2001,7 +2008,8 @@ export function clearEdges(canvas, protect = null) {
       }
       if (mn > near || mx > deep) continue;
       // 正確に切り出したページでは、小さなかたまり（ページ番号など）も残す
-      if (keep && (c.px.length < w * h * 0.001 || c.px.some(p => keep[p]))) continue;
+      // （ただし、端から2%以内におさまる切れ端は、紙の外の机や影の残り。ページ番号はもっと内側にある）
+      if (keep && ((c.px.length < w * h * 0.001 && mx > 0.02) || c.px.some(p => keep[p]))) continue;
       for (const p of c.px) kill[p] = 1;
       any = true;
     }
