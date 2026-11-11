@@ -304,11 +304,37 @@ function squareToQuad(q) {
   return { a: x1 - x0 + g * x1, b: x3 - x0 + hh * x3, c: x0, d: y1 - y0 + g * y1, e: y3 - y0 + hh * y3, f: y0, g, h: hh };
 }
 
-export function warp(canvas, corners, maxSide = MAX_SIDE) {
+// 斜めから撮った紙の本当の縦横比（幅÷高さ）を、四隅の遠近のつき方から求める（Zhang & He の方法）。
+// 写真の中心をレンズの中心とみなし、焦点距離はスマホの標準カメラの値（写真の対角線の約0.63倍）とする
+// （四隅から焦点距離も求められるが、四隅が少しずれるだけで大きく狂うので使わない）。
+// q は写真全体（切り抜く前）の上の画素座標
+export function trueAspect(q, W, H) {
+  const P = q.map(([x, y]) => [x - W / 2, y - H / 2, 1]);
+  const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const [m1, m2, m4, m3] = P; // 左上・右上・右下・左下
+  const c14 = cross(m1, m4), d2 = dot(cross(m2, m4), m3), d3 = dot(cross(m3, m4), m2);
+  if (Math.abs(d2) < 1e-9 || Math.abs(d3) < 1e-9) return null;
+  const k2 = dot(c14, m3) / d2, k3 = dot(c14, m2) / d3;
+  const n2 = m2.map((v, i) => k2 * v - m1[i]), n3 = m3.map((v, i) => k3 * v - m1[i]);
+  const f = 0.63 * Math.hypot(W, H);
+  const len = n => n[0] * n[0] + n[1] * n[1] + f * f * n[2] * n[2];
+  const r = Math.sqrt(len(n2) / len(n3));
+  return Number.isFinite(r) && r > 0 ? r : null;
+}
+
+export function warp(canvas, corners, maxSide = MAX_SIDE, photo = true) {
   const W = canvas.width, H = canvas.height;
   const q = corners.map(([x, y]) => [x * W, y * H]);
   const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
   let ow = (dist(q[0], q[1]) + dist(q[3], q[2])) / 2, oh = (dist(q[0], q[3]) + dist(q[1], q[2])) / 2;
+  // 辺の長さの平均だと、斜めから撮るほど遠い側が縮んで縦横比が狂う（文字が細長く・平たくなる）。
+  // 遠近から求めた本当の縦横比に直す（面積はそのまま）
+  const r = photo ? trueAspect(q, W, H) : null;
+  if (r && r > (ow / oh) * 0.6 && r < (ow / oh) / 0.6) {
+    const area = ow * oh;
+    ow = Math.sqrt(area * r); oh = Math.sqrt(area / r);
+  }
   const k = Math.min(1, maxSide / Math.max(ow, oh));
   ow = Math.max(8, Math.round(ow * k)); oh = Math.max(8, Math.round(oh * k));
   const src = ctx2d(canvas).getImageData(0, 0, W, H).data;
@@ -2269,7 +2295,7 @@ async function finishPage(canvas, opts, state) {
   // 文字のかたまりに合わせて切り抜き、台形のゆがみも直す（ページの端が見つからなかったとき・余白が多いとき）
   if (opts.crop === 'auto' && !edgeFound && !extended && (fromLines || !perPage) && opts.subject !== 'screen' && opts.filter !== 'none') {
     const q = textBlock(canvas);
-    if (q) { canvas = warp(canvas, q, Math.max(canvas.width, canvas.height)); await tick(); }
+    if (q) { canvas = warp(canvas, q, Math.max(canvas.width, canvas.height), false); await tick(); }
   }
   // 行を水平にそろえ済みなら、全体を回す傾き補正はしない（回すとかえって傾く）
   if (opts.deskew && !leveled) { skew = detectSkew(canvas); canvas = rotateBy(canvas, skew); }

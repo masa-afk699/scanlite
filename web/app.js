@@ -807,7 +807,7 @@ async function openEditor(page, remaining = 0) {
   $('#edit-apply').textContent = remaining ? `この設定で補正して次へ（残り ${remaining}）` : 'この設定で補正';
   const bitmap = await decode(page.original || page.blob);
   const corners = Array.isArray(page.crop) ? page.crop : page.crop === 'auto' ? (page.corners || FULL_FRAME) : FULL_FRAME;
-  edit = { page, bitmap, rotation: page.rotation || 0, corners: corners.map(c => [...c]), drag: -1 };
+  edit = { page, bitmap, rotation: page.rotation || 0, corners: corners.map(c => [...c]), drag: -1, auto: page.crop === 'auto', touched: false };
   $('#opt-deskew').checked = !!page.deskew;
   $('#opt-fingers').checked = !!page.fingers;
   $('#opt-denoise').checked = page.denoise !== false;
@@ -827,6 +827,8 @@ function renderEditBase() {
   drawEditor();
 }
 
+// 四隅の丸のほかに、辺の中央の丸（辺ごと平行に動かす）を持つ。ドラッグ中は指で隠れる所を拡大して見せる
+const sideMid = (q, i) => [(q[i][0] + q[(i + 1) % 4][0]) / 2, (q[i][1] + q[(i + 1) % 4][1]) / 2];
 function drawEditor() {
   const c = editCanvas.getContext('2d'), W = editCanvas.width, H = editCanvas.height;
   const q = edit.corners.map(([x, y]) => [x * W, y * H]);
@@ -843,6 +845,36 @@ function drawEditor() {
     c.fillStyle = i === edit.drag ? '#b8ed71' : 'rgba(184,237,113,.35)'; c.fill();
     c.lineWidth = Math.max(2, W / 300); c.strokeStyle = '#fff'; c.stroke();
   });
+  for (let i = 0; i < 4; i++) {
+    const [x, y] = sideMid(q, i);
+    c.beginPath(); c.arc(x, y, r * 0.62, 0, Math.PI * 2);
+    c.fillStyle = edit.drag === 4 + i ? '#b8ed71' : 'rgba(255,255,255,.75)'; c.fill();
+    c.lineWidth = Math.max(2, W / 300); c.strokeStyle = '#b8ed71'; c.stroke();
+  }
+  if (edit.drag >= 0) drawLoupe(c, W, H, edit.drag < 4 ? q[edit.drag] : sideMid(q, edit.drag - 4), q);
+  c.restore();
+}
+
+// 拡大鏡: 動かしている点のまわりを3倍で、指と反対側の上の隅に出す
+function drawLoupe(c, W, H, [px, py], q) {
+  const R = Math.min(W, H) * 0.17, zoom = 3;
+  const cx = px < W / 2 ? W - R - 10 : R + 10, cy = R + 10;
+  c.save();
+  c.beginPath(); c.arc(cx, cy, R, 0, Math.PI * 2); c.closePath();
+  c.fillStyle = '#101914'; c.fill();
+  c.clip();
+  c.translate(cx - px * zoom, cy - py * zoom); c.scale(zoom, zoom);
+  c.drawImage(edit.base, 0, 0);
+  c.beginPath(); c.moveTo(...q[0]); q.slice(1).forEach(p => c.lineTo(...p)); c.closePath();
+  c.lineWidth = Math.max(1, W / 700); c.strokeStyle = '#b8ed71'; c.stroke();
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.restore();
+  c.save();
+  c.beginPath(); c.arc(cx, cy, R, 0, Math.PI * 2);
+  c.lineWidth = Math.max(2, W / 260); c.strokeStyle = '#fff'; c.stroke();
+  const t = R * 0.18;
+  c.beginPath(); c.moveTo(cx - t, cy); c.lineTo(cx + t, cy); c.moveTo(cx, cy - t); c.lineTo(cx, cy + t);
+  c.lineWidth = Math.max(1.5, W / 400); c.strokeStyle = '#ff5a4f'; c.stroke();
   c.restore();
 }
 
@@ -853,35 +885,55 @@ function canvasPoint(e) {
 editCanvas.addEventListener('pointerdown', e => {
   if (!edit) return;
   const [x, y] = canvasPoint(e), rect = editCanvas.getBoundingClientRect();
+  const handles = [...edit.corners, ...[0, 1, 2, 3].map(i => sideMid(edit.corners, i))];
   let best = -1, bestD = Infinity;
-  edit.corners.forEach(([cx, cy], i) => {
-    const d = Math.hypot((cx - x) * rect.width, (cy - y) * rect.height);
+  handles.forEach(([cx, cy], i) => {
+    // 四隅を優先する（辺の中央の丸は少し近くないと選ばない）
+    const d = Math.hypot((cx - x) * rect.width, (cy - y) * rect.height) * (i < 4 ? 1 : 1.4);
     if (d < bestD) { bestD = d; best = i; }
   });
   if (bestD > 60) return;
   edit.drag = best;
+  edit.start = [x, y];
+  edit.from = edit.corners.map(p => [...p]);
   editCanvas.setPointerCapture(e.pointerId);
   drawEditor();
 });
 editCanvas.addEventListener('pointermove', e => {
   if (!edit || edit.drag < 0) return;
-  edit.corners[edit.drag] = canvasPoint(e);
+  const p = canvasPoint(e);
+  if (edit.drag < 4) edit.corners[edit.drag] = p;
+  else {
+    // 辺を動かす: 両端の角を同じだけ動かす（写真の外へは出さない）
+    const i = edit.drag - 4, j = (i + 1) % 4, f = edit.from;
+    let dx = p[0] - edit.start[0], dy = p[1] - edit.start[1];
+    for (const k of [i, j]) {
+      dx = Math.min(1 - f[k][0], Math.max(-f[k][0], dx));
+      dy = Math.min(1 - f[k][1], Math.max(-f[k][1], dy));
+    }
+    edit.corners[i] = [f[i][0] + dx, f[i][1] + dy];
+    edit.corners[j] = [f[j][0] + dx, f[j][1] + dy];
+  }
+  edit.touched = true;
   drawEditor();
 });
 const endDrag = () => { if (edit && edit.drag >= 0) { edit.drag = -1; drawEditor(); } };
 editCanvas.addEventListener('pointerup', endDrag);
 editCanvas.addEventListener('pointercancel', endDrag);
 
+// 自動のまま（四隅を動かしていない）なら、補正は自動の範囲で行う（紙の反り・行の波打ちの補正もかかる）
+const autoCorners = () => (edit.rotation === (edit.page.rotation || 0) && edit.page.crop === 'auto' && edit.page.corners) || detectPage(edit.base, optionsOf(edit.page).subject) || FULL_FRAME;
 $('#edit-rotate').onclick = () => {
   edit.rotation = (edit.rotation + 270) % 360;
   edit.base = drawRotated(edit.bitmap, edit.rotation, 1200);
-  edit.corners = detectPage(edit.base, optionsOf(edit.page).subject) || FULL_FRAME;
+  edit.corners = autoCorners().map(c => [...c]);
+  edit.auto = true; edit.touched = false;
   renderEditBase();
 };
-$('#edit-auto').onclick = () => { edit.corners = detectPage(edit.base, optionsOf(edit.page).subject) || FULL_FRAME; drawEditor(); };
-$('#edit-full').onclick = () => { edit.corners = FULL_FRAME.map(c => [...c]); drawEditor(); };
+$('#edit-auto').onclick = () => { edit.corners = autoCorners().map(c => [...c]); edit.auto = true; edit.touched = false; drawEditor(); };
+$('#edit-full').onclick = () => { edit.corners = FULL_FRAME.map(c => [...c]); edit.auto = false; edit.touched = true; drawEditor(); };
 $('#edit-apply').onclick = async () => {
-  const { page, rotation, corners, bitmap } = edit;
+  const { page, rotation, corners, bitmap } = edit, auto = edit.auto && !edit.touched;
   const change = {
     rotation, half: $('#opt-half').value || null,
     deskew: $('#opt-deskew').checked, fingers: $('#opt-fingers').checked, denoise: $('#opt-denoise').checked,
@@ -891,7 +943,7 @@ $('#edit-apply').onclick = async () => {
   bitmap.close?.();
   edit = null;
   const full = corners.every((c, i) => Math.abs(c[0] - FULL_FRAME[i][0]) < 0.002 && Math.abs(c[1] - FULL_FRAME[i][1]) < 0.002);
-  change.crop = full ? 'none' : corners;
+  change.crop = auto ? 'auto' : full ? 'none' : corners;
   // 補正は裏で進め、選んだページが残っていればすぐ次のページを開く
   editJobs.push(reprocess(page, change, { quiet: true }).catch(e => console.error(e)));
   await openNextEdit();
