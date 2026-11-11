@@ -269,15 +269,19 @@ $('#doc-delete').onclick = async () => {
 
 // ---------- 保存先を選ぶ画面（撮影中の保存先の切り替え・文書の移動） ----------
 // kind: 'camera' = フォルダと文書を選んで、以後の撮影をそこに保存 / 'move' = 今の文書を別のフォルダへ移す
+//       'copy' = 選んだページを、選んだ文書の最後にまとめてコピーする
 let dest = null;
 function openDest(kind) {
   dest = { kind, folder: currentDoc()?.folderId ?? null };
   if (!folderName(dest.folder)) dest.folder = null;
-  $('#dest-title').textContent = kind === 'move' ? '文書をフォルダに移す' : '保存先を選ぶ';
+  $('#dest-title').textContent = { move: '文書をフォルダに移す', copy: '選んだページをコピー' }[kind] || '保存先を選ぶ';
   $('#dest-note').textContent = kind === 'move'
     ? `「${currentDoc().name}」を入れるフォルダを選んでください。`
-    : 'これから撮るページの保存先です。撮影の途中でも切り替えられます。';
+    : kind === 'copy'
+      ? `選んだ ${selectedPages().filter(ready).length} ページを、選んだ文書の最後にコピーします。この文書を選ぶと、同じ文書の最後に複製します。`
+      : 'これから撮るページの保存先です。撮影の途中でも切り替えられます。';
   $('#dest-docs-area').hidden = kind === 'move';
+  $('#dest-docs-label').textContent = kind === 'copy' ? 'コピー先の文書' : '文書（ここに撮影したページが入ります）';
   drawDest();
   $('#dest-dialog').showModal();
 }
@@ -308,6 +312,14 @@ function drawDest() {
     item('＋ 新しいフォルダ', false, async () => { const id = await newFolder(); if (id == null) return; folders = await db.allFolders(); await pick(id); }, 'add'),
   );
   if (dest.kind === 'move') return;
+  if (dest.kind === 'copy') {
+    const list = docs.filter(d => (dest.folder == null ? !folderName(d.folderId) : d.folderId === dest.folder)).reverse();
+    $('#dest-docs').replaceChildren(
+      item('＋ 新しい文書', false, async () => { const id = await newDocIn(dest.folder); if (id != null) await copySelectedTo(id); }, 'add'),
+      ...list.map(d => item(d.id === docId ? `${d.name}（この文書）` : d.name, false, () => copySelectedTo(d.id))),
+    );
+    return;
+  }
   const choose = async id => {
     docId = id;
     // 撮影画面で選んだ保存先を、ホーム画面の表示にも合わせる
@@ -486,6 +498,7 @@ function showSelection() {
   $('#sel-edit').disabled = !usable.length;
   $('#sel-rotate').disabled = !usable.length;
   $('#sel-settings').disabled = !usable.length;
+  $('#sel-copy').disabled = !usable.length;
   const allReady = usable.length === list.length && list.length > 0;
   const first = pages.findIndex(p => selected.has(p.id)), last = pages.length - 1 - [...pages].reverse().findIndex(p => selected.has(p.id));
   $('#sel-up').disabled = !allReady || first <= 0 || list.length === pages.length;
@@ -550,6 +563,24 @@ async function moveSelected(delta) {
 }
 $('#sel-up').onclick = () => moveSelected(-1);
 $('#sel-down').onclick = () => moveSelected(1);
+
+// 選んだページを、別の文書（または同じ文書の最後）へまとめてコピーする。元のページはそのまま残す
+async function copySelectedTo(targetId) {
+  const list = selectedPages().filter(ready);
+  if (!list.length) return;
+  const target = docs.find(d => d.id === targetId) || (await db.allDocs()).find(d => d.id === targetId);
+  const base = Date.now();
+  for (let i = 0; i < list.length; i++) {
+    const { id, ...rest } = await db.getPage(list[i].id);
+    // 並び順は created で決まるので、選んだときの順のまま最後に足す
+    await db.addPage({ ...rest, docId: targetId, created: base + i });
+  }
+  $('#dest-dialog').close();
+  endSelect();
+  await refresh();
+  alert(`${list.length} ページを「${destLabel(target)}」にコピーしました。`);
+}
+$('#sel-copy').onclick = () => openDest('copy');
 
 $('#sel-delete').onclick = async () => {
   const list = selectedPages();
@@ -734,6 +765,8 @@ function syncCameraBar() {
   $('#camera-dest-name').textContent = destLabel(currentDoc());
   const two = $('#opt-split').checked;
   document.querySelectorAll('#camera-pages button').forEach(b => b.setAttribute('aria-checked', String((b.dataset.pages === '2') === two)));
+  // 見開き（2ページ）のときは、右手の親指で押せるようにシャッターを画面の右側に置く
+  $('#camera-dialog').classList.toggle('one-hand', mode !== 'screen' && two);
 }
 // 撮影中でも「1ページ」「2ページ（見開き）」をいつでも切り替えられる
 document.querySelectorAll('#camera-pages button').forEach(b => b.onclick = () => {
