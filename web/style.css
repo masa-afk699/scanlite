@@ -54,3 +54,4 @@ body.selecting .shell{padding-bottom:calc(150px + env(safe-area-inset-bottom))}
 .shutter{width:82px;height:82px;border-radius:50%;border:4px solid #fff;background:#fff;box-shadow:inset 0 0 0 4px #111;padding:0}.shutter:active{transform:scale(.94)}
 .camera-done{display:flex;flex-direction:column;align-items:center;gap:2px;border:0;background:none;color:#fff;font:inherit;padding:4px 8px}.camera-done svg{width:34px;height:34px;padding:5px;border-radius:8px;background:#fff;color:#111;stroke-width:3}.camera-done small{font-size:11px;color:#ccc}
 .camera-dialog.flash::after{content:"";position:absolute;inset:0;background:#fff;animation:flash .35s ease-out forwards;pointer-events:none}@keyframes flash{from{opacity:.8}to{opacity:0}}
+#force-update{border:0;background:none;padding:0 0 0 6px;font:inherit;color:#4f7f65;text-decoration:underline;cursor:pointer}

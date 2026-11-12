@@ -1420,3 +1420,14 @@ if ('serviceWorker' in navigator) {
     document.addEventListener('visibilitychange', () => { if (!document.hidden) reg.update().catch(() => {}); });
   }).catch(() => {});
 }
+// 「最新版に更新」: 自動の更新が届かないときの手動の取り直し。
+// アプリの画面のファイルだけを消して読み込み直す（撮った写真・文書・OCRモデルは消さない）。
+document.getElementById('force-update')?.addEventListener('click', async e => {
+  if (!confirm('アプリを最新版に読み込み直します。撮影したページや文書は消えません。')) return;
+  e.target.disabled = true; e.target.textContent = '更新中…';
+  try {
+    for (const r of await navigator.serviceWorker?.getRegistrations?.() || []) await r.unregister();
+    for (const k of await caches.keys()) if (k.startsWith('scanlite-shell-')) await caches.delete(k);
+  } catch {}
+  location.reload();
+});
