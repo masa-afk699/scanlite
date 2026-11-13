@@ -88,12 +88,12 @@
     </div>
     <p id="storage" class="privacy-note storage" hidden></p>
     <p class="privacy-note">写真・PDF・認識テキストはすべてこのスマホの中で処理・保存します。<br>サーバーや外部サービスには送信しません（文字認識も端末内で動作）。</p>
-    <p class="privacy-note app-version">バージョン v35（2026-11-13） <button id="force-update" type="button">最新版に更新</button></p>
+    <p class="privacy-note app-version">バージョン v36（2026-11-13） <button id="force-update" type="button">最新版に更新</button></p>
 
     <dialog id="camera-dialog" class="camera-dialog">
       <div class="camera-head">
         <form method="dialog"><button class="cam-round" aria-label="撮影を終える"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg></button></form>
-        <span class="camera-info"><span id="camera-mode">本</span><span class="version-chip">v35</span></span>
+        <span class="camera-info"><span id="camera-mode">本</span><span class="version-chip">v36</span></span>
         <span class="cam-round-spacer"></span>
       </div>
       <div class="camera-view">
@@ -200,13 +200,14 @@
         <label>指を消す<select id="batch-fingers" class="tri"></select></label>
         <label>モアレ除去（画面撮影）<select id="batch-moire" class="tri"></select></label>
         <label>ページ端の切り抜き<select id="batch-crop" class="tri"></select></label>
+        <label>歪み補正（本の反り・行の曲がり）<select id="batch-dewarp" class="tri"></select></label>
         <label>OCR（文字検索用）<select id="batch-ocr" class="tri"></select></label>
       </div>
       <p class="dialog-note">OCRを「する」にすると、裏で順番に文字認識を進めます。PDFを作るときに待たずに済みます。</p>
       <button id="batch-apply" class="dark-button" type="button">全ページに適用</button>
     </dialog>
 
-    <dialog id="edit-dialog" class="edit-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2 id="edit-title">範囲と補正</h2><p class="dialog-note">四隅の丸（辺は中央の丸）をドラッグして紙の角に合わせると、斜めから撮った紙も長方形に直します。ドラッグ中は拡大鏡が出ます。</p><div class="edit-stage"><canvas id="edit-canvas"></canvas></div><div class="edit-row"><button id="edit-rotate" type="button">↺ 回転</button><button id="edit-auto" type="button">自動検出</button><button id="edit-full" type="button">切り抜かない</button></div><div class="edit-options"><label><input type="checkbox" id="opt-deskew"> 傾きを補正</label><label><input type="checkbox" id="opt-fingers"> 指を消す</label><label><input type="checkbox" id="opt-denoise"> ノイズを除去</label><label><input type="checkbox" id="opt-even"> 色ムラを補正</label><label><input type="checkbox" id="opt-moire"> モアレを除去</label><label>色 <select id="opt-filter"></select></label><label class="wide">見開き <select id="opt-half"><option value="">分けない</option><option value="right">右ページだけ</option><option value="left">左ページだけ</option></select></label></div><button id="edit-apply" class="dark-button" type="button">この設定で補正</button></dialog>
+    <dialog id="edit-dialog" class="edit-dialog"><form method="dialog"><button class="close" aria-label="閉じる">×</button></form><h2 id="edit-title">範囲と補正</h2><p class="dialog-note" id="edit-note">四隅の丸（辺は中央の丸）をドラッグして紙の角に合わせると、斜めから撮った紙も長方形に直します。</p><div class="edit-stage"><canvas id="edit-canvas"></canvas></div><div class="edit-row"><button id="edit-rotate" type="button">↺ 回転</button><button id="edit-auto" type="button">自動検出</button><button id="edit-full" type="button">切り抜かない</button><button id="edit-bend" type="button" aria-pressed="false">辺を曲げる</button></div><div class="edit-options"><label class="wide"><input type="checkbox" id="opt-dewarp"> 歪み補正（本の反り・行の曲がりを直す）</label><label><input type="checkbox" id="opt-deskew"> 傾きを補正</label><label><input type="checkbox" id="opt-fingers"> 指を消す</label><label><input type="checkbox" id="opt-denoise"> ノイズを除去</label><label><input type="checkbox" id="opt-even"> 色ムラを補正</label><label><input type="checkbox" id="opt-moire"> モアレを除去</label><label>色 <select id="opt-filter"></select></label><label class="wide">見開き <select id="opt-half"><option value="">分けない</option><option value="right">右ページだけ</option><option value="left">左ページだけ</option></select></label></div><button id="edit-apply" class="dark-button" type="button">この設定で補正</button></dialog>
   </main>
   <script src="app.js" type="module"></script>
 </body>
