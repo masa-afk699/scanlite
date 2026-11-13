@@ -1579,6 +1579,7 @@ function whitenOutside(canvas, corners, size, outline) {
     let P = pts.map(toOut).map(([x, y]) => horizontal ? [x, side === 0 ? y : H - 1 - y] : [y, side === 3 ? x : W - 1 - x]);
     P = P.filter(([a, b]) => b > -2 && b < (horizontal ? H : W) * 0.08).sort((p, q) => p[0] - q[0]);
     if (P.length < 6) return;
+    const inset = Math.max(2, (horizontal ? H : W) * 0.004);
     // 細かなぶれをならす（5点の中央値）
     const vals = P.map((_, i) => { const s = P.slice(Math.max(0, i - 2), i + 3).map(p => p[1]).sort((a, b) => a - b); return s[s.length >> 1]; });
     const N = horizontal ? W : H;
@@ -1589,7 +1590,8 @@ function whitenOutside(canvas, corners, size, outline) {
       if (a <= P[0][0]) depth = vals[0];
       else if (a >= P[P.length - 1][0]) depth = vals[vals.length - 1];
       else { const t = (a - P[k][0]) / (P[k + 1][0] - P[k][0] || 1); depth = vals[k] + (vals[k + 1] - vals[k]) * t; }
-      const n = Math.floor(depth - 1);
+      // 境目そのもの（紙の端の影の線）が残らないよう、境目の少し内側まで白にする
+      const n = Math.floor(depth + inset);
       for (let b = 0; b < n; b++) {
         const x = horizontal ? a : side === 3 ? b : W - 1 - b, y = horizontal ? (side === 0 ? b : H - 1 - b) : a;
         const i = (y * W + x) * 4; d[i] = d[i + 1] = d[i + 2] = 255;
@@ -2024,9 +2026,9 @@ export function clearEdges(canvas, protect = null) {
     if (v < 130) dark[p] = 1; else if (v < 238) gray[p] = 1; else white++;
   }
   if (white < w * h * 0.5) return; // 紙の白が少ない（写真など）は触らない
-  const deep = 0.09, kill = new Uint8Array(w * h);
+  const deep = 0.09, band = 0.03, kill = new Uint8Array(w * h);
   let any = false;
-  const sweep = (mask, near, keep = null) => {
+  const sweep = (mask, near, keep = null, bandKeep = keep) => {
     for (const c of components(mask, w, h)) {
       let mn = 1, mx = 0;
       for (const p of c.px) {
@@ -2035,19 +2037,15 @@ export function clearEdges(canvas, protect = null) {
         if (mx > deep) break;
       }
       if (mx > deep) continue;
-      if (mn > near) {
-        // 正確に切り出したページで、端から3%以内に端と平行に並ぶ細い切れ端（紙の端の影・机の線の残り）は消す。
-        // 文字の行（ページ番号も）にかかるものは残す
-        if (!keep || mx > 0.03 || c.px.some(p => keep[p])) continue;
-        let x0 = w, x1 = 0, y0 = h, y1 = 0;
-        for (const p of c.px) { const x = p % w, y = (p - x) / w; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
-        const horiz = Math.min(y0, h - 1 - y1) / h < Math.min(x0, w - 1 - x1) / w;
-        const thick = horiz ? y1 - y0 + 1 : x1 - x0 + 1, long = horiz ? x1 - x0 + 1 : y1 - y0 + 1;
-        if (thick > 4 || long < thick * 3) continue;
+      // 正確に切り出したページでは、端から3%以内におさまるかたまりは紙の端の影・机の線・とじ穴の残りなので、
+      // 形によらず消す（文字の行にかかるものは残す。ページ番号は行として見つかっているか、もっと内側にある）
+      if (bandKeep && mx <= band) {
+        if (c.px.some(p => bandKeep[p])) continue;
         for (const p of c.px) kill[p] = 1;
         any = true;
         continue;
       }
+      if (mn > near) continue;
       // 正確に切り出したページでは、小さなかたまり（ページ番号など）も残す
       // （ただし、端から2%以内におさまる切れ端は、紙の外の机や影の残り。ページ番号はもっと内側にある）
       if (keep && ((c.px.length < w * h * 0.001 && mx > 0.02) || c.px.some(p => keep[p]))) continue;
@@ -2063,6 +2061,12 @@ export function clearEdges(canvas, protect = null) {
     for (const [x0, y0, x1, y1] of protect) for (let y = Math.max(0, Math.floor(y0 * h)); y <= Math.min(h - 1, Math.ceil(y1 * h)); y++) for (let x = Math.max(0, Math.floor(x0 * w)); x <= Math.min(w - 1, Math.ceil(x1 * w)); x++) keep[y * w + x] = 1;
   }
   sweep(dark, protect ? 0.015 : 0.018, keep);
+  // 正確に切り出したページ: 濃淡によらず、端の帯の中だけにある汚れ（薄い線・点も）を消す
+  if (keep) {
+    const ink = new Uint8Array(w * h);
+    for (let p = 0; p < ink.length; p++) ink[p] = dark[p] | gray[p];
+    sweep(ink, -1, keep);
+  }
   // 次に薄いかげり（影）。影は濃淡がなだらかで、写真の縁まで続く。見出しの帯の薄い部分や図の塗りは
   // 輪郭がはっきりしているので、明るさが急に変わる所を境目にして、影だけを縁からたどって消す
   const val = p => Math.min(d[p * 4], d[p * 4 + 1], d[p * 4 + 2]);
@@ -2074,7 +2078,7 @@ export function clearEdges(canvas, protect = null) {
     const g = Math.max(x > 0 ? Math.abs(v - val(p - 1)) : 0, x < w - 1 ? Math.abs(v - val(p + 1)) : 0, y > 0 ? Math.abs(v - val(p - w)) : 0, y < h - 1 ? Math.abs(v - val(p + w)) : 0);
     if (g > 26) gray[p] = 0;
   }
-  sweep(gray, 0.006);
+  sweep(gray, 0.006, null, keep);
   if (!any) return;
   // 縁のぼけた分まで消えるよう、1画素ふくらませる
   const grown = morph(kill, w, h, 1, true);
@@ -2084,6 +2088,86 @@ export function clearEdges(canvas, protect = null) {
     for (let x = 0; x < W; x++) if (grown[sy * w + Math.min(w - 1, (x * w / W) | 0)]) { const i = (y * W + x) * 4; o[i] = o[i + 1] = o[i + 2] = 255; }
   }
   ctx.putImageData(full, 0, 0);
+}
+
+// ---------- 行の書き出しのずれ（平行四辺形のゆがみ） ----------
+// 行は水平なのに、行の書き出しの位置が下へ行くほど横にずれていく（ページが平行四辺形にゆがむ）のを直す。
+// 行を水平にそろえる処理は縦にずらすだけなので、切り出しが少し回っていると、行はまっすぐでも段落の左端が斜めに残る。
+// 行ごとの書き出し（と行末）の位置を画像から測り、いちばん多くの行がのる直線の傾きだけ横にずらして戻す。
+// vertical: 縦書き（列の上端・下端のそろい方を見て、縦にずらす）
+export function fixShear(canvas, vertical = false) {
+  const img = shrink(canvas, 800), { width: iw, height: ih, data: d } = img;
+  // 縦書きは縦横を入れ替えて同じ計算をする
+  const w = vertical ? ih : iw, h = vertical ? iw : ih;
+  const ink = (x, y) => { const i = (vertical ? x * iw + y : y * iw + x) * 4; return Math.min(d[i], d[i + 1], d[i + 2]) < 140; };
+  const mx = Math.round(w * 0.035), my = Math.round(h * 0.035);
+  // 行（文字のある横の並び）ごとに、書き出しと行末の位置を取る
+  const rows = [];
+  let run = null;
+  for (let y = my; y < h - my; y++) {
+    let first = -1, last = -1, n = 0;
+    for (let x = mx; x < w - mx; x++) if (ink(x, y)) { if (first < 0) first = x; last = x; n++; }
+    if (n >= 3 && last - first > w * 0.05) {
+      if (!run) run = { y0: y, y1: y, a: first, b: last };
+      else { run.y1 = y; if (first < run.a) run.a = first; if (last > run.b) run.b = last; }
+    } else if (run) { rows.push(run); run = null; }
+  }
+  if (run) rows.push(run);
+  // 行らしい高さのものだけ（罫線・図・つながった行のかたまりは除く）
+  const hs = rows.map(r => r.y1 - r.y0 + 1).sort((a, b) => a - b), med = hs[hs.length >> 1] || 0;
+  const R = rows.filter(r => { const t = r.y1 - r.y0 + 1; return t >= med * 0.5 && t <= med * 1.8 && t >= 3; });
+  if (R.length < 8) return canvas;
+  const tol = Math.max(1.5, w * 0.004);
+  // 行の端の傾き k（x = c + k·y）。字下げや枠で書き出しの位置がいくつかあっても傾きは同じなので、
+  // 傾きごとに「同じ c に3行以上そろう行」の数を数え、いちばん多い傾きを選ぶ
+  const fit = key => {
+    const P = R.map(r => [(r.y0 + r.y1) / 2, r[key]]);
+    const groups = k => {
+      const c = P.map(([y, x], i) => [x - k * y, i]).sort((p, q) => p[0] - q[0]), out = [];
+      let g = [c[0]];
+      for (let i = 1; i <= c.length; i++) {
+        if (i < c.length && c[i][0] - g[g.length - 1][0] <= tol) { g.push(c[i]); continue; }
+        if (g.length >= 3) out.push(g.map(e => e[1]));
+        g = [c[i]];
+      }
+      return out;
+    };
+    let best = null;
+    for (let k = -0.15; k <= 0.1501; k += 0.002) {
+      const G = groups(k), n = G.reduce((a, g) => a + g.length, 0);
+      if (!best || n > best.n || (n === best.n && Math.abs(k) < Math.abs(best.k))) best = { k, n, G };
+    }
+    if (!best || !best.n) return null;
+    // そろった行で最小二乗（かたまりごとに c は別、傾きは共通）
+    let sxy = 0, syy = 0, y0 = Infinity, y1 = -Infinity;
+    for (const g of best.G) {
+      const ym = g.reduce((a, i) => a + P[i][0], 0) / g.length, xm = g.reduce((a, i) => a + P[i][1], 0) / g.length;
+      for (const i of g) { sxy += (P[i][0] - ym) * (P[i][1] - xm); syy += (P[i][0] - ym) * (P[i][0] - ym); if (P[i][0] < y0) y0 = P[i][0]; if (P[i][0] > y1) y1 = P[i][0]; }
+    }
+    return { k: syy ? sxy / syy : best.k, n: best.n, span: y1 - y0 };
+  };
+  const ok = f => (f && f.n >= Math.max(6, R.length * 0.3) && f.span > h * 0.35 ? f : null);
+  // 書き出しは半分以上の行がそろうこと。行末は、ほとんどの行がそろう（両端ぞろえの文章）ときだけ信じる
+  // （行末がばらばらの文章で、たまたま並んだ数行を拾わないように）
+  const strong = (f, share) => (f && f.n >= R.length * share ? f : null);
+  const fa = strong(ok(fit('a')), 0.5), fb = strong(ok(fit('b')), 0.65);
+  if (!fa) return canvas;
+  // 書き出しと行末の両方がそろっているときは、それぞれの傾きを使う（下へ行くほど行が短くなる台形のゆがみも直る）。
+  // 片方だけのとき（行末がそろわない文章など）は、同じ傾きで平行にずらす
+  const xs = key => { const v = R.map(r => r[key]).sort((p, q) => p - q); return v[v.length >> 1]; };
+  let k0, k1;
+  if (fa && fb && xs('b') - xs('a') > w * 0.3) {
+    const xa = xs('a'), xb = xs('b'), at = x => fa.k + (fb.k - fa.k) * (x - xa) / (xb - xa);
+    k0 = at(0); k1 = at(w);
+  } else k0 = k1 = fa.k;
+  if (Math.max(Math.abs(k0), Math.abs(k1)) < 0.004 || Math.abs(k0) > 0.12 || Math.abs(k1) > 0.12) return canvas;
+  // 文字の向き（横書きの縦方向）の長さ・幅
+  const W = canvas.width, H = canvas.height, r = vertical ? W / H : H / W;
+  // 中央の行を動かさずに、左右の端がそれぞれの傾きの線になる四角形を、長方形に写す
+  const q = [[-k0 * r / 2, 0], [1 - k1 * r / 2, 0], [1 + k1 * r / 2, 1], [k0 * r / 2, 1]];
+  const out = warp(canvas, vertical ? [q[0], q[3], q[2], q[1]].map(([a2, b2]) => [b2, a2]) : q, Math.max(W, H), false);
+  out.shear = { k0, k1, vertical };
+  return out;
 }
 
 // ---------- 傾き補正 ----------
@@ -2297,7 +2381,7 @@ async function pageGeometry(original, opts) {
 // 切り出したページの仕上げ（行の波打ち・明るさ・色・文字のくっきり・傾き・端の掃除）
 async function finishPage(canvas, opts, state) {
   const { corners, perPage, fromLines, edgeFound, extended, exact, size } = state;
-  let leveled = false;
+  let leveled = false, sheared = null;
   // 行の波打ち・傾きを画像から測って仕上げる（横書きの紙のみ。2回かけて残りを詰める。
   // 紙の端から正確に切り出して反りも直したページは、残りが小さいので1回）
   if (opts.subject !== 'screen' && opts.crop === 'auto' && opts.lines && linesVertical(opts.lines) === false) {
@@ -2312,11 +2396,28 @@ async function finishPage(canvas, opts, state) {
     const q = textBlock(canvas);
     if (q) { canvas = warp(canvas, q, Math.max(canvas.width, canvas.height), false); await tick(); }
   }
+  // 行は水平でも書き出しが下へ行くほど横にずれる（平行四辺形のゆがみ）のを直す
+  if (opts.crop === 'auto' && opts.subject !== 'screen' && opts.filter !== 'none' && opts.lines) {
+    const v = linesVertical(opts.lines);
+    if (v !== null) { const c2 = fixShear(canvas, v); if (c2 !== canvas) { canvas = c2; sheared = c2.shear; await tick(); } }
+  }
   // 行を水平にそろえ済みなら、全体を回す傾き補正はしない（回すとかえって傾く）
   if (opts.deskew && !leveled) { skew = detectSkew(canvas); canvas = rotateBy(canvas, skew); }
   // 端の掃除（机・隣のページの切れ端・影を消す）。紙の端・のどで正確に切り出したときは、文字の行がかかる
   // かたまり（ページの端に接する見出しの帯など）は残す
-  if (opts.crop === 'auto' && opts.subject !== 'screen' && opts.filter !== 'none') clearEdges(canvas, exact ? lineBoxes(opts.lines, corners, size) : null);
+  if (opts.crop === 'auto' && opts.subject !== 'screen' && opts.filter !== 'none') {
+    let boxes = exact ? lineBoxes(opts.lines, corners, size) : null;
+    // 横（縦）にずらした分だけ、文字の行の範囲もずらす
+    if (boxes && sheared) {
+      const { k0, k1, vertical } = sheared, r = canvas.height / canvas.width;
+      boxes = boxes.map(([x0, y0, x1, y1]) => {
+        const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+        if (vertical) { const dy = -(k0 + (k1 - k0) * cy) * (cx - 0.5) / r; return [x0, y0 + dy, x1, y1 + dy]; }
+        const dx = -(k0 + (k1 - k0) * cx) * (cy - 0.5) * r; return [x0 + dx, y0, x1 + dx, y1];
+      });
+    }
+    clearEdges(canvas, boxes);
+  }
   // 利用者が「回転」で回したページは、仕上がったページをそのまま回す（元写真は回さない。見開きの片側でも正しく回る）
   if (opts.turn) canvas = drawRotated(canvas, opts.turn, Infinity);
   const blob = await toJpeg(canvas, JPEG_Q);
