@@ -1,5 +1,5 @@
 // ScanLite: すべての処理をブラウザー内で行う。撮影画像・PDF・OCR結果はネットワークに送らない。
-import { processImage as processHere, processSpread as spreadHere, finishHalf as finishHere, decode, drawRotated, detectPage, FULL_FRAME, recompress, limitOriginal as limitHere, cropTop, orientCandidates, linesVertical, turnPage } from './scan.js';
+import { processImage as processHere, processSpread as spreadHere, finishHalf as finishHere, decode, drawRotated, detectPage, FULL_FRAME, recompress, limitOriginal as limitHere, cropTop, orientCandidates, linesVertical, turnPage, bendOutline, bendHandle, bendFromPoint, hasCurves } from './scan.js';
 import * as db from './db.js';
 import { buildPdf } from './pdf.js';
 import { recognize, textLines, warmUp } from './ocr.js';
@@ -7,7 +7,7 @@ import { createCamera } from './camera.js';
 import * as save from './save.js';
 
 // 新しく取り込んだページの標準設定
-const DEFAULTS = { rotation: 0, filter: 'color', crop: 'auto', half: null, deskew: true, fingers: true, denoise: true, evenColor: true, moire: false };
+const DEFAULTS = { rotation: 0, filter: 'color', crop: 'auto', half: null, deskew: true, fingers: true, denoise: true, evenColor: true, moire: false, dewarp: true };
 // PC・スマホの画面を撮るとき: 紙向けの補正は使わず、モアレ除去と画面向けの色補正にする
 const SCREEN_DEFAULTS = { ...DEFAULTS, filter: 'screen', deskew: false, fingers: false, denoise: false, evenColor: false, moire: true };
 const FILTERS = { color: 'カラー', gray: 'グレースケール', bw: '白黒', screen: '画面向け', none: '補正なし' };
@@ -425,7 +425,7 @@ async function showStorage() {
 const optionsOf = p => ({
   rotation: p.rotation || 0, turn: p.turn || 0, filter: p.filter || 'none', crop: p.crop || 'none', half: p.half || null, perPage: !!p.perPage,
   deskew: !!p.deskew, fingers: !!p.fingers, denoise: p.denoise !== false, evenColor: p.evenColor !== false,
-  moire: !!p.moire, subject: p.mode === 'screen' ? 'screen' : 'paper', lines: p.lines || null,
+  moire: !!p.moire, dewarp: p.dewarp !== false, curves: Array.isArray(p.crop) && hasCurves(p.curves) ? p.curves : null, subject: p.mode === 'screen' ? 'screen' : 'paper', lines: p.lines || null,
 });
 
 // 仕上がったページを右に90度回す。元写真は回さないので、見開きの片側のページもそのまま回る
@@ -946,7 +946,10 @@ async function openEditor(page, remaining = 0) {
   $('#edit-apply').textContent = remaining ? `この設定で補正して次へ（残り ${remaining}）` : 'この設定で補正';
   const bitmap = await decode(page.original || page.blob);
   const corners = Array.isArray(page.crop) ? page.crop : page.crop === 'auto' ? (page.corners || FULL_FRAME) : FULL_FRAME;
-  edit = { page, bitmap, rotation: page.rotation || 0, corners: corners.map(c => [...c]), drag: -1, auto: page.crop === 'auto', touched: false };
+  const curves = Array.isArray(page.crop) && hasCurves(page.curves) ? [...page.curves] : null;
+  edit = { page, bitmap, rotation: page.rotation || 0, corners: corners.map(c => [...c]), drag: -1, auto: page.crop === 'auto', touched: false, curves };
+  $('#opt-dewarp').checked = page.dewarp !== false;
+  syncBend();
   $('#opt-deskew').checked = !!page.deskew;
   $('#opt-fingers').checked = !!page.fingers;
   $('#opt-denoise').checked = page.denoise !== false;
@@ -971,12 +974,14 @@ const sideMid = (q, i) => [(q[i][0] + q[(i + 1) % 4][0]) / 2, (q[i][1] + q[(i + 
 function drawEditor() {
   const c = editCanvas.getContext('2d'), W = editCanvas.width, H = editCanvas.height;
   const q = edit.corners.map(([x, y]) => [x * W, y * H]);
+  // 輪郭（辺を曲げているときは曲線）
+  const ring = (edit.curves ? bendOutline(edit.corners, edit.curves) : edit.corners).map(([x, y]) => [x * W, y * H]);
   c.drawImage(edit.base, 0, 0);
   c.save();
   c.beginPath(); c.rect(0, 0, W, H);
-  c.moveTo(...q[0]); q.slice(1).forEach(p => c.lineTo(...p)); c.closePath();
+  c.moveTo(...ring[0]); ring.slice(1).forEach(p => c.lineTo(...p)); c.closePath();
   c.fillStyle = 'rgba(10,20,16,.55)'; c.fill('evenodd');
-  c.beginPath(); c.moveTo(...q[0]); q.slice(1).forEach(p => c.lineTo(...p)); c.closePath();
+  c.beginPath(); c.moveTo(...ring[0]); ring.slice(1).forEach(p => c.lineTo(...p)); c.closePath();
   c.lineWidth = Math.max(2, W / 250); c.strokeStyle = '#b8ed71'; c.stroke();
   const r = Math.max(10, Math.min(W, H) / 28);
   q.forEach(([x, y], i) => {
@@ -984,13 +989,13 @@ function drawEditor() {
     c.fillStyle = i === edit.drag ? '#b8ed71' : 'rgba(184,237,113,.35)'; c.fill();
     c.lineWidth = Math.max(2, W / 300); c.strokeStyle = '#fff'; c.stroke();
   });
-  for (let i = 0; i < 4; i++) {
-    const [x, y] = sideMid(q, i);
-    c.beginPath(); c.arc(x, y, r * 0.62, 0, Math.PI * 2);
-    c.fillStyle = edit.drag === 4 + i ? '#b8ed71' : 'rgba(255,255,255,.75)'; c.fill();
-    c.lineWidth = Math.max(2, W / 300); c.strokeStyle = '#b8ed71'; c.stroke();
-  }
-  if (edit.drag >= 0) drawLoupe(c, W, H, edit.drag < 4 ? q[edit.drag] : sideMid(q, edit.drag - 4), q);
+  const sides = sideHandles().map(([x, y]) => [x * W, y * H]);
+  sides.forEach(([x, y], i) => {
+    c.beginPath(); c.arc(x, y, r * (edit.curves ? 0.5 : 0.62), 0, Math.PI * 2);
+    c.fillStyle = edit.drag === 4 + i ? '#b8ed71' : edit.curves ? 'rgba(255,214,90,.9)' : 'rgba(255,255,255,.75)'; c.fill();
+    c.lineWidth = Math.max(2, W / 300); c.strokeStyle = edit.curves ? '#fff' : '#b8ed71'; c.stroke();
+  });
+  if (edit.drag >= 0) drawLoupe(c, W, H, edit.drag < 4 ? q[edit.drag] : sides[edit.drag - 4], ring);
   c.restore();
 }
 
@@ -1017,6 +1022,28 @@ function drawLoupe(c, W, H, [px, py], q) {
   c.restore();
 }
 
+// 辺の丸: ふだんは辺の中央に1つ（辺ごと平行に動かす）。「辺を曲げる」のときは辺ごとに3つ（辺を曲げる）
+function sideHandles() {
+  if (edit.curves) return Array.from({ length: 12 }, (_, k) => bendHandle(edit.corners, edit.curves, k));
+  return [0, 1, 2, 3].map(i => sideMid(edit.corners, i));
+}
+function syncBend() {
+  const on = !!edit.curves;
+  $('#edit-bend').setAttribute('aria-pressed', String(on));
+  $('#edit-bend').textContent = on ? '✓ 辺を曲げる' : '辺を曲げる';
+  $('#edit-note').textContent = on
+    ? '黄色の丸を内側・外側へドラッグして、曲がった紙の端（本の上下の端の弓なりなど）に辺を合わせると、その曲がりを平らに直します。'
+    : '四隅の丸（辺は中央の丸）をドラッグして紙の角に合わせると、斜めから撮った紙も長方形に直します。紙の端が曲がっているときは「辺を曲げる」で辺を曲げられます。';
+}
+$('#edit-bend').onclick = () => {
+  if (edit.curves) edit.curves = null;
+  // 自動の範囲のまま曲げ始めたときは、今の四隅を手で決めた範囲として使う
+  else edit.curves = new Array(12).fill(0);
+  edit.auto = false; edit.touched = true;
+  syncBend();
+  drawEditor();
+};
+
 function canvasPoint(e) {
   const rect = editCanvas.getBoundingClientRect();
   return [Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)), Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height))];
@@ -1024,7 +1051,7 @@ function canvasPoint(e) {
 editCanvas.addEventListener('pointerdown', e => {
   if (!edit) return;
   const [x, y] = canvasPoint(e), rect = editCanvas.getBoundingClientRect();
-  const handles = [...edit.corners, ...[0, 1, 2, 3].map(i => sideMid(edit.corners, i))];
+  const handles = [...edit.corners, ...sideHandles()];
   let best = -1, bestD = Infinity;
   handles.forEach(([cx, cy], i) => {
     // 四隅を優先する（辺の中央の丸は少し近くないと選ばない）
@@ -1042,7 +1069,13 @@ editCanvas.addEventListener('pointermove', e => {
   if (!edit || edit.drag < 0) return;
   const p = canvasPoint(e);
   if (edit.drag < 4) edit.corners[edit.drag] = p;
-  else {
+  else if (edit.curves) {
+    // 歪み補正: 辺の上の丸を動かして辺を曲げる（辺と直角の向きだけ動く）
+    // 中央の丸は辺全体を弓なりに曲げる（両隣の丸も 3/4 だけ一緒に動く）。両隣の丸はその場所だけ動かす
+    const k = edit.drag - 4, delta = bendFromPoint(edit.corners, k, p) - edit.curves[k];
+    edit.curves[k] += delta;
+    if (k % 3 === 1) { edit.curves[k - 1] += delta * 0.75; edit.curves[k + 1] += delta * 0.75; }
+  } else {
     // 辺を動かす: 両端の角を同じだけ動かす（写真の外へは出さない）
     const i = edit.drag - 4, j = (i + 1) % 4, f = edit.from;
     let dx = p[0] - edit.start[0], dy = p[1] - edit.start[1];
@@ -1066,23 +1099,25 @@ $('#edit-rotate').onclick = () => {
   edit.rotation = (edit.rotation + 270) % 360;
   edit.base = drawRotated(edit.bitmap, edit.rotation, 1200);
   edit.corners = autoCorners().map(c => [...c]);
-  edit.auto = true; edit.touched = false;
+  edit.auto = true; edit.touched = false; edit.curves = null; syncBend();
   renderEditBase();
 };
-$('#edit-auto').onclick = () => { edit.corners = autoCorners().map(c => [...c]); edit.auto = true; edit.touched = false; drawEditor(); };
-$('#edit-full').onclick = () => { edit.corners = FULL_FRAME.map(c => [...c]); edit.auto = false; edit.touched = true; drawEditor(); };
+$('#edit-auto').onclick = () => { edit.corners = autoCorners().map(c => [...c]); edit.auto = true; edit.touched = false; edit.curves = null; syncBend(); drawEditor(); };
+$('#edit-full').onclick = () => { edit.corners = FULL_FRAME.map(c => [...c]); edit.auto = false; edit.touched = true; edit.curves = null; syncBend(); drawEditor(); };
 $('#edit-apply').onclick = async () => {
-  const { page, rotation, corners, bitmap } = edit, auto = edit.auto && !edit.touched;
+  const { page, rotation, corners, bitmap } = edit, auto = edit.auto && !edit.touched, curves = hasCurves(edit.curves) ? edit.curves.map(v => Math.round(v * 1e4) / 1e4) : null;
   const change = {
     rotation, half: $('#opt-half').value || null,
     deskew: $('#opt-deskew').checked, fingers: $('#opt-fingers').checked, denoise: $('#opt-denoise').checked,
     evenColor: $('#opt-even').checked, moire: $('#opt-moire').checked, filter: $('#opt-filter').value,
+    dewarp: $('#opt-dewarp').checked,
   };
   $('#edit-dialog').close();
   bitmap.close?.();
   edit = null;
   const full = corners.every((c, i) => Math.abs(c[0] - FULL_FRAME[i][0]) < 0.002 && Math.abs(c[1] - FULL_FRAME[i][1]) < 0.002);
-  change.crop = auto ? 'auto' : full ? 'none' : corners;
+  change.crop = auto ? 'auto' : full && !curves ? 'none' : corners;
+  change.curves = Array.isArray(change.crop) ? curves : null;
   // 補正は裏で進め、選んだページが残っていればすぐ次のページを開く
   editJobs.push(reprocess(page, change, { quiet: true }).catch(e => console.error(e)));
   await openNextEdit();
@@ -1129,7 +1164,7 @@ $('#batch-apply').onclick = async () => {
   const tri = id => ({ '': undefined, '1': true, '0': false })[$(id).value];
   const change = {};
   if ($('#batch-filter').value) change.filter = $('#batch-filter').value;
-  for (const [id, key] of [['#batch-even', 'evenColor'], ['#batch-deskew', 'deskew'], ['#batch-denoise', 'denoise'], ['#batch-fingers', 'fingers'], ['#batch-moire', 'moire']]) {
+  for (const [id, key] of [['#batch-even', 'evenColor'], ['#batch-dewarp', 'dewarp'], ['#batch-deskew', 'deskew'], ['#batch-denoise', 'denoise'], ['#batch-fingers', 'fingers'], ['#batch-moire', 'moire']]) {
     const v = tri(id); if (v !== undefined) change[key] = v;
   }
   const crop = tri('#batch-crop');

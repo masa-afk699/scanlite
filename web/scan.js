@@ -325,7 +325,55 @@ export function trueAspect(q, W, H) {
   return Number.isFinite(r) && r > 0 ? r : null;
 }
 
-export function warp(canvas, corners, maxSide = MAX_SIDE, photo = true) {
+// ---------- 歪み補正（曲がった辺に合わせて平らにする） ----------
+// curves: 12個の数 [上3, 右3, 下3, 左3]。四隅で決まる長方形（台形補正したあと）の上で、各辺の 1/4・1/2・3/4 の
+// 位置を、辺から内側へどれだけずらすか（長方形の幅・高さに対する割合。外側へは負）。
+// 辺は四隅とこの3点を通るなめらかな曲線になり、内側は上下・左右の辺の曲がりをなめらかにつないで平らにする
+// （本のページの上下の端が弓なりに曲がっているときなど、四隅だけでは直らない歪みを直す）
+export const BEND_T = [0.25, 0.5, 0.75];
+export const hasCurves = c => Array.isArray(c) && c.length === 12 && c.some(v => Math.abs(v) > 1e-4);
+function bendAt(c, side, s) {
+  const v = [0, c[side * 3], c[side * 3 + 1], c[side * 3 + 2], 0];
+  const f = Math.min(3.9999, Math.max(0, s * 4)), i = f | 0, t = f - i;
+  const p0 = v[Math.max(0, i - 1)], p1 = v[i], p2 = v[i + 1], p3 = v[Math.min(4, i + 2)];
+  return 0.5 * (2 * p1 + (p2 - p0) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (3 * p1 - p0 - 3 * p2 + p3) * t * t * t);
+}
+// 出来上がりの位置 (s, t)（0〜1）→ 長方形の上の位置 (u, v)
+function bendMap(c, s, t) {
+  return [s + (1 - s) * bendAt(c, 3, t) - s * bendAt(c, 1, t), t + (1 - t) * bendAt(c, 0, s) - t * bendAt(c, 2, s)];
+}
+const homography = q => { const m = squareToQuad(q); return ([u, v]) => { const z = m.g * u + m.h * v + 1; return [(m.a * u + m.b * v + m.c) / z, (m.d * u + m.e * v + m.f) / z]; }; };
+// 写真の上の点 → 長方形の上の位置 (u, v)（squareToQuad の逆）
+function unHomography(q) {
+  const m = squareToQuad(q), A = [[m.a, m.b, m.c], [m.d, m.e, m.f], [m.g, m.h, 1]];
+  const C = (r, c) => { const r1 = (r + 1) % 3, r2 = (r + 2) % 3, c1 = (c + 1) % 3, c2 = (c + 2) % 3; return A[r1][c1] * A[r2][c2] - A[r1][c2] * A[r2][c1]; };
+  const inv = [[C(0, 0), C(1, 0), C(2, 0)], [C(0, 1), C(1, 1), C(2, 1)], [C(0, 2), C(1, 2), C(2, 2)]];
+  return ([x, y]) => { const z = inv[2][0] * x + inv[2][1] * y + inv[2][2]; return [(inv[0][0] * x + inv[0][1] * y + inv[0][2]) / z, (inv[1][0] * x + inv[1][1] * y + inv[1][2]) / z]; };
+}
+// 調整画面用: 曲げた辺の輪郭（割合の座標の点の並び。上→右→下→左）
+export function bendOutline(corners, c, n = 32) {
+  const H = homography(corners), out = [];
+  const z = c || new Array(12).fill(0);
+  for (let i = 0; i < n; i++) out.push(H(bendMap(z, i / n, 0)));
+  for (let i = 0; i < n; i++) out.push(H(bendMap(z, 1, i / n)));
+  for (let i = 0; i < n; i++) out.push(H(bendMap(z, 1 - i / n, 1)));
+  for (let i = 0; i < n; i++) out.push(H(bendMap(z, 0, 1 - i / n)));
+  return out;
+}
+// 調整画面用: 辺の上の曲げる丸の位置（k = 辺×3 + 何番目か）
+export function bendHandle(corners, c, k) {
+  const side = Math.floor(k / 3), s = BEND_T[k % 3], z = c || new Array(12).fill(0);
+  const st = [[s, 0], [1, s], [s, 1], [0, s]][side];
+  return homography(corners)(bendMap(z, st[0], st[1]));
+}
+// 調整画面用: 丸を写真の上の点 p へ動かしたときの、その位置の内側へのずれ（辺と直角の向きの分だけ使う）
+export function bendFromPoint(corners, k, p) {
+  const [u, v] = unHomography(corners)(p), side = Math.floor(k / 3);
+  const d = [v, 1 - u, 1 - v, u][side];
+  return Math.max(-0.3, Math.min(0.3, d));
+}
+
+export function warp(canvas, corners, maxSide = MAX_SIDE, photo = true, curves = null) {
   const W = canvas.width, H = canvas.height;
   const q = corners.map(([x, y]) => [x * W, y * H]);
   const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
@@ -337,15 +385,33 @@ export function warp(canvas, corners, maxSide = MAX_SIDE, photo = true) {
     const area = ow * oh;
     ow = Math.sqrt(area * r); oh = Math.sqrt(area / r);
   }
+  const bent = hasCurves(curves);
+  if (bent) {
+    // 曲がった辺は、まっすぐな辺より長い。上下の辺の長さで幅を、左右の辺の長さで高さを決める
+    const arc = (side, sx) => { let a = 0, prev = null; for (let i = 0; i <= 40; i++) { const t = i / 40, d = bendAt(curves, side, t), p = sx ? [t * ow, d * oh] : [d * ow, t * oh]; if (prev) a += Math.hypot(p[0] - prev[0], p[1] - prev[1]); prev = p; } return a; };
+    const fw = (arc(0, true) + arc(2, true)) / 2 / ow, fh = (arc(1, false) + arc(3, false)) / 2 / oh;
+    // 内側へ曲げた分だけ狭くなる（平均の幅・高さ）
+    let wIn = 0, hIn = 0; for (let i = 0; i <= 20; i++) { const t = i / 20; wIn += 1 - bendAt(curves, 3, t) - bendAt(curves, 1, t); hIn += 1 - bendAt(curves, 0, t) - bendAt(curves, 2, t); }
+    ow *= fw * wIn / 21; oh *= fh * hIn / 21;
+  }
   const k = Math.min(1, maxSide / Math.max(ow, oh));
   ow = Math.max(8, Math.round(ow * k)); oh = Math.max(8, Math.round(oh * k));
   const src = ctx2d(canvas).getImageData(0, 0, W, H).data;
   const out = makeCanvas(ow, oh), octx = ctx2d(out), dst = octx.createImageData(ow, oh), o = dst.data;
   const m = squareToQuad(q);
+  // 曲げた辺: 列ごとの上下の辺のずれ・行ごとの左右の辺のずれを先に求めておく
+  let top, bot, lef, rig;
+  if (bent) {
+    top = new Float32Array(ow); bot = new Float32Array(ow); lef = new Float32Array(oh); rig = new Float32Array(oh);
+    for (let x = 0; x < ow; x++) { const s = (x + 0.5) / ow; top[x] = bendAt(curves, 0, s); bot[x] = bendAt(curves, 2, s); }
+    for (let y = 0; y < oh; y++) { const t = (y + 0.5) / oh; lef[y] = bendAt(curves, 3, t); rig[y] = bendAt(curves, 1, t); }
+  }
   for (let y = 0; y < oh; y++) {
-    const v = (y + 0.5) / oh;
+    const t = (y + 0.5) / oh;
     for (let x = 0; x < ow; x++) {
-      const u = (x + 0.5) / ow, z = m.g * u + m.h * v + 1;
+      const s = (x + 0.5) / ow;
+      const u = bent ? s + (1 - s) * lef[y] - s * rig[y] : s, v = bent ? t + (1 - t) * top[x] - t * bot[x] : t;
+      const z = m.g * u + m.h * v + 1;
       let sx = (m.a * u + m.b * v + m.c) / z - 0.5, sy = (m.d * u + m.e * v + m.f) / z - 0.5;
       sx = Math.min(W - 1.001, Math.max(0, sx)); sy = Math.min(H - 1.001, Math.max(0, sy));
       const x0 = sx | 0, y0 = sy | 0, fx = sx - x0, fy = sy - y0;
@@ -2363,17 +2429,22 @@ async function pageGeometry(original, opts) {
         }
       }
     }
-  } else if (Array.isArray(opts.crop)) corners = opts.crop;
+  } else if (Array.isArray(opts.crop)) {
+    corners = opts.crop;
+    // 手で範囲を決めたページも、文字の行がわかっていれば行の曲がり（本の反り）を直す（辺を曲げたときは除く。
+    // 曲げた辺に合わせて平らにしたあとは、行の位置が写真の上の位置と合わなくなるので）
+    if (opts.dewarp !== false && opts.subject !== 'screen' && opts.lines && opts.lines.length >= 4 && !hasCurves(opts.curves)) fromLines = true;
+  }
   const before = { w: canvas.width, h: canvas.height };
   if (corners) {
-    canvas = warp(canvas, corners, maxSide); await tick();
+    canvas = warp(canvas, corners, maxSide, true, Array.isArray(opts.crop) ? opts.curves : null); await tick();
     // 紙の端が曲がっていて、切り出した四角形の内側に机などが入りこんだ所を白にする
     if (found) whitenOutside(canvas, corners, before, found.outline);
   }
   // 紙の反りで曲がった行をまっすぐにする（行の位置がわかっているとき）
   // 見開きの左右の境目は、文字の行のすき間から求める（のどの影がはっきりしない・中央からずれているときも正しく分ける）
   const gutter = opts.half && !perPage && corners && opts.lines ? linesGutter(canvas, corners, before, opts.lines) : null;
-  if (corners && fromLines) { canvas = straightenLines(canvas, corners, before, opts.lines, gutter, exact); await tick(); }
+  if (corners && fromLines && opts.dewarp !== false) { canvas = straightenLines(canvas, corners, before, opts.lines, gutter, exact); await tick(); }
   const split = (opts.half === 'left' || opts.half === 'right') && !perPage;
   return { canvas, gutter, split, state: { corners, perPage, fromLines, edgeFound, extended, exact, size: before } };
 }
@@ -2384,7 +2455,7 @@ async function finishPage(canvas, opts, state) {
   let leveled = false, sheared = null;
   // 行の波打ち・傾きを画像から測って仕上げる（横書きの紙のみ。2回かけて残りを詰める。
   // 紙の端から正確に切り出して反りも直したページは、残りが小さいので1回）
-  if (opts.subject !== 'screen' && opts.crop === 'auto' && opts.lines && linesVertical(opts.lines) === false) {
+  if (opts.subject !== 'screen' && (opts.crop === 'auto' || Array.isArray(opts.crop)) && opts.dewarp !== false && opts.lines && linesVertical(opts.lines) === false) {
     for (let i = 0; i < (state.exact ? 1 : 2); i++) { const c2 = levelRows(canvas); if (c2 === canvas) break; canvas = c2; leveled = true; await tick(); }
   }
   if (opts.moire) { demoire(canvas); await tick(); }
