@@ -2034,7 +2034,20 @@ export function clearEdges(canvas, protect = null) {
         if (dp < mn) mn = dp; if (dp > mx) mx = dp;
         if (mx > deep) break;
       }
-      if (mn > near || mx > deep) continue;
+      if (mx > deep) continue;
+      if (mn > near) {
+        // 正確に切り出したページで、端から3%以内に端と平行に並ぶ細い切れ端（紙の端の影・机の線の残り）は消す。
+        // 文字の行（ページ番号も）にかかるものは残す
+        if (!keep || mx > 0.03 || c.px.some(p => keep[p])) continue;
+        let x0 = w, x1 = 0, y0 = h, y1 = 0;
+        for (const p of c.px) { const x = p % w, y = (p - x) / w; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+        const horiz = Math.min(y0, h - 1 - y1) / h < Math.min(x0, w - 1 - x1) / w;
+        const thick = horiz ? y1 - y0 + 1 : x1 - x0 + 1, long = horiz ? x1 - x0 + 1 : y1 - y0 + 1;
+        if (thick > 4 || long < thick * 3) continue;
+        for (const p of c.px) kill[p] = 1;
+        any = true;
+        continue;
+      }
       // 正確に切り出したページでは、小さなかたまり（ページ番号など）も残す
       // （ただし、端から2%以内におさまる切れ端は、紙の外の机や影の残り。ページ番号はもっと内側にある）
       if (keep && ((c.px.length < w * h * 0.001 && mx > 0.02) || c.px.some(p => keep[p]))) continue;
@@ -2337,11 +2350,15 @@ export async function orientCandidates(blob, split) {
   const bitmap = await decode(blob);
   let canvas = drawRotated(bitmap, 0, 1400);
   bitmap.close?.();
+  const portrait = canvas.height > canvas.width * 1.05;
   const corners = detectPage(canvas, 'paper');
   if (corners) canvas = warp(canvas, corners);
   const w = canvas.width, h = canvas.height;
-  // 見開きは横長、1ページは縦長のはず。そうでなければ横倒しに写っている
-  return { need: split ? h > w * 1.05 : w > h * 1.15 };
+  // 見開きは横長、1ページは縦長のはず。そうでなければ横倒しに写っている。
+  // 見開きを縦長の写真に撮ったときは、見つけた紙の形によらず文字で向きを確かめる（2ページが上下に並ぶとき、
+  // 紙の検出が片方のページだけを拾うと横長に見えて「回さなくてよい」と誤り、左右に分けられなくなるので）
+  const sideways = split ? h > w * 1.05 : w > h * 1.15;
+  return { need: sideways || (split && portrait), sideways };
 }
 
 // 画像の上の方だけを切り出す（題名の読み取り用。小さい画像の方がOCRが速い）

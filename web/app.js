@@ -108,11 +108,14 @@ function decideRotation(p, blob = p.original) {
           return turns[best];
         }
       }
-      // 文字で決めきれないときは、撮影時のスマホの傾き（横持ちの向き）で決める
-      const turn = tiltTurn(p) ?? 0;
+      // 文字で決めきれないときは、撮影時のスマホの傾き（横持ちの向き）で決める。
+      // 見開きの紙が縦長に写っている（2ページが上下に並んでいる）なら、少なくとも90度は回す（回さないと左右に
+      // 分けられず、2ページとも見開き全体になってしまう）。左右どちらに回すかは、読み比べで少しでも確かな方
+      let turn = tiltTurn(p);
+      if (turn == null) turn = split && g.sideways ? (r && r.scores ? (r.scores[1] >= r.scores[2] ? 90 : 270) : (lastTurn || 90)) : 0;
       if (r && r.rotation === turn) rememberLines(p, turn, Promise.resolve(r.lines));
       return turn;
-    })().catch(e => { console.error(e); return 0; }));
+    })().catch(e => { console.error(e); return p.half ? (tiltTurn(p) ?? 0) : 0; }));
     if (rotationCache.size > 50) rotationCache.delete(rotationCache.keys().next().value);
   }
   return rotationCache.get(key);
