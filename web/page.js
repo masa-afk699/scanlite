@@ -335,6 +335,11 @@ export function findPage(canvas, lines, { side: half = null, debug = null } = {}
   let target, leftN = null, rightN = null;
   if (half) {
     let li, ri;
+    // 選んだページが写真の中央（見開きの のど を合わせる所）を大きくまたぐときは、2ページが1つにまとまっている
+    // （のどが見つからず、写真の端の切れ端だけが別のページになったとき）。中央に近いすき間で左右に分け直す
+    const straddles = g => { const b = boxOf(g.lines); return b.u0 < cu - w * 0.12 && b.u1 > cu + w * 0.12; };
+    const pairOf = () => { let best = -1, at2 = -1; for (let i = 0; i + 1 < pages.length; i++) { const s2 = pScore(pages[i]) + pScore(pages[i + 1]); if (s2 > best) { best = s2; at2 = i; } } return at2; };
+    if (pages.length >= 2) { const i0 = pairOf(); if (straddles(pages[i0]) || straddles(pages[i0 + 1])) pages.length = 1; }
     if (pages.length >= 2) {
       let best = -1;
       for (let i = 0; i + 1 < pages.length; i++) { const s = pScore(pages[i]) + pScore(pages[i + 1]); if (s > best) { best = s; li = i; } }
@@ -344,10 +349,14 @@ export function findPage(canvas, lines, { side: half = null, debug = null } = {}
       leftN = half === 'left' ? pages[li - 1] : pages[li];
       rightN = half === 'left' ? pages[ri] : pages[ri + 1];
     } else {
-      // のどが見つからないときは、いちばん広いすき間で左右に分ける
+      // のどが見つからないときは、いちばん広いすき間で左右に分ける（写真の中央から遠いすき間は不利にする。
+      // 見開きは のど を中央に合わせて撮るので、端の切れ端との間のすき間で分けてしまわないように）
       if (groups.length < 2) return null;
       let cut = 1, best = -1;
-      for (let i = 1; i < groups.length; i++) { const g = groups[i].u0 - groups[i - 1].u1; if (g > best) { best = g; cut = i; } }
+      for (let i = 1; i < groups.length; i++) {
+        const g = (groups[i].u0 - groups[i - 1].u1) * Math.max(0.15, 1 - Math.abs((groups[i].u0 + groups[i - 1].u1) / 2 - cu) / (w * 0.35));
+        if (g > best) { best = g; cut = i; }
+      }
       const lg = groups.slice(0, cut).flatMap(g => g.lines), rg = groups.slice(cut).flatMap(g => g.lines);
       target = half === 'left' ? lg : rg;
       if (half === 'left') rightN = { lines: rg }; else leftN = { lines: lg };

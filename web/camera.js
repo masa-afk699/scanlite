@@ -40,6 +40,7 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
     } catch {}
     video.srcObject = stream;
     await video.play().catch(() => {});
+    setupStill();
     setupTorch();
     prev = null; stillSince = 0; needMotion = false; sharpMax = 0;
     const aim = split() ? '本の綴じ目（のど）を点線に合わせて、' : 'ページを枠に入れて、';
@@ -208,6 +209,70 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
     }
   }
 
+  // 高画質の静止画（ImageCapture.takePhoto）。映像のフレームは多くのスマホで 1920×1080 ほどに抑えられ、
+  // 動画向けの圧縮・ノイズ消しもかかって文字がぼやけるので、カメラ本来の解像度の静止画が撮れる端末ではそちらを使う
+  let still = null;
+  async function setupStill() {
+    still = null;
+    try {
+      if (typeof ImageCapture === 'undefined') return;
+      const track = stream?.getVideoTracks()[0];
+      if (!track) return;
+      const ic = new ImageCapture(track), pc = await ic.getPhotoCapabilities();
+      const big = Math.max(pc.imageWidth?.max || 0, pc.imageHeight?.max || 0), now = Math.max(video.videoWidth, video.videoHeight);
+      // 映像より2割以上大きく撮れるときだけ（同じくらいなら速いフレームの方がよい）
+      if (!big || big < now * 1.2) return;
+      const settings = {};
+      if (pc.imageWidth?.max) { settings.imageWidth = pc.imageWidth.max; settings.imageHeight = pc.imageHeight.max; }
+      if (pc.fillLightMode?.includes('off')) settings.fillLightMode = 'off';
+      still = { ic, settings };
+    } catch { still = null; }
+  }
+  const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+  // 映像の向き（縦長か横長か）と同じ向きの JPEG にする。向きが違うときは、映像の小さな画像と見比べて回す向きを決める
+  async function stillShot() {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    // 比べるための今の映像（静止画を撮る前に取っておく）
+    const ref = document.createElement('canvas'); ref.width = 48; ref.height = 48;
+    ref.getContext('2d', { willReadFrequently: true }).drawImage(video, 0, 0, 48, 48);
+    let photo;
+    try { photo = await withTimeout(still.ic.takePhoto(still.settings), 3000); }
+    catch { photo = await withTimeout(still.ic.takePhoto(), 3000); }
+    let bm;
+    try { bm = await createImageBitmap(photo, { imageOrientation: 'from-image' }); } catch { bm = await createImageBitmap(photo); }
+    const pw = bm.width, ph = bm.height;
+    let turn = 0;
+    if ((pw > ph) !== (vw > vh) && Math.abs(pw - ph) > Math.min(pw, ph) * 0.05) {
+      const diff = deg => {
+        const c = document.createElement('canvas'); c.width = 48; c.height = 48;
+        const x = c.getContext('2d', { willReadFrequently: true });
+        x.translate(24, 24); x.rotate(deg * Math.PI / 180); x.drawImage(bm, -24, -24, 48, 48);
+        const a = x.getImageData(0, 0, 48, 48).data, b = ref.getContext('2d').getImageData(0, 0, 48, 48).data;
+        let d = 0; for (let i = 0; i < a.length; i += 4) d += Math.abs(a[i + 1] - b[i + 1]);
+        return d;
+      };
+      turn = diff(90) <= diff(270) ? 90 : 270;
+    }
+    // 長辺4000pxまで（保存するときにさらに3200pxに抑える）
+    const k = Math.min(1, 4000 / Math.max(pw, ph)), w = Math.round(pw * k), h = Math.round(ph * k);
+    const c = document.createElement('canvas');
+    c.width = turn ? h : w; c.height = turn ? w : h;
+    const x = c.getContext('2d');
+    x.imageSmoothingQuality = 'high';
+    x.translate(c.width / 2, c.height / 2); x.rotate(turn * Math.PI / 180); x.drawImage(bm, -w / 2, -h / 2, w, h);
+    bm.close?.();
+    return await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92));
+  }
+
+  // 静止画が撮れない端末・ライトを点けているとき（静止画を撮るとライトが消える端末がある）は、映像のいまのフレームを使う
+  async function capture() {
+    if (still && !torchOn) {
+      try { const b = await stillShot(); if (b) return b; }
+      catch (e) { console.warn('still capture failed, using video frame', e); still = null; }
+    }
+    return grab();
+  }
+
   // 映像のいまのフレームをそのまま使う（静止画撮影に切り替えるより速く、シャッターがすぐ切れる）
   async function grab() {
     const w = video.videoWidth, h = video.videoHeight;
@@ -234,7 +299,7 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
       // 音は鳴らさず、振動で撮影を知らせる（映像のフレームを使うのでシャッター音も出ない）
       navigator.vibrate?.([60, 40, 60]);
       dialog.classList.remove('flash'); void dialog.offsetWidth; dialog.classList.add('flash');
-      const blob = await grab();
+      const blob = await capture();
       if (!blob) { shots--; counter.textContent = String(shots); return; }
       // 左下に今撮った写真を小さく出す
       if (thumb) { if (thumb.src) URL.revokeObjectURL(thumb.src); thumb.src = URL.createObjectURL(blob); thumb.hidden = false; }
