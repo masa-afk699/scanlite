@@ -500,35 +500,47 @@ function showSelection() {
   $('#sel-rotate').disabled = !usable.length;
   $('#sel-settings').disabled = !usable.length;
   $('#sel-copy').disabled = !usable.length;
-  const allReady = usable.length === list.length && list.length > 0;
+  // 補正中のページも並べ替えられる（補正が終わっても、並べ替えた順番は保たれる）
   const first = pages.findIndex(p => selected.has(p.id)), last = pages.length - 1 - [...pages].reverse().findIndex(p => selected.has(p.id));
-  $('#sel-up').disabled = !allReady || first <= 0 || list.length === pages.length;
-  $('#sel-down').disabled = !allReady || last >= pages.length - 1 || list.length === pages.length;
+  $('#sel-up').disabled = !list.length || first <= 0 || list.length === pages.length;
+  $('#sel-down').disabled = !list.length || last >= pages.length - 1 || list.length === pages.length;
   $('#sel-delete').disabled = !list.length;
 }
 
-// 長押しの判定（指を少し動かしたらスクロールとみなしてやめる）
+// 長押しの判定（指を少し動かしたらスクロールとみなしてやめる）。
+// 長押しのあと指を離さずに動かすと、選んだページをつかんで並べ替えられる
 {
   const root = $('#pages');
-  let timer = null, start = null, fired = false;
+  let timer = null, start = null, fired = false, armed = null, drag = null;
   const cancel = () => { clearTimeout(timer); timer = null; };
   root.addEventListener('pointerdown', e => {
     const card = e.target.closest('.page-card');
     if (!card || (e.pointerType === 'mouse' && e.button !== 0)) return;
     fired = false;
+    armed = null;
     start = [e.clientX, e.clientY];
     cancel();
     timer = setTimeout(() => {
       timer = null;
       fired = true;
       const id = Number(card.dataset.id);
-      if (selectMode) toggleSelect(id); else startSelect(id);
+      // 選択中に長押ししたページは、選んだままにする（外すのはタップで）。つかんで動かせるように
+      if (!selectMode) startSelect(id);
+      else if (!selected.has(id)) { selected.add(id); navigator.vibrate?.(25); paintSelection(); }
+      armed = { card, id, pointerId: e.pointerId };
     }, 450);
   });
-  root.addEventListener('pointermove', e => { if (timer && start && Math.hypot(e.clientX - start[0], e.clientY - start[1]) > 10) cancel(); });
-  root.addEventListener('pointerup', cancel);
-  root.addEventListener('pointercancel', cancel);
+  root.addEventListener('pointermove', e => {
+    if (timer && start && Math.hypot(e.clientX - start[0], e.clientY - start[1]) > 10) cancel();
+    if (armed && !drag && e.pointerId === armed.pointerId && Math.hypot(e.clientX - start[0], e.clientY - start[1]) > 8) beginDrag(e);
+  });
+  // 指の動きは画面全体で追う（つかんだページが指の下から外れても続ける）
+  window.addEventListener('pointermove', e => { if (drag && e.pointerId === drag.pointerId) moveDrag(e.clientX, e.clientY); });
+  window.addEventListener('pointerup', e => { cancel(); if (drag && e.pointerId === drag.pointerId) endDrag(true); armed = null; });
+  window.addEventListener('pointercancel', e => { cancel(); if (drag && e.pointerId === drag.pointerId) endDrag(false); armed = null; });
   root.addEventListener('scroll', cancel, { passive: true });
+  // つかんでいる間は画面をスクロールさせない（長押しが成立したあとの動きだけ止めるので、普段のスクロールはそのまま）
+  document.addEventListener('touchmove', e => { if (armed || drag) e.preventDefault(); }, { passive: false });
   // 長押しで出る「画像を保存」などのメニューを出さない
   root.addEventListener('contextmenu', e => { if (e.target.closest('.page-card')) e.preventDefault(); });
   root.addEventListener('click', e => {
@@ -540,6 +552,84 @@ function showSelection() {
     if (selectMode) { toggleSelect(id); return; }
     if (ready(page)) openViewer(id, e.target.closest('.page-snippet') ? 'text' : 'after');
   });
+
+  function beginDrag(e) {
+    const { card, pointerId } = armed;
+    const r = card.getBoundingClientRect();
+    const ghost = card.cloneNode(true);
+    ghost.classList.add('drag-ghost');
+    Object.assign(ghost.style, { width: r.width + 'px', height: r.height + 'px', left: r.left + 'px', top: r.top + 'px', transformOrigin: `${start[0] - r.left}px ${start[1] - r.top}px` });
+    const count = selected.size;
+    if (count > 1) {
+      const badge = document.createElement('span');
+      badge.className = 'drag-count';
+      badge.textContent = `${count}枚`;
+      ghost.append(badge);
+    }
+    document.body.append(ghost);
+    const marker = document.createElement('div');
+    marker.className = 'drop-marker';
+    document.body.append(marker);
+    root.querySelectorAll('.page-card').forEach(c => c.classList.toggle('dragging', selected.has(Number(c.dataset.id))));
+    document.body.classList.add('drag-active');
+    drag = { pointerId, ghost, marker, dx: start[0] - r.left, dy: start[1] - r.top, x: e.clientX, y: e.clientY, target: null, raf: 0 };
+    navigator.vibrate?.(15);
+    moveDrag(e.clientX, e.clientY);
+    drag.raf = requestAnimationFrame(autoScroll);
+  }
+  // 指の位置から「どのページの前に入れるか」を決め、入る所に縦線を出す
+  function moveDrag(x, y) {
+    drag.x = x; drag.y = y;
+    drag.ghost.style.transform = `translate(${x - start[0]}px, ${y - start[1]}px) scale(.8)`;
+    const cards = [...root.querySelectorAll('.page-card')];
+    if (!cards.length) return;
+    // 指に一番近いページを探し、その左半分なら前、右半分なら後ろに入れる
+    let best = null, bestD = Infinity;
+    for (const c of cards) {
+      const r = c.getBoundingClientRect();
+      const dx = x < r.left ? r.left - x : x > r.right ? x - r.right : 0;
+      const dy = y < r.top ? r.top - y : y > r.bottom ? y - r.bottom : 0;
+      const d = dx * dx + dy * dy * 4;
+      if (d < bestD) { bestD = d; best = { c, r }; }
+    }
+    const after = x > best.r.left + best.r.width / 2;
+
+    drag.target = { id: Number(best.c.dataset.id), after };
+    const m = drag.marker.style, gap = 6;
+    Object.assign(m, { left: (after ? best.r.right + gap - 2 : best.r.left - gap - 2) + 'px', top: best.r.top + 'px', height: best.r.height + 'px' });
+    drag.marker.hidden = false;
+  }
+  // 画面の上下の端までつかんで行くと、その方向へスクロールする
+  function autoScroll() {
+    if (!drag) return;
+    const h = window.innerHeight, edge = 90, barTop = $('#select-bar').hidden ? h : $('#select-bar').getBoundingClientRect().top;
+    let v = 0;
+    if (drag.y < edge) v = -Math.ceil((edge - drag.y) / 6);
+    else if (drag.y > barTop - edge) v = Math.ceil((drag.y - (barTop - edge)) / 6);
+    if (v) { window.scrollBy(0, Math.max(-24, Math.min(24, v))); moveDrag(drag.x, drag.y); }
+    drag.raf = requestAnimationFrame(autoScroll);
+  }
+  async function endDrag(drop) {
+    const d = drag;
+    drag = null;
+    cancelAnimationFrame(d.raf);
+    d.ghost.remove();
+    d.marker.remove();
+    document.body.classList.remove('drag-active');
+    root.querySelectorAll('.page-card.dragging').forEach(c => c.classList.remove('dragging'));
+    if (!drop || !d.target) return;
+    // つかんだページ（選んだページ全部）を、指を離した所へまとめて入れる
+    const moving = pages.filter(p => selected.has(p.id)), rest = pages.filter(p => !selected.has(p.id));
+    let at;
+    if (selected.has(d.target.id)) {
+      // 選んだページの上で離した: 選んだページのうち一番前の位置にまとめる
+      const first = pages.findIndex(p => selected.has(p.id));
+      at = pages.slice(0, first).filter(p => !selected.has(p.id)).length;
+    } else {
+      at = rest.findIndex(p => p.id === d.target.id) + (d.target.after ? 1 : 0);
+    }
+    await applyOrder([...rest.slice(0, at), ...moving, ...rest.slice(at)]);
+  }
 }
 
 $('#select-done').onclick = () => endSelect();
@@ -549,18 +639,33 @@ $('#select-all').onclick = () => {
   paintSelection();
 };
 
-// 選んだページを前後へ動かす（並び順は created で管理する。IDは変えない）
+// ページの並び順は created で管理する（IDは変えない）。今ある created の値を新しい順番に割り当て直す。
+// 同じ値が重なっていると入れ替えても順番が変わらないので、そのときは少しずつずらす
+async function applyOrder(order) {
+  const times = pages.map(p => p.created).sort((a, b) => a - b);
+  for (let i = 1; i < times.length; i++) if (!(times[i] > times[i - 1])) times[i] = times[i - 1] + 0.001;
+  const changed = [];
+  for (let i = 0; i < order.length; i++) {
+    if (order[i].created === times[i]) continue;
+    changed.push({ id: order[i].id, created: times[i] });
+  }
+  // 補正中のページも並べ替えられるよう、保存されている最新の内容に順番だけ書き込む
+  for (const c of changed) {
+    const p = await db.getPage(c.id);
+    if (!p) continue;
+    p.created = c.created;
+    p.moved = true; // 自分で並べ替えたページは、見開きの左右の自動の並びで戻さない
+    await db.putPage(p);
+  }
+  await refresh();
+}
+// 選んだページを前後へ1つずつ動かす
 async function moveSelected(delta) {
-  const order = [...pages], times = order.map(p => p.created);
+  const order = [...pages];
   const idx = order.map((_, i) => i);
   if (delta < 0) idx.forEach(i => { if (i > 0 && selected.has(order[i].id) && !selected.has(order[i - 1].id)) [order[i - 1], order[i]] = [order[i], order[i - 1]]; });
   else idx.reverse().forEach(i => { if (i < order.length - 1 && selected.has(order[i].id) && !selected.has(order[i + 1].id)) [order[i + 1], order[i]] = [order[i], order[i + 1]]; });
-  for (let i = 0; i < order.length; i++) {
-    if (order[i].created === times[i]) continue;
-    order[i].created = times[i];
-    await db.putPage(order[i]);
-  }
-  await refresh();
+  await applyOrder(order);
 }
 $('#sel-up').onclick = () => moveSelected(-1);
 $('#sel-down').onclick = () => moveSelected(1);
@@ -702,7 +807,7 @@ async function processOne(p, ready = preparePage(p), run = () => processImage(p.
   try {
     await ready;
     // 見開きの順番: 横書きの本は左ページから、縦書きの本は右ページから（文字の向きで自動で決める）
-    if (p.half && p.capture != null && p.lines) {
+    if (p.half && p.capture != null && p.lines && !p.moved) {
       const v = linesVertical(p.lines);
       if (v !== null) p.created = p.capture + ((p.half === 'left') === !v ? 0 : 1) / 2000;
     }
@@ -713,7 +818,13 @@ async function processOne(p, ready = preparePage(p), run = () => processImage(p.
   }
   p.waiting = false;
   // 処理中に削除されたページは保存し直さない
-  if (await db.getPage(p.id)) await db.putPage(p);
+  const now = await db.getPage(p.id);
+  if (!now) return scheduleRefresh();
+  // 補正している間に並べ替え・別の文書へ移動されていたら、その順番と行き先を残す
+  // （以前は補正前の内容で上書きしていたため、補正中に並べ替えても元に戻っていた）
+  if (now.moved) { p.created = now.created; p.moved = true; }
+  p.docId = now.docId;
+  await db.putPage(p);
   scheduleRefresh();
 }
 async function processWaiting() {
