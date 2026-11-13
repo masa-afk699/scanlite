@@ -4,6 +4,8 @@
 import { findPage } from './page.js';
 
 export const MAX_SIDE = 2400;
+// 仕上がりのJPEGの画質
+const JPEG_Q = 0.86;
 const tick = () => new Promise(r => setTimeout(r, 0));
 
 // Web Worker の中でも動くよう、document が無ければ OffscreenCanvas を使う
@@ -2302,7 +2304,9 @@ async function finishPage(canvas, opts, state) {
   // 端の掃除（机・隣のページの切れ端・影を消す）。紙の端・のどで正確に切り出したときは、文字の行がかかる
   // かたまり（ページの端に接する見出しの帯など）は残す
   if (opts.crop === 'auto' && opts.subject !== 'screen' && opts.filter !== 'none') clearEdges(canvas, exact ? lineBoxes(opts.lines, corners, size) : null);
-  const blob = await toJpeg(canvas, 0.86);
+  // 利用者が「回転」で回したページは、仕上がったページをそのまま回す（元写真は回さない。見開きの片側でも正しく回る）
+  if (opts.turn) canvas = drawRotated(canvas, opts.turn, Infinity);
+  const blob = await toJpeg(canvas, JPEG_Q);
   // 一覧表示用の小さな画像（大量のページでも一覧が重くならないように）
   const tk = Math.min(1, 420 / Math.max(canvas.width, canvas.height));
   const tc = makeCanvas(Math.max(1, Math.round(canvas.width * tk)), Math.max(1, Math.round(canvas.height * tk))), tx = ctx2d(tc);
@@ -2310,6 +2314,19 @@ async function finishPage(canvas, opts, state) {
   tx.drawImage(canvas, 0, 0, tc.width, tc.height);
   const thumb = await toJpeg(tc, 0.7);
   return { blob, thumb, width: canvas.width, height: canvas.height, corners: corners || FULL_FRAME, skew, perPage };
+}
+
+// 仕上がったページを90度単位で回す（「回転」ボタン。補正をやり直さないのですぐ終わる）
+export async function turnPage(blob, deg) {
+  const bitmap = await decode(blob);
+  const canvas = drawRotated(bitmap, deg, Infinity);
+  bitmap.close?.();
+  const out = await toJpeg(canvas, JPEG_Q);
+  const tk = Math.min(1, 420 / Math.max(canvas.width, canvas.height));
+  const tc = makeCanvas(Math.max(1, Math.round(canvas.width * tk)), Math.max(1, Math.round(canvas.height * tk))), tx = ctx2d(tc);
+  tx.imageSmoothingQuality = 'high';
+  tx.drawImage(canvas, 0, 0, tc.width, tc.height);
+  return { blob: out, thumb: await toJpeg(tc, 0.7), width: canvas.width, height: canvas.height };
 }
 
 // ---------- 向きの自動判定 ----------

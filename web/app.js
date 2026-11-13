@@ -1,5 +1,5 @@
 // ScanLite: すべての処理をブラウザー内で行う。撮影画像・PDF・OCR結果はネットワークに送らない。
-import { processImage as processHere, processSpread as spreadHere, finishHalf as finishHere, decode, drawRotated, detectPage, FULL_FRAME, recompress, limitOriginal as limitHere, cropTop, orientCandidates, linesVertical } from './scan.js';
+import { processImage as processHere, processSpread as spreadHere, finishHalf as finishHere, decode, drawRotated, detectPage, FULL_FRAME, recompress, limitOriginal as limitHere, cropTop, orientCandidates, linesVertical, turnPage } from './scan.js';
 import * as db from './db.js';
 import { buildPdf } from './pdf.js';
 import { recognize, textLines, warmUp } from './ocr.js';
@@ -420,10 +420,20 @@ async function showStorage() {
 }
 
 const optionsOf = p => ({
-  rotation: p.rotation || 0, filter: p.filter || 'none', crop: p.crop || 'none', half: p.half || null, perPage: !!p.perPage,
+  rotation: p.rotation || 0, turn: p.turn || 0, filter: p.filter || 'none', crop: p.crop || 'none', half: p.half || null, perPage: !!p.perPage,
   deskew: !!p.deskew, fingers: !!p.fingers, denoise: p.denoise !== false, evenColor: p.evenColor !== false,
   moire: !!p.moire, subject: p.mode === 'screen' ? 'screen' : 'paper', lines: p.lines || null,
 });
+
+// 仕上がったページを右に90度回す。元写真は回さないので、見開きの片側のページもそのまま回る
+// （以前は元写真を回して切り出し直していたため、見開きのページが回らず別の所が切り出されていた）
+async function turnBy(page, deg) {
+  Object.assign(page, await turnPage(page.blob, deg));
+  page.turn = ((page.turn || 0) + deg) % 360;
+  page.rev = (page.rev || 0) + 1;
+  delete page.ocr; // 画像が変わったのでOCR結果は作り直す
+  await db.putPage(page);
+}
 
 async function reprocess(page, change, { quiet = false } = {}) {
   if (!page.original) page.original = page.blob;
@@ -617,7 +627,7 @@ async function openNextEdit() {
 
 $('#sel-rotate').onclick = async () => {
   const list = selectedPages().filter(ready);
-  await eachInLanes(list, p => reprocess(p, { rotation: ((p.rotation || 0) + 90) % 360, crop: 'auto' }, { quiet: true }), '回転しています');
+  await eachInLanes(list, p => turnBy(p, 90), '回転しています');
   await refresh();
   runBackgroundOcr();
 };
@@ -1224,7 +1234,10 @@ $('#retake-input').addEventListener('change', async e => {
 $('#view-rotate').onclick = async () => {
   const page = await db.getPage(viewer.id);
   if (!page) return;
-  await reprocess(page, { rotation: ((page.rotation || 0) + 90) % 360, crop: 'auto' });
+  setBusy('回転しています…');
+  try { await turnBy(page, 90); } finally { showPending(); }
+  await refresh();
+  runBackgroundOcr();
   showViewer('after');
 };
 
