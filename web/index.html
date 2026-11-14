@@ -16,7 +16,7 @@
 <body>
   <main class="shell">
     <header>
-      <div><p class="eyebrow">PERSONAL SCANNER</p><h1>ScanLite</h1><p class="sub">本も書類も、スマホの中だけでスキャン</p></div>
+      <h1>ScanLite</h1>
       <span class="local-badge">端末内で処理</span>
     </header>
 
@@ -46,16 +46,14 @@
       <h2 id="mode-title">本をスキャン</h2>
       <p id="mode-help">ページをめくって手を止めると、自動で撮影します。</p>
       <div id="spread-options" class="spread-options">
-        <label><input type="checkbox" id="opt-split"> 見開きを2ページに分ける</label>
-        <select id="opt-order" aria-label="ページの順番">
-          <option value="rtl">右ページから（縦書きの本）</option>
-          <option value="ltr">左ページから（横書きの本）</option>
-        </select>
+        <div class="split-switch" role="radiogroup" aria-label="1回の撮影で保存するページ数"><button type="button" data-split="0" role="radio">1ページ</button><button type="button" data-split="1" role="radio">見開き2ページ</button></div>
+        <button id="home-order" class="order-chip" type="button" aria-label="ページの順番を切り替える"></button>
+        <input type="checkbox" id="opt-split" hidden>
+        <select id="opt-order" hidden><option value="rtl">右ページから</option><option value="ltr">左ページから</option></select>
       </div>
       <button id="camera-button" class="primary-button" type="button">連続撮影をはじめる</button>
       <p class="silent-note">シャッター音なし・撮影はバイブでお知らせ</p>
       <div class="secondary-row">
-        <label class="secondary-button" for="camera-input">カメラアプリで撮影（音が鳴ります）</label>
         <label class="secondary-button" for="file-input">写真を選ぶ</label>
       </div>
       <input id="camera-input" type="file" accept="image/*" capture="environment" hidden>
@@ -72,7 +70,7 @@
       <button id="text-export" type="button" disabled>文字を書き出す</button>
     </section>
     <p id="search-note" class="search-note" hidden></p>
-    <p id="pages-hint" class="pages-hint" hidden>ページを<strong>長押し</strong>すると選べます。長押ししたまま指を動かすと、ページを並べ替えられます。選んだページだけを編集・並べ替え・削除したり、別のフォルダへ移したり、Claude などに貼るためにコピーしたりできます。</p>
+    <p id="pages-hint" class="pages-hint" hidden><strong>長押し</strong>でページを選べます。そのまま指を動かすと並べ替えられます。</p>
     <section id="pages" class="pages" aria-live="polite"></section>
     <div id="select-bar" class="select-bar" role="toolbar" aria-label="選んだページの操作" hidden>
       <div class="select-head"><strong id="select-count">0枚を選択中</strong><button id="select-all" type="button">全部選ぶ</button><button id="select-done" type="button">選択をやめる</button></div>
@@ -80,16 +78,16 @@
         <button id="sel-edit" type="button">範囲・補正</button>
         <button id="sel-rotate" type="button">↻ 回転</button>
         <button id="sel-settings" type="button">色・補正</button>
+        <button id="sel-pdf" type="button">PDFにする</button>
         <button id="sel-copy" type="button">コピー・送る</button>
         <button id="sel-move" type="button">📁 移動</button>
-        <button id="sel-up" type="button">◀ 前へ</button>
-        <button id="sel-down" type="button">後ろへ ▶</button>
         <button id="sel-delete" type="button" class="danger">削除</button>
       </div>
     </div>
  <p id="toast" class="toast" role="status" aria-live="polite" hidden></p>
+    <p class="trash-row"><button id="trash-button" class="text-button" type="button" hidden>ゴミ箱</button></p>
     <p id="storage" class="privacy-note storage" hidden></p>
-    <p class="privacy-note">写真・PDF・認識テキストはすべてこのスマホの中で処理・保存します。<br>サーバーや外部サービスには送信しません（文字認識も端末内で動作）。</p>
+    <p class="privacy-note">写真・PDF・文字はすべてこのスマホの中だけで処理・保存します（外部に送信しません）。</p>
     <p class="privacy-note app-version">バージョン v39（2026-11-14） <button id="force-update" type="button">最新版に更新</button></p>
 
     <dialog id="camera-dialog" class="camera-dialog">
@@ -162,6 +160,7 @@
     <dialog id="pdf-dialog">
       <form method="dialog"><button class="close" aria-label="閉じる">×</button></form>
       <h2>PDFを作成</h2>
+      <p id="pdf-scope" class="pdf-scope" hidden></p>
       <div id="pdf-setup">
         <label class="name-field">ファイル名<span class="name-input"><input id="pdf-name" type="text" autocomplete="off"><span>.pdf</span></span></label>
         <p id="pdf-name-note" class="dialog-note name-note"></p>
@@ -188,6 +187,15 @@
         <button id="pdf-share" class="text-button" type="button" hidden>他のアプリで開く…</button>
         <p class="dialog-note">「スマホに保存」はダウンロードフォルダに保存します。共有を選んだ場合だけ、選んだアプリにPDFが渡ります。</p>
       </div>
+    </dialog>
+
+    <dialog id="trash-dialog" class="trash-dialog">
+      <form method="dialog"><button class="close" aria-label="閉じる">×</button></form>
+      <h2>ゴミ箱</h2>
+      <p class="dialog-note">削除したページは30日間ここに残り、そのあと自動で完全に消えます。</p>
+      <p id="trash-empty-note" class="dialog-note" hidden>ゴミ箱は空です。</p>
+      <div id="trash-list" class="trash-list"></div>
+      <div class="trash-buttons"><button id="trash-clear" type="button" class="danger">空にする</button><button id="trash-restore-all" type="button" class="dark-button">全部戻す</button></div>
     </dialog>
 
     <dialog id="batch-dialog" class="batch-dialog">
