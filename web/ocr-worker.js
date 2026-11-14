@@ -123,9 +123,36 @@ function order(lines) {
   return rows.flatMap(r => r.items.sort((a, b) => a.bbox.x0 - b.bbox.x0));
 }
 
-// 1枚ずつ順番に処理する（同時に動かすとメモリを食うため）
-let queue = Promise.resolve();
-self.onmessage = e => { queue = queue.then(() => handle(e.data)); };
+// 1件ずつ順番に処理する（同時に動かすとメモリを食うため）。
+// 補正に使う行の検出（lines）とモデルの読み込み（warm）は急ぎの仕事として、読み取り（PDF用のOCR）より先に行う。
+// 読み取りは1行ごとに区切って、その間に急ぎの仕事が来たら先に片付ける（裏で読んでいても、撮影後の補正を待たせない）
+const urgent = [], normal = [];
+let busy = false, hold = false, wake = null;
+self.onmessage = e => {
+  const m = e.data;
+  // hold: 撮影した写真の補正中は、読み取りを止めておく（CPUを補正に回す）
+  if (m.hold !== undefined) { hold = m.hold; if (!hold && wake) { wake(); wake = null; } return; }
+  (m.lines || m.warm ? urgent : normal).push(m);
+  if (wake && urgent.length) { wake(); wake = null; }
+  pump();
+};
+async function pump() {
+  if (busy) return;
+  busy = true;
+  while (urgent.length || normal.length) await handle(urgent.length ? urgent.shift() : normal.shift());
+  busy = false;
+}
+// 読み取りの区切りごとに呼ぶ: 急ぎの仕事を先に済ませ、止めるよう言われていれば再開を待つ
+// （文字を読む計算の間は届いたメッセージが処理されないので、ここで一度メッセージを受け取る）
+const tick = () => new Promise(r => setTimeout(r, 0));
+async function yieldToUrgent() {
+  await tick();
+  for (;;) {
+    while (urgent.length) await handle(urgent.shift());
+    if (!hold) return;
+    await new Promise(r => { wake = r; });
+  }
+}
 // 行の位置: 検出した各行に直線を当てはめ、両端の点と太さを返す（ページの範囲と台形のゆがみを求めるのに使う）。
 // 座標は画像に対する割合
 // choose（向きの候補の配列）があるときは、向きの判定もいっしょに行う: rotation の向きで検出した行を
@@ -247,11 +274,13 @@ async function handle({ id, blob, lines, rotation, choose, warm }) {
   try {
     progress(0);
     await load();
+    await yieldToUrgent();
     const bitmap = await createImageBitmap(blob);
     const boxes = await detect(bitmap);
     progress(0.15);
     const lines = [];
     for (let i = 0; i < boxes.length; i++) {
+      await yieldToUrgent();
       const r = await read(bitmap, boxes[i]);
       if (r.text && r.conf > 0.5) {
         const b = boxes[i];
