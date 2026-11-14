@@ -724,7 +724,8 @@ function flattenFine(d, W, H) {
 }
 
 // 紙を白・文字の芯を黒にする直線の濃度補正。曲線をかけないので、文字が太らず輪郭もなめらかなまま
-function documentTone(d, Y, W, H, fill = null) {
+// 紙の白と文字の芯の濃さ（階調を決める両端）
+function toneLevels(Y, W, H) {
   const hist = new Uint32Array(256);
   for (let p = 0; p < Y.length; p += 3) hist[Y[p]]++;
   const total = hist.reduce((a, b) => a + b, 0);
@@ -745,7 +746,11 @@ function documentTone(d, Y, W, H, fill = null) {
   const paper = pct(0.6), darkest = pct(0.004);
   const core = cells.length >= 12 ? cells[Math.floor(cells.length * 0.15)] : darkest;
   const black = Math.min(Math.max(darkest, core), paper - 90);
-  const white = Math.max(black + 60, paper - 16), k = 255 / (white - black);
+  const white = Math.max(black + 60, paper - 16);
+  return { black, white };
+}
+function documentTone(d, Y, W, H, fill = null) {
+  const { black, white } = toneLevels(Y, W, H), k = 255 / (white - black);
   const lut = new Uint8ClampedArray(256);
   // 芯はほぼ黒に、中間調は少し濃く（小さい文字やかすれた文字も読みやすく）
   for (let v = 0; v < 256; v++) { const t = Math.min(1, Math.max(0, (v - black) * k / 255)); lut[v] = 8 + 247 * Math.pow(t, 1.15); }
@@ -936,25 +941,34 @@ function boxBlur(Y, W, H, r) {
   return o;
 }
 
+// 紙の書類のなめらかな仕上げ: 輪郭を軽く締め、紙を白・文字の芯を黒にする階調を画像全体に一様にかける。
+// 場所ごとに濃さを変えたり強く輪郭を立てたりしないので、字の線がまだらに欠けたり太ったりせず、薄い字も
+// 見出しの帯のグラデーションも元の濃淡のまま濃くなる（細かさの足りない写真でも字が崩れない）
+function softTone(d, W, H) {
+  const Y = luma(d, W, H), R = Math.max(1, Math.round(Math.max(W, H) / 1100)), B = boxBlur(Y, W, H, R);
+  const { black, white } = toneLevels(Y, W, H), k = 1 / (white - black);
+  // 中間の濃さを濃いほうへ寄せる（薄い灰色の字を読みやすく）
+  const lut = new Float32Array(256);
+  for (let v = 0; v < 256; v++) lut[v] = 255 * Math.pow(Math.min(1, Math.max(0, (v - black) * k)), 1.5);
+  for (let p = 0, i = 0; p < Y.length; p++, i += 4) {
+    const y = Y[p], df = y - B[p];
+    const ys = Math.min(255, Math.max(0, y + (df > 2 || df < -2 ? 0.8 * df : 0)));
+    const lo = ys | 0, ny = lut[lo] + (lut[Math.min(255, lo + 1)] - lut[lo]) * (ys - lo);
+    // 色みは少し抑えて残す（濃くした分だけ色が強まって、黒い字が茶色く見えないように）
+    d[i] = ny + (d[i] - y) * 0.7; d[i + 1] = ny + (d[i + 1] - y) * 0.7; d[i + 2] = ny + (d[i + 2] - y) * 0.7;
+  }
+}
+
 // 背景のまだら・縞・薄い汚れを白にし、点状のゴミとページ端の線を消す。
 // binarize: 文字を黒・背景を白にくっきり分ける（白黒）
 function cleanDocument(d, W, H, { binarize, fine = false }) {
   // 画面の細かい縞を打ち消す処理。紙の写真では薄い・ぼけた文字まで紙と見なして消してしまうので使わない
+  const soft = !fine && !binarize;
   if (fine) flattenFine(d, W, H);
-  else liftFaded(d, W, H);
-  // 文字の線の中のざらつき（ぼけた写真を端末が強調したときの細かいすじ）を、明るさの3x3メディアンでならす。
-  // 線の輪郭は動かないので、細い字もやせない。紙の上の明るい所はあとで白にするので、暗い所だけ
-  if (!fine && !binarize) {
-    const Y0 = luma(d, W, H), buf = new Uint8ClampedArray(9);
-    for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
-      const p = y * W + x;
-      if (Y0[p] > 225) continue;
-      buf[0] = Y0[p - W - 1]; buf[1] = Y0[p - W]; buf[2] = Y0[p - W + 1]; buf[3] = Y0[p - 1]; buf[4] = Y0[p];
-      buf[5] = Y0[p + 1]; buf[6] = Y0[p + W - 1]; buf[7] = Y0[p + W]; buf[8] = Y0[p + W + 1];
-      const dv = median9(buf) - Y0[p];
-      if (dv) { const i = p * 4; d[i] += dv; d[i + 1] += dv; d[i + 2] += dv; }
-    }
-  }
+  else if (!soft) liftFaded(d, W, H);
+  // 紙の写真（カラー・グレー）は、やわらかく仕上げる。字を太らせたり輪郭を強く締めたりすると、
+  // 細かさの足りない写真では字がまだら・ぎざぎざになり、帯や図の濃淡も白と黒に割れてしまう
+  if (soft) softTone(d, W, H);
   const Y = luma(d, W, H);
   // 3x3平均で判定する（細かい縞やJPEGのざらつきに引っぱられないように）
   const S = new Uint8ClampedArray(W * H), row = new Uint16Array(W * H);
@@ -978,7 +992,7 @@ function cleanDocument(d, W, H, { binarize, fine = false }) {
       const v = Math.max(0, Math.min(255, (sharp - lo) * 255 / (hi - lo)));
       d[i] = d[i + 1] = d[i + 2] = S[p] >= hi ? 255 : v;
     }
-  } else {
+  } else if (!soft) {
     // 見出しの帯・図の塗りのような「べた塗り」の所は、印刷の網点や紙のざらつきが輪郭の強調で
     // まだら・砂目になる。そこは強調せず、ならして元のなめらかな濃淡に戻す（中の白抜き文字は残す）
     const fill = smoothFills(d, Y, S, W, H);
@@ -2507,6 +2521,17 @@ async function finishPage(canvas, opts, state) {
   // 紙の端から正確に切り出して反りも直したページは、残りが小さいので1回）
   if (opts.subject !== 'screen' && (opts.crop === 'auto' || Array.isArray(opts.crop)) && opts.dewarp !== false && opts.lines && linesVertical(opts.lines) === false) {
     for (let i = 0; i < (state.exact ? 1 : 2); i++) { const c2 = levelRows(canvas); if (c2 === canvas) break; canvas = c2; leveled = true; await tick(); }
+  }
+  // 細かさの足りないページ（見開きを1枚に撮った片側など）は、仕上げの前に大きくしておく。
+  // 小さいまま階調を締めると字の輪郭がぎざぎざ・まだらになる
+  if (opts.subject !== 'screen' && opts.filter !== 'none') {
+    const long = Math.max(canvas.width, canvas.height), up = Math.min(1.6, 1700 / long);
+    if (up > 1.15) {
+      const c2 = makeCanvas(Math.round(canvas.width * up), Math.round(canvas.height * up)), x2 = ctx2d(c2);
+      x2.imageSmoothingQuality = 'high';
+      x2.drawImage(canvas, 0, 0, c2.width, c2.height);
+      canvas = c2;
+    }
   }
   if (opts.moire) { demoire(canvas); await tick(); }
   enhance(canvas, { filter: opts.filter || 'none', fingers: !!opts.fingers, denoise: opts.denoise !== false, evenColor: opts.evenColor !== false });
