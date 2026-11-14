@@ -222,7 +222,7 @@ export function findPage(canvas, lines, { side: half = null, debug = null } = {}
     const nIn = Math.sign(ln.nx * inPt[0] + ln.ny * inPt[1] - ln.rho) || 1;
     const ix = ln.nx * nIn, iy = ln.ny * nIn;
     let ok = 0, n = 0, both = 0;
-    const dark = [], darkW = [], st = Math.max(2, (a1 - a0) / 80);
+    const dark = [], darkW = [], crease = [], jump = [], st = Math.max(2, (a1 - a0) / 80);
     for (let t = a0; t <= a1; t += st) {
       const p = horizontal ? pointAtU(ln, t) : pointAtV(ln, t);
       if (!p) continue;
@@ -233,9 +233,13 @@ export function findPage(canvas, lines, { side: half = null, debug = null } = {}
         ci += sample(C, w, h, p[0] + ix * s, p[1] + iy * s); co += sample(C, w, h, p[0] - ix * s, p[1] - iy * s);
       }
       yi /= 4; yo /= 4; ci /= 4; co /= 4;
+      if (yi > P * 0.6 && yo > P * 0.6) jump.push(Math.abs(yi - yo));
       // 線の上と、少し離れた所（のどの影は幅があり、印刷の細い線にはない）
       const yl = sample(Y, w, h, p[0], p[1]), yw = (sample(Y, w, h, p[0] + ix * 3, p[1] + iy * 3) + sample(Y, w, h, p[0] - ix * 3, p[1] - iy * 3)) / 2;
       if (yl === yl && yw === yw) { dark.push(yl); darkW.push(yw); }
+      // 折り目（のど）: 線の上が、両側（少し離れた紙）より暗い。写真の明るさのむらによらず、その場で比べる
+      const ya = sample(Y, w, h, p[0] + ix * 6, p[1] + iy * 6), yb = sample(Y, w, h, p[0] - ix * 6, p[1] - iy * 6);
+      if (yl === yl && ya > P * 0.6 && yb > P * 0.6) crease.push(Math.min(ya, yb) - Math.min(yl, sample(Y, w, h, p[0] + ix, p[1] + iy), sample(Y, w, h, p[0] - ix, p[1] - iy)));
       if (!(yi === yi) || !(yo === yo)) continue;
       const paperIn = yi > P * 0.6 && Math.abs(ci - Pc) < 25;
       if (paperIn && yo > P * 0.6 && Math.abs(co - Pc) < 25) both++;
@@ -279,7 +283,13 @@ export function findPage(canvas, lines, { side: half = null, debug = null } = {}
     // shade: 線の上が紙より暗い度合い（のどの影）。両側が紙のときだけ数える（図の黒い部分を除く）
     const pct = a => P - a[Math.floor(a.length * 0.8)];
     const shade = dark.length && n && both / n > 0.7 ? Math.min(pct(dark), 2 * pct(darkW)) : 0;
-    return { support: n ? ok / n : 0, shade: Math.min(shade, P * 0.4), beyond: nb2 ? back2 / nb2 : 1 };
+    crease.sort((a, b) => a - b);
+    // crease: 線の上が両側の紙より暗い度合い（中央値）。紙が両側にある所が半分未満なら 0
+    const crs = n && crease.length > n * 0.5 ? crease[crease.length >> 1] : 0;
+    // jump: 両側とも紙の所での、内と外の明るさの差（中央値。のどでは片側のページが影になって段差になる）
+    jump.sort((a, b) => a - b);
+    const jmp = n && jump.length > n * 0.5 ? jump[jump.length >> 1] : 0;
+    return { support: n ? ok / n : 0, shade: Math.min(shade, P * 0.4), beyond: nb2 ? back2 / nb2 : 1, crease: crs, jump: jmp };
   }
   // 直線がかたまりの文字をどちら側に置くか（内側=正）。いちばん近い点までの距離
   const sideDist = (ln, ls, inPt) => {
@@ -518,15 +528,18 @@ export function findPage(canvas, lines, { side: half = null, debug = null } = {}
       // のどは行とほぼ直交し、上から下まで両ページの文字のすき間の中を通る。影・段差（s）と、直線の強さ（ハフ変換の票）、
       // すき間の中央への近さで選ぶ（印刷の細い枠線は本文のすぐ横にあり、票も少ない）
       const ok = list.filter(c => {
-        if (Math.abs(c.ln.nx * e1[0] + c.ln.ny * e1[1]) < Math.cos(4 * RAD) || c.shade < -5) return false;
+        // 紙全体より明るく写った所でも、両側より暗い折り目なら のど の候補にする（照明のむら）
+        if (Math.abs(c.ln.nx * e1[0] + c.ln.ny * e1[1]) < Math.cos(4 * RAD) || (c.shade < -5 && c.crease < 2 && c.jump < 6)) return false;
         const pt = pointAtV(c.ln, v0), pb = pointAtV(c.ln, v1);
         return pt && pb && U(pt) >= lo && U(pt) <= hi && U(pb) >= lo && U(pb) <= hi;
       });
       const vmax = Math.max(1, ...ok.map(c => c.ln.votes || 0));
       for (const c of ok) {
-        const s = Math.min(2, Math.max(c.support * 2, c.shade / 10)), v = (c.ln.votes || 0) / vmax;
+        const s = Math.min(2, Math.max(c.support * 2, c.shade / 10, c.crease / 3, c.jump / 8)), v = (c.ln.votes || 0) / vmax;
         if (s < 0.8 && v < 0.5) continue;
-        const sc = v + 0.5 * s - 0.7 * Math.abs(c.pos - mid) / half2;
+        // 本文のすぐ横の線（行末・見出しの帯の端がそろってできる線）は、のどではないことが多い
+        const hug = c.dist < em ? 0.4 * (1 - c.dist / em) : 0;
+        const sc = v + 0.5 * s - 0.7 * Math.abs(c.pos - mid) / half2 - hug;
         if (sc > bs) { bs = sc; best = c; }
       }
       if (best) chosen = best.ln;
@@ -557,8 +570,13 @@ export function findPage(canvas, lines, { side: half = null, debug = null } = {}
       kind = 'gutter';
     } else {
       // 本文にいちばん近い、外が紙に戻らない境目（印刷の枠や表の罫線で止まらないように）。なければ従来どおり
-      let good = list.filter(c => c.support >= 0.3 && c.beyond < 0.4).sort((a, b) => a.dist - b.dist);
-      if (!good.length) good = list.filter(c => c.support >= 0.35).sort((a, b) => a.dist - b.dist);
+      // 近さは辺の中央での本文からの距離で測り、本文の向きから大きく傾いた線は遠いものとして扱う
+      // （傾いた線は端の一点だけが本文に近くなり、机の縁や影へ斜めに切りこむ範囲になりやすい。撮影の遠近で
+      // 4度ほどまでは紙の端も傾くので、それを超えた分だけ）
+      const edgeAt = [v0, u1, v1, u0][side], ref = horizontal ? e2 : e1;
+      const key = c => Math.abs(c.pos - edgeAt) + Math.max(0, Math.acos(Math.min(1, Math.abs(c.ln.nx * ref[0] + c.ln.ny * ref[1]))) / RAD - 4) * S * 0.004;
+      let good = list.filter(c => c.support >= 0.3 && c.beyond < 0.4).sort((a, b) => key(a) - key(b));
+      if (!good.length) good = list.filter(c => c.support >= 0.35).sort((a, b) => key(a) - key(b));
       if (good.length) { chosen = good[0].ln; kind = 'edge'; }
     }
     if (!chosen) {
@@ -579,11 +597,13 @@ export function findPage(canvas, lines, { side: half = null, debug = null } = {}
   const quad = () => [meetLines(sides[3], sides[0]), meetLines(sides[0], sides[1]), meetLines(sides[1], sides[2]), meetLines(sides[2], sides[3])];
   // 選んだ紙の端は、境目の位置を細かく測り直す
   const outline = [null, null, null, null];
+  if (debug) debug.pre = sides.slice();
   let corners = quad();
   if (corners.some(c => !c)) return null;
   for (let side = 0; side < 4; side++) {
     if (kinds[side] !== 'edge') continue;
     const r = refine(Y, C, w, h, corners[side], corners[(side + 1) % 4], tc, P, Pc);
+    if (debug && r) (debug.ref = debug.ref || []).push([side, r.nx, r.ny, r.rho, r.outer]);
     if (r && Math.abs(r.nx * sides[side].nx + r.ny * sides[side].ny) > Math.cos(3 * RAD)) {
       // 曲がった紙の端が切れないよう、外へはみ出した分だけ広げる（広げた所に残る机は、仕上げの端の掃除で消す）
       const sg = Math.sign(r.nx * tc[0] + r.ny * tc[1] - r.rho) || 1;
@@ -633,7 +653,17 @@ function refine(Y, C, w, h, a, b, inside, P, Pc) {
     const d0 = (ln.nx * px0 + ln.ny * py0 - ln.rho) * sg; // 直線までの距離（内向き正）
     const px = px0 - ln.nx * sg * d0, py = py0 - ln.ny * sg * d0; // 直線上の点
     let best = 0, bs = 0;
-    for (let s = 3; s >= -24; s -= 1) { const g = stepAt(px, py, s); if (g > best * 1.15 && g > 12) { best = g; bs = s; } }
+    // 外へたどるのは、途中がずっと紙の色の間だけ（机の上の別の境目まで広げないように）
+    // 比べる紙は、この場所の直線のすぐ内側（写真の明るさ・色みのむらによらないように）
+    const yr = sample(Y, w, h, px + nx * 6, py + ny * 6), cr = sample(C, w, h, px + nx * 6, py + ny * 6);
+    for (let s = 3; s >= -24; s -= 1) {
+      if (s < -1) {
+        const yq = sample(Y, w, h, px + nx * (s + 2), py + ny * (s + 2)), cq = sample(C, w, h, px + nx * (s + 2), py + ny * (s + 2));
+        if (!(yq > yr * 0.93) || !(Math.abs(cq - cr) < 7)) break;
+      }
+      const g = stepAt(px, py, s);
+      if (g > best * 1.15 && g > 12) { best = g; bs = s; }
+    }
     outs.push(Math.max(0, -bs));
     if (best > 12) edge.push([px + nx * bs, py + ny * bs]);
   }
