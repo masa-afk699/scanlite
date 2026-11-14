@@ -861,7 +861,7 @@ function liftFaded(d, W, H) {
 
 // べた塗りの所（紙の白がほとんど見えない、ある程度の広さの暗い面）を見つけ、ざらつきをならす。
 // d と Y を書き換え、べた塗りの画素を 1 にしたマスクを返す（なければ null）
-function smoothFills(d, Y, S, W, H) {
+function smoothFills(d, Y, S, W, H, soft = false) {
   const r = Math.max(3, Math.round(Math.max(W, H) / 260)), W1 = W + 1;
   const integ = (f, w = W, h = H) => { const w1 = w + 1, I = new Uint32Array(w1 * (h + 1)); for (let y = 0; y < h; y++) { let rs = 0; for (let x = 0; x < w; x++) { rs += f(y * w + x); I[(y + 1) * w1 + x + 1] = I[y * w1 + x + 1] + rs; } } return I; };
   // 区画の合計（返り値）と画素数（boxN）。配列を作らない（画素ごとに呼ぶので）
@@ -907,7 +907,8 @@ function smoothFills(d, Y, S, W, H) {
     const p = y * W + x; if (!fill[p]) continue;
     // 白抜きの字や線は数画素まとまって平均から離れる（3x3平均 S で見る）。ざらつきは1画素ごとにばらつくだけ
     const n = box(IF, x, y, r), sy = box(IFY, x, y, r), mean = sy / n, df = Math.abs(S[p] - mean);
-    const t = Math.min(1, Math.max(0.3, (df - 5) / 8)); // 小さいほど強くならす。1: そのまま
+    // 紙の写真の仕上げ（soft）では、光の粒・紙の繊維の白い点も数画素のかたまりになるので、もっと強くならす
+    const t = soft ? Math.min(1, Math.max(0.12, (df - 14) / 16)) : Math.min(1, Math.max(0.3, (df - 5) / 8)); // 小さいほど強くならす。1: そのまま
     out[p] = mean + (Y[p] - mean) * t;
   }
   for (let p = 0, i = 0; p < fill.length; p++, i += 4) {
@@ -952,10 +953,15 @@ function softTone(d, W, H) {
   for (let v = 0; v < 256; v++) lut[v] = 255 * Math.pow(Math.min(1, Math.max(0, (v - black) * k)), 1.5);
   for (let p = 0, i = 0; p < Y.length; p++, i += 4) {
     const y = Y[p], df = y - B[p];
-    const ys = Math.min(255, Math.max(0, y + (df > 2 || df < -2 ? 0.8 * df : 0)));
+    // 色の付いたインク（赤・茶・青の字）は、同じ明るさの灰色より濃く見えるものなので、色みの分だけ
+    // 濃さを足してから階調を整える（明るさだけで決めると、黒い字より薄い灰色の字になってしまう）
+    const r = d[i], g = d[i + 1], b = d[i + 2];
+    const c = Math.hypot(-0.168736 * r - 0.331264 * g + 0.5 * b, 0.5 * r - 0.418688 * g - 0.081312 * b);
+    const ink = c > 12 ? Math.min(1, Math.max(0, (INK_Y + 20 - y) / 40)) : 0;
+    const ys = Math.min(255, Math.max(0, y + (df > 2 || df < -2 ? 0.8 * df : 0) - ink * 0.9 * c));
     const lo = ys | 0, ny = lut[lo] + (lut[Math.min(255, lo + 1)] - lut[lo]) * (ys - lo);
     // 色みは少し抑えて残す（濃くした分だけ色が強まって、黒い字が茶色く見えないように）
-    d[i] = ny + (d[i] - y) * 0.7; d[i + 1] = ny + (d[i + 1] - y) * 0.7; d[i + 2] = ny + (d[i + 2] - y) * 0.7;
+    d[i] = ny + (r - y) * 0.7; d[i + 1] = ny + (g - y) * 0.7; d[i + 2] = ny + (b - y) * 0.7;
   }
 }
 
@@ -981,6 +987,9 @@ function cleanDocument(d, W, H, { binarize, fine = false }) {
     const o = y * W, up = y > 0 ? o - W : o, dn = y < H - 1 ? o + W : o;
     for (let x = 0; x < W; x++) S[o + x] = (row[up + x] + row[o + x] + row[dn + x]) / 9;
   }
+  // 紙の写真でも、見出しの帯・図の塗り・写真のような「べた塗り」は、写真のざらつきや光のむらで
+  // 砂目・まだらに見える。そこだけ明るさをならす（白抜きの字・中の線はそのまま）
+  if (soft) smoothFills(d, Y, S, W, H, true);
   const sample = [];
   for (let p = 0; p < S.length; p += 7) sample.push(S[p]);
   const t = Math.min(200, Math.max(90, otsu(sample)));
@@ -1094,15 +1103,22 @@ function removeEdgeLines(d, W, H, dark) {
 }
 
 // 色ムラ補正: 紙や文字に出る薄い色かぶり・まだらな色を消し、はっきりした色（印鑑・図・写真）は残す
+// インクとみなす濃さ（紙を白にそろえた後の明るさ）
+const INK_Y = 185;
+// 色の付いたインクとみなす色みの強さ（一帯のインクの平均）と、仕上げで付ける色みの強さ
+const INK_C0 = 4, INK_TARGET = 26;
 function removeColorBlotches(d, W, H) {
   const S = 8, gw = Math.ceil(W / S), gh = Math.ceil(H / S);
   const cb = new Float32Array(gw * gh), cr = new Float32Array(gw * gh), n = new Float32Array(gw * gh);
+  // 色の付いたインク（赤・茶・青の文字や線）の色: 区画の中の濃い画素（インク）だけの平均の色み。
+  // 黒い字の縁に出る色ずれ（片側が紫・反対側が緑）は平均すると打ち消し合うので、インクの色だけが残る
+  const ib = new Float32Array(gw * gh), ir = new Float32Array(gw * gh), ni = new Float32Array(gw * gh);
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
     const i = (y * W + x) * 4, g = ((y / S) | 0) * gw + ((x / S) | 0);
     const r = d[i], gg = d[i + 1], b = d[i + 2];
-    cb[g] += -0.168736 * r - 0.331264 * gg + 0.5 * b;
-    cr[g] += 0.5 * r - 0.418688 * gg - 0.081312 * b;
-    n[g]++;
+    const pb = -0.168736 * r - 0.331264 * gg + 0.5 * b, pr = 0.5 * r - 0.418688 * gg - 0.081312 * b;
+    cb[g] += pb; cr[g] += pr; n[g]++;
+    if (0.299 * r + 0.587 * gg + 0.114 * b < INK_Y) { ib[g] += pb; ir[g] += pr; ni[g]++; }
   }
   for (let g = 0; g < n.length; g++) { cb[g] /= n[g]; cr[g] /= n[g]; }
   // 周囲と平均して、まだら模様をならす
@@ -1120,6 +1136,24 @@ function removeColorBlotches(d, W, H) {
     return o;
   };
   const sb = blur(cb), sr = blur(cr);
+  // インクの色みも周りの区画と合わせてならす（数画素の色ずれに引っぱられないよう、インクの画素数で重みづけ）
+  const inkC = new Float32Array(gw * gh), inkB = new Float32Array(gw * gh), inkR = new Float32Array(gw * gh);
+  for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+    let b = 0, r = 0, c = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const yy = y + dy, xx = x + dx;
+      if (yy < 0 || xx < 0 || yy >= gh || xx >= gw) continue;
+      const g = yy * gw + xx; b += ib[g]; r += ir[g]; c += ni[g];
+    }
+    if (c < 6) continue;
+    const g = y * gw + x;
+    inkB[g] = b / c; inkR[g] = r / c; inkC[g] = Math.hypot(inkB[g], inkR[g]);
+    // 一帯がほとんどインクで埋まっている所（見出しの帯・図の塗り）は、光の映り込みで色づいて見えるだけの
+    // ことが多いので、色を足さない（字・記号のように周りに紙がある所だけ）
+    let area = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const yy = y + dy, xx = x + dx; if (yy >= 0 && xx >= 0 && yy < gh && xx < gw) area += n[yy * gw + xx]; }
+    inkC[g] *= Math.min(1, Math.max(0, (0.9 - c / area) / 0.2));
+  }
   for (let y = 0; y < H; y++) {
     const gy = Math.min(gh - 1, (y / S) | 0);
     for (let x = 0; x < W; x++) {
@@ -1132,7 +1166,15 @@ function removeColorBlotches(d, W, H) {
       const strength = Math.max(local, own * 0.6);
       let k = Math.min(1, Math.max(0, (strength - 9) / 16));
       if (Y > 215) k *= Math.max(0, (245 - Y) / 30); // 明るい紙の部分はより強く無彩色に
-      const ncb = pcb * k, ncr = pcr * k;
+      let ncb = pcb * k, ncr = pcr * k;
+      // 色の付いた文字・記号（赤や茶の字・●）のインクは、その一帯のインクの色で塗る。写真では細い字の色が
+      // 紙の白と混ざって薄くなる（以前は周りの紙の色みで消され、灰色の字になっていた）ので、色をはっきりさせる
+      const ic = inkC[g];
+      if (ic > INK_C0 && Y < INK_Y + 30) {
+        const w = Math.min(1, (ic - INK_C0) / 4) * Math.min(1, (INK_Y + 30 - Y) / 40);
+        const boost = Math.min(3, INK_TARGET / ic);
+        ncb += (inkB[g] * boost - ncb) * w; ncr += (inkR[g] * boost - ncr) * w;
+      }
       d[i] = Y + 1.402 * ncr;
       d[i + 1] = Y - 0.344136 * ncb - 0.714136 * ncr;
       d[i + 2] = Y + 1.772 * ncb;
