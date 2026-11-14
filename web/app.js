@@ -2,7 +2,7 @@
 import { processImage as processHere, processSpread as spreadHere, finishHalf as finishHere, decode, drawRotated, detectPage, FULL_FRAME, recompress, limitOriginal as limitHere, cropTop, orientCandidates, linesVertical, turnPage, bendOutline, bendHandle, bendFromPoint, hasCurves } from './scan.js';
 import * as db from './db.js';
 import { buildPdf } from './pdf.js';
-import { recognize, textLines, warmUp } from './ocr.js';
+import { recognize, textLines, warmUp, holdReading } from './ocr.js';
 import { createCamera } from './camera.js';
 import * as save from './save.js';
 
@@ -154,7 +154,11 @@ function setBusy(text) {
   el.hidden = !text;
   el.textContent = text || '';
 }
-const showPending = () => setBusy(pending ? `画像を補正しています…（残り ${pending} 枚）` : '');
+// 写真の補正が残っている間は、裏での文字の読み取りを止めておく（補正を先に終わらせる）
+const showPending = () => { holdReading(pending > 0); setBusy(pending ? `画像を補正しています…（残り ${pending} 枚）` : ''); };
+// 新しく撮るページの文字を、補正が済んだら裏で先に読んでおくか。
+// 「まとめて設定」で決めていなければ、文字で検索できるPDFを作っている人には読んでおく（PDF作成時に待たなくてよい）
+const autoOcr = () => prefs.get('autoOcr', null) ?? prefs.get('searchable', false);
 
 // ---------- フォルダと文書 ----------
 // フォルダは文書をまとめる入れ物。表示中のフォルダ: 'all'（すべて）/ 'none'（フォルダなし）/ フォルダのid
@@ -844,7 +848,7 @@ async function enqueue(blobs, extra = {}) {
     const created = Date.now() + (seq++ % 1000) / 1000;
     for (let i = 0; i < halves.length; i++) {
       await db.addPage({
-        original: blob, ...defaultsFor(mode), half: halves[i], wantOcr: prefs.get('autoOcr', false),
+        original: blob, ...defaultsFor(mode), half: halves[i], wantOcr: autoOcr(),
         mode, docId: target, created: created + i / 2000, waiting: true,
         capture: created, autoRotate: mode !== 'screen', tilt: extra.tilt ?? null,
       });
@@ -1275,9 +1279,12 @@ async function runBackgroundOcr() {
   ocrRunning = true;
   try {
     for (;;) {
-      const todo = (await db.allPages()).filter(p => ready(p) && p.wantOcr && !(p.ocr && p.ocr.width === p.width));
+      // 表示中の文書のページから読む
+      const todo = (await db.allPages()).filter(p => ready(p) && p.wantOcr && !(p.ocr && p.ocr.width === p.width))
+        .sort((a, b) => (a.docId === docId ? 0 : 1) - (b.docId === docId ? 0 : 1));
       if (!todo.length || pending) break;
       setBusy(`文字認識を裏で進めています…（残り ${todo.length} ページ）`);
+      if ($('#pdf-dialog').open) showOcrNote();
       // ワーカーの数だけ並行して処理する
       await Promise.all(todo.slice(0, 2).map(p => ocrPage(p, () => {}).catch(async e => { console.error(e); const f = await db.getPage(p.id); if (f) { f.wantOcr = false; await db.putPage(f); } })));
       await refresh();
@@ -1285,22 +1292,45 @@ async function runBackgroundOcr() {
   } finally {
     ocrRunning = false;
     showPending();
+    if ($('#pdf-dialog').open && !$('#pdf-make').disabled) showOcrNote();
   }
 }
 
 // ---------- OCR ----------
 // 結果はページに保存して、PDFの文字検索にも使い回す
+// 裏での読み取りとPDF作成が同じページを同時に読むときは、1回だけ読んで結果を分け合う
+const ocrJobs = new Map();
 async function ocrPage(page, onProgress) {
   if (page.ocr && page.ocr.width === page.width) return page.ocr;
-  const rev = page.rev || 0;
-  const r = await recognize(page.blob, onProgress);
-  const ocr = { text: r.text, lines: r.lines, width: page.width, height: page.height };
-  page.ocr = ocr;
-  // 認識中にページが補正し直されていたら保存しない（最新の内容を上書きしないため）
-  const fresh = await db.getPage(page.id);
-  if (fresh && (fresh.rev || 0) === rev) { fresh.ocr = ocr; await db.putPage(fresh); }
+  const rev = page.rev || 0, key = page.id + ':' + rev;
+  if (!ocrJobs.has(key)) {
+    ocrJobs.set(key, (async () => {
+      // 裏の読み取りがちょうど済んで保存されたところなら、それを使う
+      const saved = await db.getPage(page.id);
+      if (saved && (saved.rev || 0) === rev && saved.ocr && saved.ocr.width === saved.width) return saved.ocr;
+      const t0 = performance.now();
+      const r = await recognize(page.blob, onProgress);
+      noteOcrTime(performance.now() - t0);
+      const ocr = { text: r.text, lines: r.lines, width: page.width, height: page.height };
+      // 認識中にページが補正し直されていたら保存しない（最新の内容を上書きしないため）
+      const fresh = await db.getPage(page.id);
+      if (fresh && (fresh.rev || 0) === rev) { fresh.ocr = ocr; await db.putPage(fresh); }
+      return ocr;
+    })().finally(() => ocrJobs.delete(key)));
+  }
+  const ocr = await ocrJobs.get(key);
+  if ((page.rev || 0) === rev) page.ocr = ocr;
   return ocr;
 }
+// 1ページを読むのにかかる時間（この端末での目安。残り時間の表示に使う）
+function noteOcrTime(ms) {
+  const prev = prefs.get('ocrMs', 0);
+  prefs.set('ocrMs', Math.round(prev ? prev * 0.7 + ms * 0.3 : ms));
+}
+const ocrLeft = n => {
+  const sec = Math.ceil(n * prefs.get('ocrMs', 0) / 1000);
+  return n && sec ? (sec < 60 ? `（あと約${sec}秒）` : `（あと約${Math.ceil(sec / 60)}分）`) : '';
+};
 
 // ---------- ページの確認（補正後・元の写真・OCRの文字） ----------
 const viewer = { id: null, tab: 'after', url: null, job: 0 };
@@ -1471,9 +1501,10 @@ let pdfUrl = null;
 const cleanName = t => t.replace(/[\\/:*?"<>|\u0000-\u001f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
 
 // 1ページ目の題名らしい行（上の方にある、いちばん大きな文字の行）を探す
-async function guessTitle(page) {
+async function guessTitle(page, whole = false) {
   let lines, H;
-  if (page.ocr && page.ocr.width === page.width) { lines = page.ocr.lines; H = page.height; }
+  // 検索できるPDFを作るときはページ全体を読む（その結果をPDFにも使うので、読み直さなくてよい）
+  if (whole || page.ocr && page.ocr.width === page.width) { ({ lines } = await ocrPage(page, () => {})); H = page.height; }
   else {
     const top = await cropTop(page.blob, 0.4);
     lines = (await recognize(top.blob)).lines;
@@ -1502,23 +1533,47 @@ $('#pdf-button').onclick = () => {
   $('#pdf-name').value = doc.name;
   $('#pdf-name-note').textContent = '1ページ目の題名を読み取っています…';
   const job = ++titleJob;
-  guessTitle(usable[0]).then(title => {
+  const searchable = prefs.get('searchable', false);
+  // 検索できるPDFにするなら、名前や画質を選んでいる間に文字を読み始めておく
+  if (searchable) readAhead(usable);
+  guessTitle(usable[0], searchable).then(title => {
     if (job !== titleJob || nameEdited) return;
     if (title) { $('#pdf-name').value = title; $('#pdf-name-note').textContent = '1ページ目の題名から付けました。自由に変えられます。'; }
     else $('#pdf-name-note').textContent = '題名を読み取れなかったので、文書名にしました。';
   }).catch(() => { if (job === titleJob) $('#pdf-name-note').textContent = ''; });
   const q = prefs.get('quality', 'high');
   document.querySelectorAll('input[name=quality]').forEach(r => { r.checked = r.value === q; });
-  $('#pdf-ocr').checked = prefs.get('searchable', false);
+  $('#pdf-ocr').checked = searchable;
   $('#pdf-setup').hidden = false;
   $('#pdf-result').hidden = true;
   $('#pdf-make').disabled = false;
   $('#pdf-make').textContent = '作成する';
-  const ocrDone = usable.filter(p => p.ocr && p.ocr.width === p.width).length;
-  $('#pdf-ocr-note').textContent = ocrDone === usable.length ? '全ページの文字認識が済んでいます' : `未処理の ${usable.length - ocrDone} ページを端末内でOCRします（並行処理）`;
+  showOcrNote();
   showSaveTarget();
   $('#pdf-dialog').showModal();
 };
+
+// PDFの画面の「文字で検索できるPDFにする」の下に、文字認識の進み具合を出す
+function showOcrNote() {
+  const usable = pages.filter(ready), left = usable.filter(p => !(p.ocr && p.ocr.width === p.width)).length;
+  $('#pdf-ocr-note').textContent = !left ? '全ページの文字認識が済んでいます'
+    : $('#pdf-ocr').checked && usable.some(p => p.wantOcr) ? `文字を読み取っています… 残り ${left} ページ${ocrLeft(left)}`
+    : `未処理の ${left} ページを端末内でOCRします`;
+}
+// ページの文字を裏で読み始める（PDFの画面を開いている間に進めておく）
+async function readAhead(list) {
+  for (const p of list) {
+    if (p.wantOcr || (p.ocr && p.ocr.width === p.width)) continue;
+    p.wantOcr = true;
+    const f = await db.getPage(p.id);
+    if (f) { f.wantOcr = true; await db.putPage(f); }
+  }
+  runBackgroundOcr();
+}
+$('#pdf-ocr').addEventListener('change', () => {
+  if ($('#pdf-ocr').checked) readAhead(pages.filter(ready));
+  showOcrNote();
+});
 
 $('#pdf-make').onclick = async () => {
   const quality = document.querySelector('input[name=quality]:checked').value;
@@ -1533,12 +1588,13 @@ $('#pdf-make').onclick = async () => {
     // 1) OCR（済んでいるページは保存済みの結果を使う。残りは並行処理）
     if (searchable) {
       let done = list.filter(p => p.ocr && p.ocr.width === p.width).length;
-      btn.textContent = `文字を認識しています… ${done}/${list.length}`;
+      const show = () => { btn.textContent = `文字を認識しています… ${done}/${list.length}${ocrLeft(list.length - done)}`; };
+      show();
       await Promise.all(list.map(async p => {
         if (p.ocr && p.ocr.width === p.width) return;
         p.wantOcr = true;
         try { await ocrPage(p, () => {}); } catch (e) { console.error(e); }
-        btn.textContent = `文字を認識しています… ${++done}/${list.length}`;
+        done++; show();
       }));
     }
     // 2) 画質に合わせて縮小（3枚ずつ並行）

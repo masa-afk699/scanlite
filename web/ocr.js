@@ -40,7 +40,7 @@ export const tidy = t => t
   .replace(new RegExp(`(?<=${CJK}) +(?=[0-9０-９])|(?<=[0-9０-９]) +(?=${CJK})`, 'g'), '');
 
 // ---------- 高精度OCR（PaddleOCR、Web Workerで実行） ----------
-let paddle = null, paddleFailed = false, seq = 0;
+let paddle = null, paddleFailed = false, seq = 0, held = false;
 const jobs = new Map();
 function paddleWorker() {
   if (paddle) return paddle;
@@ -56,6 +56,7 @@ function paddleWorker() {
     for (const job of jobs.values()) job.reject(new Error(e.message || 'OCR worker error'));
     jobs.clear(); paddle = null;
   };
+  if (held) paddle.postMessage({ hold: true });
   return paddle;
 }
 function recognizePaddle(blob, onProgress) {
@@ -72,6 +73,13 @@ export function warmUp() {
   const id = ++seq;
   jobs.set(id, { resolve: () => {}, reject: () => {}, onProgress: () => {} });
   paddleWorker().postMessage({ id, warm: true });
+}
+
+// 撮影した写真の補正中は、PDF用の読み取りを止めておく（true で止める、false で再開）
+export function holdReading(on) {
+  if (held === on) return;
+  held = on;
+  if (paddle) paddle.postMessage({ hold: on });
 }
 
 // 写真の中の文字の行（両端の点と太さ、割合）。使えない端末では null。
