@@ -276,10 +276,13 @@ let dest = null;
 function openDest(kind) {
   dest = { kind, folder: currentDoc()?.folderId ?? null };
   if (!folderName(dest.folder)) dest.folder = null;
-  $('#dest-title').textContent = kind === 'move' ? '文書をフォルダに移す' : '保存先を選ぶ';
+  $('#dest-title').textContent = { move: '文書をフォルダに移す', pages: '選んだページを移す' }[kind] || '保存先を選ぶ';
   $('#dest-note').textContent = kind === 'move'
     ? `「${currentDoc().name}」を入れるフォルダを選んでください。`
-    : 'これから撮るページの保存先です。撮影の途中でも切り替えられます。';
+    : kind === 'pages'
+      ? `選んだ ${selected.size} 枚を移す先です。フォルダを選んでから、入れる文書（または新しい文書）を選んでください。`
+      : 'これから撮るページの保存先です。撮影の途中でも切り替えられます。';
+  $('#dest-docs-label').textContent = kind === 'pages' ? '文書（選んだページはこの文書の最後に入ります）' : '文書（ここに撮影したページが入ります）';
   $('#dest-docs-area').hidden = kind === 'move';
   drawDest();
   $('#dest-dialog').showModal();
@@ -312,6 +315,7 @@ function drawDest() {
   );
   if (dest.kind === 'move') return;
   const choose = async id => {
+    if (dest.kind === 'pages') { await movePagesTo(id); return; }
     docId = id;
     // 撮影画面で選んだ保存先を、ホーム画面の表示にも合わせる
     if (folderView !== 'all') folderView = dest.folder ?? 'none';
@@ -320,10 +324,11 @@ function drawDest() {
     syncCameraBar();
     $('#camera-status').textContent = `「${destLabel(currentDoc())}」に保存します`;
   };
-  const list = docs.filter(d => (dest.folder == null ? !folderName(d.folderId) : d.folderId === dest.folder)).reverse();
+  // ページを移すときは、今の文書は行き先に出さない
+  const list = docs.filter(d => (dest.folder == null ? !folderName(d.folderId) : d.folderId === dest.folder) && !(dest.kind === 'pages' && d.id === docId)).reverse();
   $('#dest-docs').replaceChildren(
     item('＋ 新しい文書', false, async () => { const id = await newDocIn(dest.folder); if (id != null) await choose(id); }, 'add'),
-    ...list.map(d => item(d.name, d.id === docId, () => choose(d.id))),
+    ...list.map(d => item(d.name, dest.kind !== 'pages' && d.id === docId, () => choose(d.id))),
   );
 }
 
@@ -500,6 +505,8 @@ function showSelection() {
   $('#sel-rotate').disabled = !usable.length;
   $('#sel-settings').disabled = !usable.length;
   $('#sel-copy').disabled = !usable.length;
+  $('#sel-copy').textContent = copyLabel();
+  $('#sel-move').disabled = !list.length;
   // 補正中のページも並べ替えられる（補正が終わっても、並べ替えた順番は保たれる）
   const first = pages.findIndex(p => selected.has(p.id)), last = pages.length - 1 - [...pages].reverse().findIndex(p => selected.has(p.id));
   $('#sel-up').disabled = !list.length || first <= 0 || list.length === pages.length;
@@ -689,28 +696,96 @@ async function copyImage(blob) {
     return true;
   } catch { return false; }
 }
-$('#sel-copy').onclick = async () => {
+// 押しても何も起きないことがあった原因（v38で修正）:
+// ・1枚のときは先にクリップボードへのコピーを試し、失敗してから共有画面を出していた。スマホの Chrome では
+//   コピーに失敗するまで（PNGへの変換に）時間がかかり、その間に「押した操作」の期限が切れて共有画面も出せなかった
+// ・Chrome の共有画面に一度に渡せる画像は10枚まで。それより多いと断られるのに、失敗を黙って捨てていた
+// そこでスマホでは待たずにすぐ共有画面を出し（Claude を選べる）、10枚ずつ送る。失敗したときは理由を表示する
+const SHARE_MAX = 10;
+const touchDevice = matchMedia('(pointer: coarse)').matches;
+let shareNext = null; // 続きを送るとき: { key: 選んだページ, start: 次に送る位置 }
+const selectionKey = () => selectedPages().filter(ready).map(p => p.id).join(',');
+function copyLabel() {
+  const total = selectedPages().filter(ready).length;
+  if (shareNext && shareNext.key === selectionKey()) return `続き ${shareNext.start + 1}〜${Math.min(total, shareNext.start + SHARE_MAX)}枚`;
+  shareNext = null;
+  return 'コピー・送る';
+}
+function pageFile(p) {
+  const base = (currentDoc()?.name || 'scan').replace(/[\\/:*?"<>|\s]/g, '_');
+  const n = pages.indexOf(p) + 1;
+  const png = (p.blob.type || '').includes('png');
+  return new File([p.blob], `${base}-p${n}.${png ? 'png' : 'jpg'}`, { type: png ? 'image/png' : 'image/jpeg' });
+}
+const canShareFiles = files => { try { return !!navigator.share && !!navigator.canShare?.({ files }); } catch { return false; } };
+function shareFiles(list, start) {
+  const key = selectionKey();
+  const chunk = list.slice(start, start + SHARE_MAX).map(pageFile);
+  // await を挟まずに呼ぶ（押した操作のうちに呼ばないと、共有画面が出ない）
+  navigator.share({ files: chunk }).then(() => {
+    const next = start + chunk.length;
+    if (next < list.length) {
+      shareNext = { key, start: next };
+      toast(`${next}枚まで送りました。続きはもう一度ボタンを押してください（一度に送れるのは${SHARE_MAX}枚まで）`);
+    } else {
+      shareNext = null;
+      if (list.length > SHARE_MAX) toast(`${list.length}枚すべて送りました`);
+    }
+    showSelection();
+  }).catch(e => {
+    if (e?.name === 'AbortError') return; // 共有画面を閉じただけ
+    toast(`送れませんでした（${e?.name || e}）。枚数を減らすか、もう一度試してください`);
+  });
+}
+$('#sel-copy').onclick = () => {
   const list = selectedPages().filter(ready);
   if (!list.length) return;
-  const base = (currentDoc()?.name || 'scan').replace(/[\\/:*?"<>|]/g, '_');
-  const files = list.map((p, i) => {
-    const n = pages.indexOf(p) + 1;
-    const ext = (p.blob.type || '').includes('png') ? 'png' : 'jpg';
-    return new File([p.blob], `${base}-p${n}.${ext}`, { type: p.blob.type || 'image/jpeg' });
-  });
-  if (list.length === 1 && await copyImage(list[0].blob)) {
-    $('#select-count').textContent = 'コピーしました。貼りたい所で長押し→貼り付け';
-    setTimeout(showSelection, 3500);
+  const start = shareNext && shareNext.key === selectionKey() ? shareNext.start : 0;
+  // スマホ、または複数枚: 共有画面で渡す先（Claude など）を選ぶ
+  if ((touchDevice || list.length > 1) && canShareFiles([pageFile(list[0])])) { shareFiles(list, start); return; }
+  // パソコン（1枚）: クリップボードにコピーして、貼り付けで使う
+  if (list.length === 1) {
+    copyImage(list[0].blob).then(ok => {
+      if (ok) toast('コピーしました。貼りたい所で貼り付けてください');
+      else toast('このブラウザーでは画像をコピーできませんでした');
+    });
     return;
   }
-  if (navigator.canShare && navigator.canShare({ files })) {
-    try { await navigator.share({ files }); } catch {}
-    return;
-  }
-  alert(list.length > 1
-    ? 'このブラウザーでは複数の画像をまとめて渡せません。1枚ずつ選んでコピーしてください。'
-    : 'このブラウザーでは画像をコピーできませんでした。');
+  toast('このブラウザーでは複数の画像をまとめて渡せません。1枚ずつ選んでコピーしてください');
 };
+
+// 画面下に短いお知らせを出す
+let toastTimer = null;
+function toast(text, ms = 4000) {
+  const el = $('#toast');
+  el.textContent = text;
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.hidden = true; }, ms);
+}
+
+// ---------- 選んだページを別のフォルダ・文書へ移す ----------
+$('#sel-move').onclick = () => openDest('pages');
+async function movePagesTo(targetId) {
+  const list = selectedPages();
+  if (!list.length || targetId === docId) return;
+  // 移す先の文書の最後に、今の順番のまま足す
+  const there = await db.pagesOf(targetId);
+  let last = there.reduce((m, p) => Math.max(m, p.created), Date.now());
+  for (const p of list) {
+    const now = await db.getPage(p.id); // 補正中でも、保存されている最新の内容に行き先だけ書き込む
+    if (!now) continue;
+    now.docId = targetId;
+    now.created = last = last + 1;
+    now.moved = true;
+    await db.putPage(now);
+  }
+  const doc = (await db.allDocs()).find(d => d.id === targetId);
+  endSelect();
+  $('#dest-dialog').close();
+  await refresh();
+  toast(`${list.length}枚を「${destLabel(doc)}」に移しました`);
+}
 
 $('#sel-delete').onclick = async () => {
   const list = selectedPages();
