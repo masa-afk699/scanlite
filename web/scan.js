@@ -724,7 +724,7 @@ function flattenFine(d, W, H) {
 }
 
 // 紙を白・文字の芯を黒にする直線の濃度補正。曲線をかけないので、文字が太らず輪郭もなめらかなまま
-function documentTone(d, Y, W, H) {
+function documentTone(d, Y, W, H, fill = null) {
   const hist = new Uint32Array(256);
   for (let p = 0; p < Y.length; p += 3) hist[Y[p]]++;
   const total = hist.reduce((a, b) => a + b, 0);
@@ -749,7 +749,14 @@ function documentTone(d, Y, W, H) {
   const lut = new Uint8ClampedArray(256);
   // 芯はほぼ黒に、中間調は少し濃く（小さい文字やかすれた文字も読みやすく）
   for (let v = 0; v < 256; v++) { const t = Math.min(1, Math.max(0, (v - black) * k / 255)); lut[v] = 8 + 247 * Math.pow(t, 1.15); }
-  for (let i = 0; i < d.length; i += 4) { d[i] = lut[d[i]]; d[i + 1] = lut[d[i + 1]]; d[i + 2] = lut[d[i + 2]]; }
+  for (let p = 0, i = 0; i < d.length; p++, i += 4) {
+    if (fill && fill[p]) {
+      // 見出しの帯・図の塗り（べた塗り）は明るくしない。グラデーションの薄い側が白く飛んで、帯が途中で
+      // 消えたように見えるので。紙の黄ばみ・照明の色が塗りの中で強まった色みも半分に抑える
+      const r = d[i], g = d[i + 1], b = d[i + 2], yy = (r * 77 + g * 150 + b * 29) >> 8;
+      for (let c = 0; c < 3; c++) { const v = (d[i + c] + yy) / 2; d[i + c] = Math.min(lut[v | 0], v); }
+    } else { d[i] = lut[d[i]]; d[i + 1] = lut[d[i + 1]]; d[i + 2] = lut[d[i + 2]]; }
+  }
 }
 
 // ---------- 光の反射（白飛び）で薄くなった文字を戻す ----------
@@ -985,7 +992,7 @@ function cleanDocument(d, W, H, { binarize, fine = false }) {
       const dv = 0.9 * (Y[p] - S[p]) + 0.7 * k * wide;
       if (dv) { d[i] += dv; d[i + 1] += dv; d[i + 2] += dv; }
     }
-    documentTone(d, Y, W, H);
+    documentTone(d, Y, W, H, fill);
   }
   // 点状のゴミ（文字にしては小さすぎる暗い点）を消す
   const Y2 = luma(d, W, H), dark = new Uint8Array(W * H);
@@ -1952,6 +1959,14 @@ export function levelRows(canvas) {
     if (v.length >= 4 && Math.abs(g[s * NB + b] - v[v.length >> 1]) > Math.max(1.2, m * 0.25)) cf[s * NB + b] = -1;
   }
   for (let i = 0; i < cf.length; i++) if (cf[i] < 0) cf[i] = 0;
+  // 横の帯で測れた所が3割に満たない高さ（図・写真だけの所、余白）は使わない。図の線どうしの見かけのずれで、
+  // 枠や図がゆがむので。そうした高さは、いちばん近い行のある高さのずれをそのまま使う
+  const bandOk = new Uint8Array(NB);
+  for (let b = 0; b < NB; b++) {
+    let n = 0; for (let s = 0; s < NS - 1; s++) if (cf[s * NB + b] > 0) n++;
+    if (n >= (NS - 1) * 0.3) bandOk[b] = 1; else for (let s = 0; s < NS - 1; s++) cf[s * NB + b] = 0;
+  }
+  if (!bandOk.some(v => v)) return canvas;
   // 確かさで重みをつけてならし、測れなかった所を周りから埋める
   let gs = Float32Array.from(g), ws = Float32Array.from(cf);
   for (let it = 0; it < 4; it++) {
@@ -1966,6 +1981,11 @@ export function levelRows(canvas) {
     }
     // 測れた所は元の値も残す（ならしすぎて急な曲がりを消さない）
     for (let i = 0; i < gs.length; i++) { const c = cf[i]; gs[i] = c > 0 ? (g[i] * c + g2[i] * 0.5 * c + g2[i] * 0.05) / (1.5 * c + 0.05) : g2[i]; ws[i] = Math.max(c, w2[i]); }
+  }
+  for (let b = 0; b < NB; b++) {
+    if (bandOk[b]) continue;
+    let nb = -1; for (let dd = 1; dd < NB && nb < 0; dd++) { if (b - dd >= 0 && bandOk[b - dd]) nb = b - dd; else if (b + dd < NB && bandOk[b + dd]) nb = b + dd; }
+    for (let s = 0; s < NS - 1; s++) gs[s * NB + b] = gs[s * NB + nb];
   }
   // 横につないで、各帯のずれ（中央の帯を基準）にする
   const off = new Float32Array(NS * NB), mid = NS >> 1;
@@ -2094,8 +2114,17 @@ export function clearEdges(canvas, protect = null) {
   if (white < w * h * 0.5) return; // 紙の白が少ない（写真など）は触らない
   const deep = 0.09, band = 0.03, kill = new Uint8Array(w * h);
   let any = false;
-  const sweep = (mask, near, keep = null, bandKeep = keep) => {
+  // stick: 消さずに残る濃い印刷（見出しの帯など）に接するかたまりは、その帯の薄い側（グラデーション）なので残す
+  const sweep = (mask, near, keep = null, bandKeep = keep, stick = null) => {
     for (const c of components(mask, w, h)) {
+      if (stick) {
+        let touch = 0;
+        for (const p of c.px) {
+          const x = p % w;
+          if ((x > 0 && stick[p - 1]) || (x < w - 1 && stick[p + 1]) || (p >= w && stick[p - w]) || (p + w < w * h && stick[p + w])) touch++;
+        }
+        if (touch >= Math.max(4, Math.sqrt(c.px.length) * 0.5)) continue;
+      }
       let mn = 1, mx = 0;
       for (const p of c.px) {
         const x = p % w, y = (p - x) / w, dp = Math.min((x + 0.5) / w, (w - x - 0.5) / w, (y + 0.5) / h, (h - y - 0.5) / h);
@@ -2112,6 +2141,20 @@ export function clearEdges(canvas, protect = null) {
         continue;
       }
       if (mn > near) continue;
+      // 端に接する長さにくらべて、ページの奥へ3倍以上のびているものは、端まで届いた見出しの帯（印刷）。
+      // 机・影・のどの奥は端にそって広がる
+      {
+        // 端に接する: 端から near の幅の中にかかる（細い白い隙間をはさんで端に並ぶものも含める）
+        const rows = new Set(), cols = new Set(), ex = Math.max(1, Math.round(near * w)), ey = Math.max(1, Math.round(near * h));
+        let x0 = w, x1 = 0, y0 = h, y1 = 0;
+        for (const p of c.px) {
+          const x = p % w, y = (p - x) / w;
+          if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+          if (x <= ex || x >= w - 1 - ex) rows.add(y); if (y <= ey || y >= h - 1 - ey) cols.add(x);
+        }
+        const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+        if ((rows.size && !cols.size && bw > 3 * rows.size && bw > w * 0.08) || (cols.size && !rows.size && bh > 3 * cols.size && bh > h * 0.08)) continue;
+      }
       // 正確に切り出したページでは、小さなかたまり（ページ番号など）も残す
       // （ただし、端から2%以内におさまる切れ端は、紙の外の机や影の残り。ページ番号はもっと内側にある）
       if (keep && ((c.px.length < w * h * 0.001 && mx > 0.02) || c.px.some(p => keep[p]))) continue;
@@ -2144,7 +2187,14 @@ export function clearEdges(canvas, protect = null) {
     const g = Math.max(x > 0 ? Math.abs(v - val(p - 1)) : 0, x < w - 1 ? Math.abs(v - val(p + 1)) : 0, y > 0 ? Math.abs(v - val(p - w)) : 0, y < h - 1 ? Math.abs(v - val(p + w)) : 0);
     if (g > 26) gray[p] = 0;
   }
-  sweep(gray, 0.006, null, keep);
+  // 残る濃い印刷: 端の近くだけにおさまらない大きな濃いかたまり（帯・図）
+  const solid = new Uint8Array(w * h);
+  for (const c of components(dark, w, h)) {
+    if (c.px.length < w * h * 0.002 || c.px.some(p => kill[p])) continue;
+    for (const p of c.px) solid[p] = 1;
+  }
+  // 帯の濃い側と薄い側の間は、明るさが急に変わる所として切れているので、少しふくらませて接しているとみなす
+  sweep(gray, 0.006, null, keep, morph(solid, w, h, 2, true));
   if (!any) return;
   // 縁のぼけた分まで消えるよう、1画素ふくらませる
   const grown = morph(kill, w, h, 1, true);
