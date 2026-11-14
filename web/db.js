@@ -13,26 +13,66 @@ const dbPromise = new Promise((resolve, reject) => {
   req.onerror = () => reject(req.error);
 });
 
+// 書き込みは、端末に保存し終わった（トランザクションが完了した）ところで成功とする。
+// 容量不足は書き込みの最後に分かることがあり、以前はその失敗を見落として「保存した」ことにしていた
 async function run(store, kind, fn) {
   const db = await dbPromise;
   return new Promise((resolve, reject) => {
-    const r = fn(db.transaction(store, kind).objectStore(store));
-    r.onsuccess = () => resolve(r.result);
+    const tx = db.transaction(store, kind), r = fn(tx.objectStore(store));
+    let result;
+    r.onsuccess = () => { result = r.result; if (kind === 'readonly') resolve(result); };
     r.onerror = () => reject(r.error);
+    tx.oncomplete = () => resolve(result);
+    tx.onabort = () => reject(tx.error || r.error || new DOMException('保存できませんでした', 'AbortError'));
   });
 }
+// 端末の保存領域がいっぱいで保存できなかったか
+export const isStorageFull = e => !!e && (e.name === 'QuotaExceededError' || /quota|space|disk/i.test(String(e.message || '')));
 
 const byOrder = (a, b) => (a.created - b.created) || (a.id - b.id);
 
-const everyPage = async () => (await run('pages', 'readonly', s => s.getAll())).sort(byOrder);
+// ページの記録は起動時に1回だけ読み、以後は手元の写しを使う（数百ページあると、毎回すべて読み直すだけで
+// 1秒近くかかり、一覧の表示や削除のたびに待たされていた）。書き込みは端末に保存できてから写しにも反映する。
+// 同じアプリを別の画面（タブ）でも開いているときは、書き込みを知らせ合って写しを読み直す
+let cache = null, loading = null;
+const channel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('scanlite-pages') : null;
+if (channel) channel.onmessage = () => { cache = null; loading = null; };
+const changed = () => channel?.postMessage(1);
+function pageMap() {
+  if (cache) return Promise.resolve(cache);
+  if (!loading) {
+    const job = loading = run('pages', 'readonly', s => s.getAll()).then(list => {
+      if (loading !== job) return pageMap(); // 読んでいる間に別の画面で変わった
+      cache = new Map(list.map(p => [p.id, p]));
+      return cache;
+    }).finally(() => { if (loading === job) loading = null; });
+  }
+  return loading;
+}
+const copy = p => (p ? { ...p } : p);
+const everyPage = async () => [...(await pageMap()).values()].map(copy).sort(byOrder);
 // ゴミ箱に入れたページ（trashed に入れた日時を持つ）は、ふだんの一覧や処理には出さない
 export const allPages = async () => (await everyPage()).filter(p => !p.trashed);
 export const trashedPages = async () => (await everyPage()).filter(p => p.trashed).sort((a, b) => b.trashed - a.trashed || byOrder(a, b));
 export const pagesOf = async docId => (await allPages()).filter(p => p.docId === docId);
-export const getPage = id => run('pages', 'readonly', s => s.get(id));
-export const putPage = p => run('pages', 'readwrite', s => s.put(p));
-export const addPage = p => run('pages', 'readwrite', s => s.add(p));
-export const removePage = id => run('pages', 'readwrite', s => s.delete(id));
+export const getPage = async id => copy((await pageMap()).get(id));
+export async function putPage(p) {
+  const map = await pageMap();
+  const id = await run('pages', 'readwrite', s => s.put(p));
+  map.set(id, { ...p, id }); changed();
+  return id;
+}
+export async function addPage(p) {
+  const map = await pageMap();
+  const id = await run('pages', 'readwrite', s => s.add(p));
+  map.set(id, { ...p, id }); changed();
+  return id;
+}
+export async function removePage(id) {
+  const map = await pageMap();
+  await run('pages', 'readwrite', s => s.delete(id));
+  map.delete(id); changed();
+}
 
 export const allDocs = async () => (await run('docs', 'readonly', s => s.getAll())).sort(byOrder);
 export const putDoc = d => run('docs', 'readwrite', s => s.put(d));

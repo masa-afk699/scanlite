@@ -139,7 +139,9 @@ async function ensureLines(p, blob = p.original) {
 }
 
 const $ = s => document.querySelector(s);
-let docs = [], docId = null, pages = [], thumbUrls = [];
+let docs = [], docId = null, pages = [];
+// 一覧のカードを覚えておき、変わっていないページは作り直さない（数百ページの文書でも重くならないように）
+let cardCache = new Map();
 
 // ---------- ちょっとした設定の記憶（この端末のブラウザー内だけ） ----------
 const prefs = {
@@ -435,6 +437,52 @@ function drawDest() {
 // ---------- ページ一覧 ----------
 const ready = p => !p.waiting && !p.failed;
 
+// 一覧のページ1枚分のカード
+function makeCard(p, index, snippet) {
+  const card = document.createElement('article');
+  let url = null;
+  card.className = 'page-card';
+  card.dataset.id = p.id;
+  const check = document.createElement('span');
+  check.className = 'page-check';
+  check.setAttribute('aria-hidden', 'true');
+  const label = document.createElement('div');
+  label.className = 'page-meta';
+  label.textContent = `${index + 1}` + (p.half ? (p.half === 'right' ? '　右' : '　左') : '') + (p.ocr ? '　文字✓' : '') + (ready(p) ? '　' + (FILTERS[p.filter || 'none'] || '') : '');
+  if (p.blurry && ready(p)) {
+    // ぶれ・ピンぼけで文字がかすれそうなページには印を付ける（押すと拡大して「撮り直す」を選べる）
+    const warn = document.createElement('span');
+    warn.className = 'blur-badge';
+    warn.textContent = 'ぼけ';
+    warn.title = 'ぶれ・ピンぼけで文字がかすれているかもしれません。撮り直しをおすすめします';
+    card.append(warn);
+  }
+  if (!ready(p)) {
+    const ph = document.createElement('div');
+    ph.className = 'page-placeholder';
+    ph.textContent = p.failed ? '補正できませんでした（タップでやり直す・長押しで削除）' : '補正待ち…';
+    card.append(ph, label, check);
+  } else {
+    const img = document.createElement('img');
+    url = URL.createObjectURL(p.thumb || p.blob);
+    img.src = url;
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    img.draggable = false;
+    img.alt = `${index + 1}ページ目`;
+    card.append(img, label, check);
+  }
+  if (snippet) {
+    const sn = document.createElement('p');
+    sn.className = 'page-snippet';
+    const mark = document.createElement('mark'); mark.textContent = snippet.hit;
+    sn.append('…' + snippet.before, mark, snippet.after + '…');
+    sn.dataset.text = '1';
+    card.append(sn);
+  }
+  return { card, url };
+}
+
 async function refresh() {
   await loadDocs();
   showScreen();
@@ -446,19 +494,17 @@ async function refresh() {
     return;
   }
   pages = await db.pagesOf(docId);
-  thumbUrls.forEach(u => URL.revokeObjectURL(u));
-  thumbUrls = [];
   const done = pages.filter(ready).length;
   $('#count').textContent = `${done} ページ` + (done < pages.length ? `（処理中 ${pages.length - done}）` : '');
   $('#pdf-button').disabled = !done;
   $('#batch-button').disabled = !done;
   const root = $('#pages');
-  const frag = document.createDocumentFragment();
   // 文字で探す: 読み取り済みの文字に含まれるページだけを出す
   const query = $('#search').value.trim();
   const norm = t => (t || '').replace(/\s+/g, '').toLowerCase();
   const q = norm(query);
   let hits = 0, unread = 0;
+  const fresh = new Map(), cards = [];
   pages.forEach((p, index) => {
     let snippet = null;
     if (q) {
@@ -469,55 +515,30 @@ async function refresh() {
       hits++;
       snippet = { before: flat.slice(Math.max(0, at - 20), at), hit: flat.slice(at, at + q.length), after: flat.slice(at + q.length, at + q.length + 40) };
     }
-    const card = document.createElement('article');
-    card.className = 'page-card';
-    card.dataset.id = p.id;
+    const blobKey = ready(p) ? (p.rev || 0) + ':' + (p.thumb || p.blob)?.size : '';
+    const sig = [index, p.half, !!p.ocr, p.filter, ready(p), !!p.failed, !!p.blurry, blobKey, snippet && JSON.stringify(snippet)].join('|');
+    const old = cardCache.get(p.id);
+    let card;
+    if (old && old.sig === sig) { card = old.card; fresh.set(p.id, old); }
+    else {
+      if (old?.url) URL.revokeObjectURL(old.url);
+      const made = makeCard(p, index, snippet);
+      card = made.card;
+      fresh.set(p.id, { sig, card, url: made.url });
+    }
     card.classList.toggle('selected', selected.has(p.id));
-    const check = document.createElement('span');
-    check.className = 'page-check';
-    check.setAttribute('aria-hidden', 'true');
-    const label = document.createElement('div');
-    label.className = 'page-meta';
-    label.textContent = `${index + 1}` + (p.half ? (p.half === 'right' ? '　右' : '　左') : '') + (p.ocr ? '　文字✓' : '') + (ready(p) ? '　' + (FILTERS[p.filter || 'none'] || '') : '');
-    if (p.blurry && ready(p)) {
-      // ぶれ・ピンぼけで文字がかすれそうなページには印を付ける（押すと拡大して「撮り直す」を選べる）
-      const warn = document.createElement('span');
-      warn.className = 'blur-badge';
-      warn.textContent = 'ぼけ';
-      warn.title = 'ぶれ・ピンぼけで文字がかすれているかもしれません。撮り直しをおすすめします';
-      card.append(warn);
-    }
-    if (!ready(p)) {
-      const ph = document.createElement('div');
-      ph.className = 'page-placeholder';
-      ph.textContent = p.failed ? '読み込めませんでした（長押しで選んで削除）' : '補正待ち…';
-      card.append(ph, label, check);
-    } else {
-      const img = document.createElement('img');
-      const url = URL.createObjectURL(p.thumb || p.blob);
-      thumbUrls.push(url);
-      img.src = url;
-      img.loading = 'lazy';
-      img.decoding = 'async';
-      img.draggable = false;
-      img.alt = `${index + 1}ページ目`;
-      card.append(img, label, check);
-    }
-    if (snippet) {
-      const sn = document.createElement('p');
-      sn.className = 'page-snippet';
-      const mark = document.createElement('mark'); mark.textContent = snippet.hit;
-      sn.append('…' + snippet.before, mark, snippet.after + '…');
-      sn.dataset.text = '1';
-      card.append(sn);
-    }
-    frag.append(card);
+    cards.push(card);
   });
   const note = $('#search-note');
   note.hidden = !q;
   if (q) note.textContent = `「${query}」が見つかったページ: ${hits}` + (unread ? `　（文字を読み取っていない ${unread} ページは対象外です。「まとめて設定」でOCRを「する」にすると探せます）` : '');
   $('#text-export').disabled = !done;
-  root.replaceChildren(frag);
+  // 一覧から消えたページの画像を手放す
+  for (const [id, c] of cardCache) if (!fresh.has(id) && c.url) URL.revokeObjectURL(c.url);
+  cardCache = fresh;
+  // 並びが変わっていなければ、画面の要素はそのまま（スクロール位置や読み込み済みの画像も保つ）
+  const now = root.children;
+  if (now.length !== cards.length || cards.some((c, i) => c !== now[i])) root.replaceChildren(...cards);
   // 消えたページは選択からも外す
   for (const id of [...selected]) if (!pages.some(p => p.id === id)) selected.delete(id);
   $('#pages-hint').hidden = !pages.length || selecting();
@@ -560,7 +581,8 @@ async function turnBy(page, deg) {
   await db.putPage(page);
 }
 
-async function reprocess(page, change, { quiet = false } = {}) {
+async function reprocess(page, change, opts) { return inBackground(() => reprocessNow(page, change, opts)); }
+async function reprocessNow(page, change, { quiet = false } = {}) {
   if (!page.original) page.original = page.blob;
   Object.assign(page, change);
   setBusy('画像を補正しています…');
@@ -672,6 +694,7 @@ function showSelection() {
     if (!page) return;
     if (selectMode) { toggleSelect(id); return; }
     if (ready(page)) openViewer(id, e.target.closest('.page-snippet') ? 'text' : 'after');
+    else if (page.failed) retryPages([id]);
   });
 
   function beginDrag(e) {
@@ -999,6 +1022,7 @@ $('#trash-clear').onclick = async () => {
   await drawTrash();
   await showTrashButton();
   showStorage();
+  processWaiting(); // 空きができたので、止めていた補正の続きを行う
 };
 $('#trash-dialog').addEventListener('close', () => { trashUrls.forEach(u => URL.revokeObjectURL(u)); trashUrls = []; });
 
@@ -1022,6 +1046,13 @@ $('#sel-rotate').onclick = async () => {
   runBackgroundOcr();
 };
 
+// 裏で進めている作業の数（新しい版への自動の切り替えは、これが0になるまで待つ）
+let bgWork = 0;
+async function inBackground(fn) {
+  bgWork++;
+  try { return await fn(); } finally { bgWork--; }
+}
+
 // ワーカーの数だけ同時に処理する
 async function eachInLanes(list, fn, text) {
   let next = 0, done = 0;
@@ -1034,7 +1065,7 @@ async function eachInLanes(list, fn, text) {
     }
   };
   if (text) setBusy(`${text}… 0/${list.length}`);
-  try { await Promise.all(Array.from({ length: scanBroken ? 1 : SCAN_POOL }, lane)); }
+  try { await inBackground(() => Promise.all(Array.from({ length: scanBroken ? 1 : SCAN_POOL }, lane))); }
   finally { showPending(); }
 }
 
@@ -1049,21 +1080,47 @@ async function enqueue(blobs, extra = {}) {
   for (const blob of blobs) {
     if (blob.type && !blob.type.startsWith('image/')) continue;
     const created = Date.now() + (seq++ % 1000) / 1000;
-    for (let i = 0; i < halves.length; i++) {
-      await db.addPage({
-        original: blob, ...defaultsFor(mode), half: halves[i], wantOcr: autoOcr(),
-        mode, docId: target, created: created + i / 2000, waiting: true,
-        capture: created, autoRotate: mode !== 'screen', tilt: extra.tilt ?? null,
-        // 撮影画面で測ったぼけの目安（測っていれば、あとで測り直さない）
-        ...(extra.sharp != null ? { sharp: extra.sharp, blurry: extra.sharp < BLURRY_BELOW } : {}),
-      });
+    const added = [];
+    try {
+      for (let i = 0; i < halves.length; i++) {
+        added.push(await db.addPage({
+          original: blob, ...defaultsFor(mode), half: halves[i], wantOcr: autoOcr(),
+          mode, docId: target, created: created + i / 2000, waiting: true,
+          capture: created, autoRotate: mode !== 'screen', tilt: extra.tilt ?? null,
+          // 撮影画面で測ったぼけの目安（測っていれば、あとで測り直さない）
+          ...(extra.sharp != null ? { sharp: extra.sharp, blurry: extra.sharp < BLURRY_BELOW } : {}),
+        }));
+      }
+    } catch (e) {
+      // 見開きの片側だけ残らないよう、保存できた側も消す
+      for (const id of added) await db.removePage(id).catch(() => {});
+      // 保存できなかった（容量不足など）。黙って捨てずに知らせ、撮影画面にも失敗を返す
+      console.error(e);
+      storageProblem(e);
+      scheduleRefresh();
+      processWaiting();
+      return false;
     }
     pending++;
     showPending();
   }
   scheduleRefresh();
   processWaiting();
+  return true;
 }
+
+// 保存できなかったときのお知らせ（容量不足はとくに、何をすればよいかを出す）
+let storageToastAt = 0;
+function storageProblem(e) {
+  if (Date.now() - storageToastAt < 3000) return;
+  storageToastAt = Date.now();
+  toast(db.isStorageFull(e)
+    ? '端末の空き容量が足りず、保存できませんでした。不要なページを削除してゴミ箱を空にするか、スマホの空き容量を増やしてください'
+    : '保存できませんでした。アプリを開き直してから、もう一度試してください', 12000);
+  showStorage();
+}
+// どこで起きても、容量不足で保存できなかったことは必ず知らせる
+window.addEventListener('unhandledrejection', e => { if (db.isStorageFull(e.reason)) storageProblem(e.reason); });
 
 // 元写真を保存用の大きさにする（同じ写真から作る左右のページで1回だけ）
 const sizedCache = new Map();
@@ -1106,7 +1163,33 @@ function blurNotice() {
   blurTimer = setTimeout(() => toast('ぼけている写真がありました。「ぼけ」の印のページは撮り直すと文字がきれいになります', 6000), 800);
 }
 
+// 補正に失敗したページを、残っている元の写真からもう一度補正する
+async function retryPages(ids) {
+  let n = 0;
+  for (const id of ids) {
+    const p = await db.getPage(id);
+    if (!p || !p.failed || !p.original) continue;
+    p.failed = false; p.waiting = true; p.tries = 0;
+    await db.putPage(p);
+    n++;
+  }
+  if (!n) { toast('元の写真が残っていないため、やり直せません。削除して撮り直してください'); return; }
+  toast(`${n}枚をもう一度補正します`, 2500);
+  await refresh();
+  processWaiting();
+}
+
 let working = false;
+// 補正を始める前に試した回数を保存しておく。補正の途中でアプリごと落ちる写真（メモリ不足など）があっても、
+// 起動のたびに同じ写真で落ち続けないよう、3回落ちたら補正せず「補正できませんでした」にする
+const MAX_TRIES = 3;
+async function markTry(p) {
+  const now = await db.getPage(p.id);
+  if (!now) return;
+  now.tries = (now.tries || 0) + 1;
+  p.tries = now.tries;
+  await db.putPage(now);
+}
 async function processOne(p, ready = preparePage(p), run = () => processImage(p.original, optionsOf(p))) {
   try {
     await ready;
@@ -1122,6 +1205,7 @@ async function processOne(p, ready = preparePage(p), run = () => processImage(p.
     p.failed = true;
   }
   p.waiting = false;
+  if (!p.failed) delete p.tries;
   // 処理中に削除されたページは保存し直さない
   const now = await db.getPage(p.id);
   if (!now) return scheduleRefresh();
@@ -1136,16 +1220,25 @@ async function processOne(p, ready = preparePage(p), run = () => processImage(p.
 async function processWaiting() {
   if (working) return;
   working = true;
+  let stopped = false;
   try {
     for (;;) {
-      const waiting = (await db.allPages()).filter(p => p.waiting);
+      const all = (await db.allPages()).filter(p => p.waiting);
+      // 前回までに補正の途中で落ちた写真は、もう補正しない（やり直しはページをタップして選べる）
+      for (const p of all.filter(p => (p.tries || 0) >= MAX_TRIES)) {
+        const now = await db.getPage(p.id);
+        if (now) { now.waiting = false; now.failed = true; await db.putPage(now); }
+      }
+      const waiting = all.filter(p => (p.tries || 0) < MAX_TRIES);
       pending = waiting.length;
       showPending();
       if (!waiting.length) break;
       // 撮った順に、ワーカーの数だけ同時に補正する
       // 見開きの左右のページ（同じ写真）は、共通の処理を1回にするため2枚まとめて補正する
       const head = waiting[0], mate = head.half && head.capture != null && waiting.find(p => p !== head && p.capture === head.capture && p.half && p.half !== head.half);
-      const batch = mate ? [head, mate] : waiting.slice(0, scanBroken ? 1 : SCAN_POOL), ready = batch.map(p => preparePage(p));
+      const batch = mate ? [head, mate] : waiting.slice(0, scanBroken ? 1 : SCAN_POOL);
+      for (const p of batch) await markTry(p);
+      const ready = batch.map(p => preparePage(p));
       // 今の写真の下準備が済んだら、補正している間に次の写真の下準備（向き・文字の行の検出）を始めておく。
       // 文字の検出は補正とは別のスレッドで動くので、その分だけ待ち時間が減る
       const next = waiting.find(p => !batch.some(b => b.id === p.id || (b.capture != null && b.capture === p.capture)));
@@ -1164,12 +1257,23 @@ async function processWaiting() {
         await Promise.all(batch.map((p, i) => processOne(p, ready[i], run(i))));
       } else await Promise.all(batch.map((p, i) => processOne(p, ready[i])));
     }
+  } catch (e) {
+    // 保存できない（容量不足など）ときは、同じ写真を繰り返し補正しないよう止めて知らせる。
+    // 補正待ちのページは残るので、空きを作ってからアプリを開き直すと続きから補正する
+    console.error(e);
+    storageProblem(e);
+    stopped = db.isStorageFull(e);
   } finally {
     working = false;
     pending = 0;
     showPending();
+    // 止めたことと、残っている枚数を出したままにする（空きを作ると続きから補正する）
+    if (stopped) {
+      const left = (await db.allPages().catch(() => [])).filter(p => p.waiting).length;
+      if (left) setBusy(`空き容量が足りないため、補正を止めています（残り ${left} 枚）。不要なページを削除してゴミ箱を空にすると続きを補正します`);
+    }
     scheduleRefresh();
-    runBackgroundOcr();
+    if (!stopped) runBackgroundOcr();
   }
 }
 
@@ -1692,6 +1796,7 @@ $('#text-export').onclick = async () => {
   const btn = $('#text-export'), list = pages.filter(ready);
   if (!list.length) return;
   btn.disabled = true;
+  bgWork++;
   try {
     let done = 0;
     const out = [];
@@ -1717,7 +1822,7 @@ $('#text-export').onclick = async () => {
   } catch (e) {
     console.error(e);
     setBusy('文字を書き出せませんでした。');
-  } finally { btn.disabled = false; }
+  } finally { btn.disabled = false; bgWork--; }
 };
 
 // ---------- 撮り直し・回転（確認画面から） ----------
@@ -1742,7 +1847,7 @@ $('#view-rotate').onclick = async () => {
   const page = await db.getPage(viewer.id);
   if (!page) return;
   setBusy('回転しています…');
-  try { await turnBy(page, 90); } finally { showPending(); }
+  try { await inBackground(() => turnBy(page, 90)); } finally { showPending(); }
   await refresh();
   runBackgroundOcr();
   showViewer('after');
@@ -1973,11 +2078,14 @@ if ('serviceWorker' in navigator) {
     if (!hadController || reloaded) return; // 初回インストール時は読み込み直さない
     reloaded = true;
     // 撮影中や確認画面を開いている間は待ってから読み込み直す
-    const go = () => { if (document.querySelector('dialog[open]')) setTimeout(go, 1500); else location.reload(); };
+    // 裏で進めている作業（補正・やり直し・回転・文字の書き出しなど）が終わるのも待つ（途中で切ると、やり直した結果が残らない）
+    const go = () => { if (document.querySelector('dialog[open]') || bgWork || editJobs.length || working || pending) setTimeout(go, 1500); else location.reload(); };
     go();
   });
   navigator.serviceWorker.register('./sw.js').then(reg => {
     reg.update().catch(() => {});
+    // 文字認識の部品を、使う前に端末に取っておく（圏外でも文字認識できるように）。通信を節約する設定のときは使うときに取る
+    if (!navigator.connection?.saveData) navigator.serviceWorker.ready.then(r => r.active?.postMessage('models')).catch(() => {});
     // アプリに戻ってきたときも更新を確認する
     document.addEventListener('visibilitychange', () => { if (!document.hidden) reg.update().catch(() => {}); });
   }).catch(() => {});
