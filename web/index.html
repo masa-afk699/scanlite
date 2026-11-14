@@ -20,13 +20,22 @@
       <span class="local-badge">端末内で処理</span>
     </header>
 
-    <section class="docbar folderbar" aria-label="フォルダ">
-      <select id="folder-select" aria-label="フォルダを選ぶ"></select>
-      <button id="folder-new" type="button">＋ フォルダ</button>
-      <button id="folder-rename" type="button" hidden>名前</button>
-      <button id="folder-delete" type="button" class="danger" hidden>削除</button>
+    <!-- 起動時の画面: フォルダを選ぶ -->
+    <section id="folder-home" class="folder-home" aria-label="フォルダ">
+      <div class="folder-home-head">
+        <h2>フォルダ</h2>
+        <button id="folder-new" class="folder-add" type="button">＋ 新しいフォルダ</button>
+      </div>
+      <div id="folder-list" class="folder-list"></div>
     </section>
-    <section class="docbar" aria-label="文書">
+
+    <!-- フォルダを開いたときの画面 -->
+    <section class="folder-head in-folder" aria-label="開いているフォルダ">
+      <button id="folder-back" class="folder-back" type="button" aria-label="フォルダ一覧へ戻る"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg>フォルダ</button>
+      <h2 id="folder-title"></h2>
+      <button id="folder-menu" class="folder-more" type="button" aria-label="フォルダの名前変更・削除">︙</button>
+    </section>
+    <section class="in-folder docbar" aria-label="文書">
       <select id="doc-select" aria-label="文書を選ぶ"></select>
       <button id="doc-new" type="button">＋ 新規</button>
       <button id="doc-rename" type="button">名前</button>
@@ -34,14 +43,14 @@
       <button id="doc-delete" type="button" class="danger">削除</button>
     </section>
 
-    <section class="controls" aria-label="スキャン設定">
+    <section class="in-folder controls" aria-label="スキャン設定">
       <div class="mode-switch" role="group" aria-label="スキャンモード">
         <button class="mode active" data-mode="book">本</button><button class="mode" data-mode="document">書類</button><button class="mode" data-mode="screen">画面</button>
       </div>
       <span id="count">0 ページ</span>
     </section>
 
-    <section class="capture-card">
+    <section class="in-folder capture-card">
       <div class="camera-mark" aria-hidden="true">▧</div>
       <h2 id="mode-title">本をスキャン</h2>
       <p id="mode-help">ページをめくって手を止めると、自動で撮影します。</p>
@@ -61,17 +70,17 @@
       <p id="busy" class="busy" hidden></p>
     </section>
 
-    <section class="actions">
+    <section class="in-folder actions">
       <button id="pdf-button" class="dark-button" disabled>PDFを作成</button>
       <button id="batch-button" class="light-button" disabled>まとめて設定</button>
     </section>
-    <section class="tools-row">
+    <section class="in-folder tools-row">
       <input id="search" type="search" placeholder="文字でページを探す" autocomplete="off" aria-label="文字でページを探す">
       <button id="text-export" type="button" disabled>文字を書き出す</button>
     </section>
-    <p id="search-note" class="search-note" hidden></p>
-    <p id="pages-hint" class="pages-hint" hidden><strong>長押し</strong>でページを選べます。そのまま指を動かすと並べ替えられます。</p>
-    <section id="pages" class="pages" aria-live="polite"></section>
+    <p id="search-note" class="search-note in-folder" hidden></p>
+    <p id="pages-hint" class="pages-hint in-folder" hidden><strong>長押し</strong>でページを選べます。そのまま指を動かすと並べ替えられます。</p>
+    <section id="pages" class="pages in-folder" aria-live="polite"></section>
     <div id="select-bar" class="select-bar" role="toolbar" aria-label="選んだページの操作" hidden>
       <div class="select-head"><strong id="select-count">0枚を選択中</strong><button id="select-all" type="button">全部選ぶ</button><button id="select-done" type="button">選択をやめる</button></div>
       <div class="select-actions">
@@ -88,12 +97,12 @@
     <p class="trash-row"><button id="trash-button" class="text-button" type="button" hidden>ゴミ箱</button></p>
     <p id="storage" class="privacy-note storage" hidden></p>
     <p class="privacy-note">写真・PDF・文字はすべてこのスマホの中だけで処理・保存します（外部に送信しません）。</p>
-    <p class="privacy-note app-version">バージョン v39（2026-11-14） <button id="force-update" type="button">最新版に更新</button></p>
+    <p class="privacy-note app-version">バージョン v40（2026-11-14） <button id="force-update" type="button">最新版に更新</button></p>
 
     <dialog id="camera-dialog" class="camera-dialog">
       <div class="camera-head">
         <form method="dialog"><button class="cam-round" aria-label="撮影を終える"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg></button></form>
-        <span class="camera-info"><span id="camera-mode">本</span><span class="version-chip">v39</span></span>
+        <span class="camera-info"><span id="camera-mode">本</span><span class="version-chip">v40</span></span>
         <span class="cam-round-spacer"></span>
       </div>
       <div class="camera-view">
@@ -186,6 +195,22 @@
         <p id="pdf-saved" class="saved" hidden></p>
         <button id="pdf-share" class="text-button" type="button" hidden>他のアプリで開く…</button>
         <p class="dialog-note">「スマホに保存」はダウンロードフォルダに保存します。共有を選んだ場合だけ、選んだアプリにPDFが渡ります。</p>
+      </div>
+    </dialog>
+
+    <dialog id="folder-dialog" class="folder-dialog">
+      <form method="dialog"><button class="close" aria-label="閉じる">×</button></form>
+      <h2 id="folder-dialog-title">フォルダ</h2>
+      <p id="folder-dialog-info" class="dialog-note"></p>
+      <div id="folder-dialog-main" class="folder-dialog-buttons">
+        <button id="fd-rename" type="button">名前を変える</button>
+        <button id="fd-delete" type="button" class="danger">フォルダを削除</button>
+      </div>
+      <div id="folder-dialog-delete" class="folder-dialog-buttons" hidden>
+        <p id="fd-delete-note" class="dialog-note"></p>
+        <button id="fd-delete-all" type="button" class="danger">中身ごと削除（ゴミ箱へ）</button>
+        <button id="fd-delete-keep" type="button">フォルダだけ削除（中身は「未分類」へ）</button>
+        <button id="fd-cancel" type="button" class="text-button">やめる</button>
       </div>
     </dialog>
 
