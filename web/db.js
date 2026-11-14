@@ -38,11 +38,11 @@ export const allDocs = async () => (await run('docs', 'readonly', s => s.getAll(
 export const putDoc = d => run('docs', 'readwrite', s => s.put(d));
 export const addDoc = d => run('docs', 'readwrite', s => s.add(d));
 // ページをゴミ箱へ移す。元の文書が消えても戻せるよう、文書の名前とフォルダも覚えておく
-export async function trashPage(id, doc) {
+export async function trashPage(id, doc, folderName = null) {
   const p = await getPage(id);
   if (!p) return;
   p.trashed = Date.now();
-  if (doc) p.trashDoc = { name: doc.name, folderId: doc.folderId ?? null };
+  if (doc) p.trashDoc = { name: doc.name, folderId: doc.folderId ?? null, folderName };
   await putPage(p);
 }
 export async function restorePage(id) {
@@ -54,7 +54,9 @@ export async function restorePage(id) {
 // 文書を消すときも、ページはゴミ箱へ移す（30日間は戻せる）
 export async function removeDoc(id) {
   const doc = (await allDocs()).find(d => d.id === id);
-  for (const p of await pagesOf(id)) await trashPage(p.id, doc);
+  // フォルダごと消したあとでも同じ名前のフォルダに戻せるよう、フォルダ名も覚える
+  const folder = doc?.folderId != null ? await run('folders', 'readonly', s => s.get(doc.folderId)) : null;
+  for (const p of await pagesOf(id)) await trashPage(p.id, doc, folder?.name ?? null);
   await run('docs', 'readwrite', s => s.delete(id));
 }
 

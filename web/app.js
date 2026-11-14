@@ -158,11 +158,14 @@ function setBusy(text) {
 const showPending = () => setBusy(pending ? `画像を補正しています…（残り ${pending} 枚）` : '');
 
 // ---------- フォルダと文書 ----------
-// フォルダは文書をまとめる入れ物。表示中のフォルダ: 'all'（すべて）/ 'none'（フォルダなし）/ フォルダのid
-let folders = [], folderView = prefs.get('folder', 'all');
+// 起動するとまずフォルダ一覧（screen = 'folders'）。フォルダを開くと、その中の文書とページの画面（screen = 'folder'）。
+// 開いているフォルダ folderView: フォルダのid / 'none'（どのフォルダにも入っていない文書 =「未分類」）
+let folders = [], screen = 'folders', folderView = null;
+const UNFILED = '未分類';
 const folderName = id => folders.find(f => f.id === id)?.name;
-const inFolder = (d, view) => view === 'all' || (view === 'none' ? !folderName(d.folderId) : d.folderId === view);
-// 文書がないフォルダを表示したときは、そのフォルダに新しい文書を1つ用意する
+const inFolder = (d, view) => (view === 'none' ? !folderName(d.folderId) : d.folderId === view);
+const viewName = view => (view === 'none' ? UNFILED : folderName(view) || '');
+// 文書がないフォルダを開いたときは、そのフォルダに新しい文書を1つ用意する（すぐ撮影・取り込みできるように）
 async function ensureDocIn(view) {
   if (docs.some(d => inFolder(d, view))) return;
   const doc = { name: defaultDocName(), created: Date.now() };
@@ -172,30 +175,18 @@ async function ensureDocIn(view) {
 }
 async function loadDocs() {
   folders = await db.allFolders();
-  if (typeof folderView === 'number' && !folderName(folderView)) folderView = 'all';
   docs = await db.allDocs();
+  if (screen !== 'folder') return;
+  if (folderView !== 'none' && !folderName(folderView)) { screen = 'folders'; folderView = null; return; }
   await ensureDocIn(folderView);
   const shown = docs.filter(d => inFolder(d, folderView));
   if (!shown.some(d => d.id === docId)) docId = prefs.get('doc', null);
   if (!shown.some(d => d.id === docId)) docId = shown[shown.length - 1].id;
   prefs.set('doc', docId);
-  prefs.set('folder', folderView);
-  const fsel = $('#folder-select');
-  fsel.replaceChildren(
-    new Option(`📁 すべて（${docs.length}）`, 'all', false, folderView === 'all'),
-    ...folders.map(f => new Option(`📁 ${f.name}（${docs.filter(d => d.folderId === f.id).length}）`, f.id, false, f.id === folderView)),
-    new Option(`📁 フォルダなし（${docs.filter(d => !folderName(d.folderId)).length}）`, 'none', false, folderView === 'none'),
-  );
-  $('#folder-rename').hidden = $('#folder-delete').hidden = typeof folderView !== 'number';
+  $('#folder-title').textContent = viewName(folderView);
+  $('#folder-menu').hidden = folderView === 'none';
   const sel = $('#doc-select');
-  const opt = d => new Option(d.name, d.id, false, d.id === docId);
-  if (folderView === 'all' && folders.length) {
-    // すべて表示のときはフォルダごとにまとめて並べる
-    const groups = [...folders.map(f => [f.name, docs.filter(d => d.folderId === f.id)]), ['フォルダなし', docs.filter(d => !folderName(d.folderId))]];
-    sel.replaceChildren(...groups.filter(([, list]) => list.length).map(([label, list]) => {
-      const g = document.createElement('optgroup'); g.label = label; g.append(...list.map(opt)); return g;
-    }));
-  } else sel.replaceChildren(...shown.map(opt));
+  sel.replaceChildren(...shown.map(d => new Option(d.name, d.id, false, d.id === docId)));
 }
 const currentDoc = () => docs.find(d => d.id === docId);
 function defaultDocName() {
@@ -217,35 +208,139 @@ async function newDocIn(folderId, ask = true) {
   return db.addDoc(doc);
 }
 
-$('#folder-select').onchange = async e => {
-  const v = e.target.value;
-  folderView = v === 'all' || v === 'none' ? v : Number(v);
-  docId = null;
+// 画面の切り替え（スマホの「戻る」でフォルダ一覧へ戻れるよう、履歴を1つ積む）
+function showScreen() {
+  const atFolders = screen === 'folders';
+  document.querySelector('.shell').classList.toggle('at-folders', atFolders);
+  $('#folder-home').hidden = !atFolders;
+}
+async function openFolder(view) {
+  if (selecting()) endSelect();
+  screen = 'folder'; folderView = view; docId = null;
+  $('#search').value = '';
+  prefs.set('folder', view);
+  try { if (!history.state?.scanliteFolder) history.pushState({ scanliteFolder: true }, ''); } catch {}
+  showScreen();
+  scrollTo(0, 0);
   await refresh();
-};
+}
+async function showFolders({ fromHistory = false } = {}) {
+  if (selecting()) endSelect({ fromHistory });
+  if (!fromHistory && history.state?.scanliteFolder) { history.back(); return; } // popstate からもう一度呼ばれる
+  screen = 'folders'; folderView = null;
+  showScreen();
+  scrollTo(0, 0);
+  await refresh();
+}
+window.addEventListener('popstate', () => {
+  if (screen === 'folder' && !history.state?.scanliteFolder && !history.state?.scanliteSelect) showFolders({ fromHistory: true });
+});
+
+// フォルダ一覧を描く。各フォルダに最新ページの小さな絵と、文書・ページの数を出す
+let folderUrls = [];
+async function drawFolders() {
+  folderUrls.forEach(u => URL.revokeObjectURL(u));
+  folderUrls = [];
+  const all = await db.allPages();
+  const pagesIn = view => { const ids = new Set(docs.filter(d => inFolder(d, view)).map(d => d.id)); return all.filter(p => ids.has(p.docId)); };
+  const card = (view, name) => {
+    const list = pagesIn(view), nDocs = docs.filter(d => inFolder(d, view)).length;
+    const row = document.createElement('div');
+    row.className = 'folder-card' + (view === 'none' ? ' unfiled' : '');
+    const open = document.createElement('button');
+    open.type = 'button'; open.className = 'folder-open';
+    open.onclick = () => openFolder(view);
+    const pic = document.createElement('span');
+    pic.className = 'folder-pic';
+    const last = [...list].reverse().find(p => p.thumb || p.blob);
+    if (last) { const u = URL.createObjectURL(last.thumb || last.blob); folderUrls.push(u); const img = new Image(); img.src = u; img.alt = ''; img.decoding = 'async'; pic.append(img); }
+    else pic.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6.5A1.5 1.5 0 014.5 5H9l2 2.5h8.5A1.5 1.5 0 0121 9v8.5a1.5 1.5 0 01-1.5 1.5h-15A1.5 1.5 0 013 17.5z"/></svg>';
+    const text = document.createElement('span');
+    text.className = 'folder-text';
+    const strong = document.createElement('strong'); strong.textContent = name;
+    const small = document.createElement('small');
+    small.textContent = list.length ? `${list.length} ページ` + (nDocs > 1 ? `・文書 ${nDocs}件` : '') : 'まだページがありません';
+    text.append(strong, small);
+    open.append(pic, text);
+    row.append(open);
+    if (view !== 'none') {
+      const more = document.createElement('button');
+      more.type = 'button'; more.className = 'folder-more'; more.textContent = '︙';
+      more.setAttribute('aria-label', `「${name}」の名前変更・削除`);
+      more.onclick = () => openFolderMenu(view);
+      row.append(more);
+    }
+    return row;
+  };
+  const items = folders.map(f => card(f.id, f.name));
+  // どのフォルダにも入っていない文書（以前のバージョンで撮ったものなど）は「未分類」にまとめて見せる
+  if (pagesIn('none').length) items.push(card('none', UNFILED));
+  if (!items.length) {
+    const p = document.createElement('p');
+    p.className = 'folder-empty';
+    p.textContent = '「＋ 新しいフォルダ」でフォルダを作り、その中で撮影・写真の取り込みをします。';
+    items.push(p);
+  }
+  $('#folder-list').replaceChildren(...items);
+}
+
 $('#folder-new').onclick = async () => {
   const id = await newFolder();
   if (id == null) return;
-  folderView = id; docId = null;
-  await refresh();
+  await openFolder(id);
 };
-$('#folder-rename').onclick = async () => {
-  const f = folders.find(x => x.id === folderView);
+$('#folder-back').onclick = () => showFolders();
+$('#folder-menu').onclick = () => openFolderMenu(folderView);
+
+// フォルダの名前変更・削除
+let menuFolder = null;
+function openFolderMenu(id) {
+  const f = folders.find(x => x.id === id);
+  if (!f) return;
+  menuFolder = f;
+  const n = docs.filter(d => d.folderId === f.id).length;
+  $('#folder-dialog-title').textContent = `📁 ${f.name}`;
+  $('#folder-dialog-info').textContent = `文書 ${n}件`;
+  $('#folder-dialog-main').hidden = false;
+  $('#folder-dialog-delete').hidden = true;
+  $('#folder-dialog').showModal();
+}
+$('#fd-rename').onclick = async () => {
+  const f = menuFolder;
   const name = f && prompt('フォルダの名前', f.name);
   if (!name || !name.trim()) return;
   f.name = name.trim();
   await db.putFolder(f);
+  $('#folder-dialog').close();
   await refresh();
 };
-$('#folder-delete').onclick = async () => {
-  const f = folders.find(x => x.id === folderView);
-  if (!f) return;
-  const n = docs.filter(d => d.folderId === f.id).length;
-  if (!confirm(`フォルダ「${f.name}」を削除しますか？\n中の文書（${n}件）とページは消さずに「フォルダなし」に移します。`)) return;
+$('#fd-delete').onclick = async () => {
+  const f = menuFolder;
+  const ids = new Set(docs.filter(d => d.folderId === f.id).map(d => d.id));
+  const n = (await db.allPages()).filter(p => ids.has(p.docId)).length;
+  if (!n) {
+    // 空のフォルダはそのまま消す
+    if (!confirm(`フォルダ「${f.name}」を削除しますか？`)) return;
+    await deleteFolder(f, true);
+    return;
+  }
+  $('#fd-delete-note').textContent = `「${f.name}」には ${n} ページあります。中身ごと削除すると、ページはゴミ箱に移り、30日間は戻せます。`;
+  $('#folder-dialog-main').hidden = true;
+  $('#folder-dialog-delete').hidden = false;
+};
+$('#fd-cancel').onclick = () => $('#folder-dialog').close();
+$('#fd-delete-all').onclick = () => deleteFolder(menuFolder, true);
+$('#fd-delete-keep').onclick = () => deleteFolder(menuFolder, false);
+async function deleteFolder(f, withPages) {
+  $('#folder-dialog').close();
+  const inside = docs.filter(d => d.folderId === f.id);
+  const trashed = [];
+  if (withPages) for (const d of inside) { trashed.push(...(await db.pagesOf(d.id)).map(p => p.id)); await db.removeDoc(d.id); }
   await db.removeFolder(f.id);
-  folderView = 'all';
-  await refresh();
-};
+  if (screen === 'folder' && folderView === f.id) await showFolders(); else await refresh();
+  if (trashed.length) toast(`フォルダ「${f.name}」を削除しました（ページはゴミ箱へ）`, 7000, { label: '元に戻す', run: () => restorePages(trashed) });
+  else toast(withPages ? `フォルダ「${f.name}」を削除しました` : `フォルダ「${f.name}」を削除しました。中身は「${UNFILED}」にあります`);
+}
 
 $('#doc-select').onchange = async e => { docId = Number(e.target.value); prefs.set('doc', docId); await refresh(); };
 $('#doc-new').onclick = async () => {
@@ -301,7 +396,7 @@ function drawDest() {
       if (folder == null) delete doc.folderId; else doc.folderId = folder;
       await db.putDoc(doc);
       // 移した先のフォルダを表示する（すべて表示中ならそのまま）
-      if (folderView !== 'all') folderView = folder ?? 'none';
+      folderView = folder ?? 'none';
       $('#dest-dialog').close();
       await refresh();
       return;
@@ -311,7 +406,7 @@ function drawDest() {
   };
   $('#dest-folders').replaceChildren(
     ...folders.map(f => item(f.name, dest.folder === f.id, () => pick(f.id))),
-    item('フォルダなし', dest.folder == null, () => pick(null)),
+    item(UNFILED, dest.folder == null, () => pick(null)),
     item('＋ 新しいフォルダ', false, async () => { const id = await newFolder(); if (id == null) return; folders = await db.allFolders(); await pick(id); }, 'add'),
   );
   if (dest.kind === 'move') return;
@@ -319,7 +414,7 @@ function drawDest() {
     if (dest.kind === 'pages') { await movePagesTo(id); return; }
     docId = id;
     // 撮影画面で選んだ保存先を、ホーム画面の表示にも合わせる
-    if (folderView !== 'all') folderView = dest.folder ?? 'none';
+    folderView = dest.folder ?? 'none';
     $('#dest-dialog').close();
     await refresh();
     syncCameraBar();
@@ -338,6 +433,14 @@ const ready = p => !p.waiting && !p.failed;
 
 async function refresh() {
   await loadDocs();
+  showScreen();
+  if (screen === 'folders') {
+    pages = [];
+    await drawFolders();
+    showStorage();
+    showTrashButton();
+    return;
+  }
   pages = await db.pagesOf(docId);
   thumbUrls.forEach(u => URL.revokeObjectURL(u));
   thumbUrls = [];
@@ -796,7 +899,7 @@ $('#sel-delete').onclick = async () => {
   const list = selectedPages();
   if (!list.length) return;
   const doc = currentDoc();
-  for (const p of list) await db.trashPage(p.id, doc);
+  for (const p of list) await db.trashPage(p.id, doc, folderName(doc?.folderId) ?? null);
   endSelect();
   await refresh();
   toast(`${list.length}ページをゴミ箱に移しました`, 7000, { label: '元に戻す', run: () => restorePages(list.map(p => p.id)) });
@@ -826,7 +929,13 @@ async function restorePages(ids) {
       if (!remade.has(key)) {
         const info = p.trashDoc || { name: '戻したページ', folderId: null };
         const d = { name: info.name, created: Date.now() };
+        folders = await db.allFolders();
         if (info.folderId != null && folders.some(f => f.id === info.folderId)) d.folderId = info.folderId;
+        else if (info.folderName) {
+          // フォルダごと消していたら、同じ名前のフォルダを作り直してそこへ戻す
+          d.folderId = folders.find(f => f.name === info.folderName)?.id ?? await db.addFolder({ name: info.folderName, created: Date.now() });
+          folders = await db.allFolders();
+        }
         remade.set(key, await db.addDoc(d));
       }
       p.docId = remade.get(key);
@@ -835,7 +944,10 @@ async function restorePages(ids) {
     await db.restorePage(id);
   }
   // 文書ごと戻したときは、その文書を開く
-  if (remade.size) { docId = [...remade.values()].pop(); prefs.set('doc', docId); folderView = 'all'; }
+  if (remade.size && screen === 'folder') {
+    docId = [...remade.values()].pop(); prefs.set('doc', docId);
+    folderView = (await db.allDocs()).find(d => d.id === docId)?.folderId ?? 'none';
+  }
   await loadDocs();
   await refresh();
   processWaiting();
@@ -1765,12 +1877,18 @@ $('#save-reset').onclick = async () => { await save.clearFolder(); await showSav
 // ---------- 起動 ----------
 async function start() {
   applyMode();
+  // 起動はいつもフォルダ一覧から（再読み込み前の「フォルダを開いた」履歴は使わない）
+  try { if (history.state?.scanliteFolder || history.state?.scanliteSelect) history.replaceState(null, ''); } catch {}
   await loadDocs();
   // 以前のバージョンのページ: 文書に入れ、サイズ情報がなければ補正なしで変換する
   for (const p of await db.allPages()) {
     if (p.docId && p.width) continue;
     try {
-      if (!p.docId) p.docId = docId;
+      if (!p.docId) {
+        // 文書に入っていない古いページは「未分類」の文書に入れる
+        if (!docs.length) { await db.addDoc({ name: defaultDocName(), created: Date.now() }); docs = await db.allDocs(); }
+        p.docId = docs[docs.length - 1].id;
+      }
       if (!p.width) {
         p.original = p.blob;
         Object.assign(p, { rotation: 0, filter: 'none', crop: 'none', deskew: false, fingers: false, denoise: false });
