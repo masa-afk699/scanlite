@@ -25,13 +25,19 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
   // 同じページで続けてぼけたときの撮り直し回数（2回までその場で撮り直し、3回目はそのまま残す）
   let blurTries = 0;
 
+  // 開くたびに番号を進める。カメラの起動を待っている間に閉じられたら、後から届いた映像はすぐ止める
+  // （以前は閉じた後に映像が届くと、画面が消えたままカメラと自動撮影が動き続けていた）
+  let session = 0;
+  const stale = id => id !== session || !dialog.open;
   async function open() {
+    const id = ++session;
     shots = 0; blurTries = 0; counter.textContent = '0';
     if (thumb) { if (thumb.src) URL.revokeObjectURL(thumb.src); thumb.removeAttribute('src'); thumb.hidden = true; }
     dialog.showModal();
     say('カメラを起動しています…');
+    let got;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
+      got = await navigator.mediaDevices.getUserMedia({
         audio: false,
         // できるだけ高い解像度で（4:3の全画角→4K→ブラウザーに任せる、の順に試す）
         video: {
@@ -40,16 +46,20 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
         },
       });
     } catch (e) {
-      say('カメラを使えませんでした。ブラウザーの設定でカメラを許可してください。');
+      if (!stale(id)) say('カメラを使えませんでした。ブラウザーの設定でカメラを許可してください。');
       return;
     }
+    if (stale(id)) { got.getTracks().forEach(t => t.stop()); return; }
+    stream = got;
     // ピントは合わせ続ける（対応している端末だけ）
     try {
       const track = stream.getVideoTracks()[0], caps = track.getCapabilities ? track.getCapabilities() : {};
       if (caps.focusMode && caps.focusMode.includes('continuous')) await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
     } catch {}
+    if (stale(id)) { stream?.getTracks().forEach(t => t.stop()); stream = null; return; }
     video.srcObject = stream;
     await video.play().catch(() => {});
+    if (stale(id)) { close(); return; }
     setupStill();
     setupTorch();
     prev = null; stillSince = 0; needMotion = false; sharpMax = 0;
@@ -72,6 +82,7 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
   }
 
   function close() {
+    session++;
     clearInterval(timer); timer = null;
     window.removeEventListener('devicemotion', onMotion); tiltX = null; landscape = false;
     clearGuide();
@@ -331,7 +342,14 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
       blurTries = 0; warnUntil = 0;
       // 左下に今撮った写真を小さく出す
       if (thumb) { if (thumb.src) URL.revokeObjectURL(thumb.src); thumb.src = URL.createObjectURL(blob); thumb.hidden = false; }
-      onCapture(blob, { tilt: tiltX, sharp });
+      // 保存できなかったとき（容量不足など）は、撮れたことにしない
+      if (await onCapture(blob, { tilt: tiltX, sharp }) === false) {
+        shots--; counter.textContent = String(shots);
+        navigator.vibrate?.(400);
+        needMotion = true; stillSince = 0;
+        say('保存できませんでした。端末の空き容量を確かめてください', true);
+        return;
+      }
       needMotion = true; stillSince = 0;
       say(autoToggle.checked ? '撮影しました。次のページをめくってください' : '撮影しました');
     } finally { busy = false; }

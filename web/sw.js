@@ -1,5 +1,5 @@
 // オフライン動作用。自サイトのファイルだけをキャッシュし、外部への通信は行わない。
-const VERSION = 'v42';
+const VERSION = 'v43';
 const CACHE = 'scanlite-shell-' + VERSION;
 // OCRの部品やモデルなど大きなファイルは別に保存し、アプリを更新しても消さない。
 // （更新のたびに十数MBを取り直すと、スマホでは途中で止まって新しい版に切り替わらないことがあった）
@@ -15,6 +15,12 @@ const VENDOR = [
   './vendor/tesseract/lang/jpn.traineddata.gz',
   './vendor/paddle/ort.wasm.min.mjs',
   './vendor/paddle/ort-wasm-simd-threaded.mjs',
+  // 文字認識の本体とモデル。以前は初めて文字認識を使ったときに取りに行っていたため、
+  // それまでネットにつながった状態で使っていないと、圏外では文字認識ができなかった
+  './vendor/paddle/ort-wasm-simd-threaded.wasm',
+  './vendor/paddle/det.onnx',
+  './vendor/paddle/rec.onnx',
+  './vendor/paddle/dict.txt',
 ];
 const isVendor = url => url.pathname.includes('/vendor/');
 
@@ -42,12 +48,16 @@ self.addEventListener('activate', e => e.waitUntil(
     .then(() => caches.keys())
     .then(keys => Promise.all(keys.filter(k => k !== CACHE && k !== MODELS).map(k => caches.delete(k))))
     .then(() => self.clients.claim())
-    .then(() => { moveVendor(true).catch(() => {}); })
 ));
+// 同時に頼まれても、取りに行くのは1回だけ
+let fetching = null;
+const fetchModels = () => (fetching = fetching || moveVendor(true).catch(() => {}).finally(() => { fetching = null; }));
 
 // 画面から「今の版」を尋ねられたら答える
 self.addEventListener('message', e => {
   if (e.data === 'version' && e.ports[0]) e.ports[0].postMessage(VERSION);
+  // 画面から頼まれたら、まだ持っていない文字認識の部品を取っておく（取り終えるまでワーカーを止めない）
+  if (e.data === 'models') e.waitUntil(fetchModels());
 });
 
 // 同じサイトのファイルだけで動くので、ページを「クロスオリジン分離」にする。

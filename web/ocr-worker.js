@@ -9,12 +9,15 @@ ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardw
 let det = null, rec = null, chars = null;
 async function load() {
   if (det) return;
-  const buf = async name => new Uint8Array(await (await fetch(base + name)).arrayBuffer());
+  // 取れなかったファイル（圏外で未保存など）は、途中までの状態を残さず失敗にする（次に呼ばれたとき最初から読み直す）
+  const get = async name => { const r = await fetch(base + name); if (!r.ok) throw new Error(`${name}: ${r.status}`); return r; };
+  const buf = async name => new Uint8Array(await (await get(name)).arrayBuffer());
   const opts = { executionProviders: ['wasm'], graphOptimizationLevel: 'all' };
-  const [d, r, dict] = await Promise.all([buf('det.onnx'), buf('rec.onnx'), fetch(base + 'dict.txt').then(r => r.text())]);
-  det = await ort.InferenceSession.create(d, opts);
-  rec = await ort.InferenceSession.create(r, opts);
+  const [d, r, dict] = await Promise.all([buf('det.onnx'), buf('rec.onnx'), get('dict.txt').then(r => r.text())]);
+  const ds = await ort.InferenceSession.create(d, opts);
+  const rs = await ort.InferenceSession.create(r, opts);
   chars = ['', ...dict.split(/\r?\n/).filter((l, i, a) => i < a.length - 1 || l), ' '];
+  rec = rs; det = ds;
 }
 
 const canvas = (w, h) => new OffscreenCanvas(w, h);

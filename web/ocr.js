@@ -40,10 +40,22 @@ export const tidy = t => t
   .replace(new RegExp(`(?<=${CJK}) +(?=[0-9０-９])|(?<=[0-9０-９]) +(?=${CJK})`, 'g'), '');
 
 // ---------- 高精度OCR（PaddleOCR、Web Workerで実行） ----------
-let paddle = null, paddleFailed = false, seq = 0, held = false;
+// paddleFailed: この端末では PaddleOCR が動かない（一度も読めずに失敗が続いた）とき true。
+// 以前は1回失敗しただけで true にしていたため、その後アプリを閉じるまで、文字の行からのページ範囲の検出が
+// 止まり、OCRも精度の低い方式のままになっていた
+let paddle = null, paddleFailed = false, paddleOk = false, paddleErrors = 0, gen = 0, seq = 0, held = false;
 const jobs = new Map();
+// 読み取りに失敗したワーカーは、中の状態が壊れているかもしれないので作り直す
+function restartPaddle(failedGen) {
+  if (failedGen !== gen || !paddle) return;
+  paddle.terminate();
+  paddle = null;
+  for (const job of jobs.values()) job.reject(new Error('OCR worker restarted'));
+  jobs.clear();
+}
 function paddleWorker() {
   if (paddle) return paddle;
+  gen++;
   paddle = new Worker(new URL('./ocr-worker.js', import.meta.url), { type: 'module' });
   paddle.onmessage = e => {
     const { id, progress, result, error } = e.data, job = jobs.get(id);
@@ -52,7 +64,9 @@ function paddleWorker() {
     jobs.delete(id);
     if (error) job.reject(new Error(error)); else job.resolve(result);
   };
+  const mine = paddle;
   paddle.onerror = e => {
+    if (paddle !== mine) return;
     for (const job of jobs.values()) job.reject(new Error(e.message || 'OCR worker error'));
     jobs.clear(); paddle = null;
   };
@@ -60,10 +74,11 @@ function paddleWorker() {
   return paddle;
 }
 function recognizePaddle(blob, onProgress) {
+  const w = paddleWorker(), g = gen;
   return new Promise((resolve, reject) => {
     const id = ++seq;
-    jobs.set(id, { resolve, reject, onProgress });
-    paddleWorker().postMessage({ id, blob });
+    jobs.set(id, { resolve, reject: e => { e.gen = g; reject(e); }, onProgress });
+    w.postMessage({ id, blob });
   });
 }
 
@@ -87,26 +102,33 @@ export function holdReading(on) {
 // （scores は候補ごとの読み取りの確かさ、lines は rotation の向きで検出した行）
 export async function textLines(blob, rotation = 0, choose = null) {
   if (paddleFailed) return null;
+  const w = paddleWorker(), g = gen;
   try {
     return await new Promise((resolve, reject) => {
       const id = ++seq;
       jobs.set(id, { resolve, reject, onProgress: () => {} });
-      paddleWorker().postMessage({ id, blob, lines: true, rotation, choose });
+      w.postMessage({ id, blob, lines: true, rotation, choose });
     });
-  } catch (e) { console.error(e); return null; }
+  } catch (e) { console.error(e); restartPaddle(g); return null; }
 }
 
 // 返り値: { text, lines: [{ text, bbox: {x0,y0,x1,y1} }] }（座標は入力画像のピクセル）
 export async function recognize(blob, onProgress = () => {}) {
   if (!paddleFailed) {
-    try {
-      const r = await recognizePaddle(blob, onProgress);
-      return { text: tidy(r.text), lines: r.lines.map(l => ({ text: tidy(l.text), bbox: l.bbox })) };
-    } catch (e) {
-      // 古い端末などで動かないときは、従来のOCR（tesseract）で読む
-      console.error('PaddleOCR failed, falling back', e);
-      paddleFailed = true;
+    // 失敗したら、ワーカーを作り直してもう1回だけ試す
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const r = await recognizePaddle(blob, onProgress);
+        paddleOk = true; paddleErrors = 0;
+        return { text: tidy(r.text), lines: r.lines.map(l => ({ text: tidy(l.text), bbox: l.bbox })) };
+      } catch (e) {
+        console.error('PaddleOCR failed', e);
+        restartPaddle(e.gen);
+      }
     }
+    // 一度も読めないまま失敗が続くときだけ、この端末では動かないとみなす。
+    // それまでに読めていたなら、このページだけ従来のOCR（tesseract）で読み、次のページはまた PaddleOCR で読む
+    if (!paddleOk && ++paddleErrors >= 2) paddleFailed = true;
   }
   return recognizeTesseract(blob, onProgress);
 }
