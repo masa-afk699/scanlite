@@ -5,6 +5,7 @@ import { buildPdf } from './pdf.js';
 import { recognize, textLines, warmUp, holdReading } from './ocr.js';
 import { createCamera } from './camera.js';
 import * as save from './save.js';
+import { sharpness, BLURRY_BELOW } from './sharp.js';
 
 // 新しく取り込んだページの標準設定
 const DEFAULTS = { rotation: 0, filter: 'color', crop: 'auto', half: null, deskew: true, fingers: true, denoise: true, evenColor: true, moire: false, dewarp: true };
@@ -161,11 +162,14 @@ const showPending = () => { holdReading(pending > 0); setBusy(pending ? `画像�
 const autoOcr = () => prefs.get('autoOcr', null) ?? prefs.get('searchable', false);
 
 // ---------- フォルダと文書 ----------
-// フォルダは文書をまとめる入れ物。表示中のフォルダ: 'all'（すべて）/ 'none'（フォルダなし）/ フォルダのid
-let folders = [], folderView = prefs.get('folder', 'all');
+// 起動するとまずフォルダ一覧（screen = 'folders'）。フォルダを開くと、その中の文書とページの画面（screen = 'folder'）。
+// 開いているフォルダ folderView: フォルダのid / 'none'（どのフォルダにも入っていない文書 =「未分類」）
+let folders = [], screen = 'folders', folderView = null;
+const UNFILED = '未分類';
 const folderName = id => folders.find(f => f.id === id)?.name;
-const inFolder = (d, view) => view === 'all' || (view === 'none' ? !folderName(d.folderId) : d.folderId === view);
-// 文書がないフォルダを表示したときは、そのフォルダに新しい文書を1つ用意する
+const inFolder = (d, view) => (view === 'none' ? !folderName(d.folderId) : d.folderId === view);
+const viewName = view => (view === 'none' ? UNFILED : folderName(view) || '');
+// 文書がないフォルダを開いたときは、そのフォルダに新しい文書を1つ用意する（すぐ撮影・取り込みできるように）
 async function ensureDocIn(view) {
   if (docs.some(d => inFolder(d, view))) return;
   const doc = { name: defaultDocName(), created: Date.now() };
@@ -175,30 +179,18 @@ async function ensureDocIn(view) {
 }
 async function loadDocs() {
   folders = await db.allFolders();
-  if (typeof folderView === 'number' && !folderName(folderView)) folderView = 'all';
   docs = await db.allDocs();
+  if (screen !== 'folder') return;
+  if (folderView !== 'none' && !folderName(folderView)) { screen = 'folders'; folderView = null; return; }
   await ensureDocIn(folderView);
   const shown = docs.filter(d => inFolder(d, folderView));
   if (!shown.some(d => d.id === docId)) docId = prefs.get('doc', null);
   if (!shown.some(d => d.id === docId)) docId = shown[shown.length - 1].id;
   prefs.set('doc', docId);
-  prefs.set('folder', folderView);
-  const fsel = $('#folder-select');
-  fsel.replaceChildren(
-    new Option(`📁 すべて（${docs.length}）`, 'all', false, folderView === 'all'),
-    ...folders.map(f => new Option(`📁 ${f.name}（${docs.filter(d => d.folderId === f.id).length}）`, f.id, false, f.id === folderView)),
-    new Option(`📁 フォルダなし（${docs.filter(d => !folderName(d.folderId)).length}）`, 'none', false, folderView === 'none'),
-  );
-  $('#folder-rename').hidden = $('#folder-delete').hidden = typeof folderView !== 'number';
+  $('#folder-title').textContent = viewName(folderView);
+  $('#folder-menu').hidden = folderView === 'none';
   const sel = $('#doc-select');
-  const opt = d => new Option(d.name, d.id, false, d.id === docId);
-  if (folderView === 'all' && folders.length) {
-    // すべて表示のときはフォルダごとにまとめて並べる
-    const groups = [...folders.map(f => [f.name, docs.filter(d => d.folderId === f.id)]), ['フォルダなし', docs.filter(d => !folderName(d.folderId))]];
-    sel.replaceChildren(...groups.filter(([, list]) => list.length).map(([label, list]) => {
-      const g = document.createElement('optgroup'); g.label = label; g.append(...list.map(opt)); return g;
-    }));
-  } else sel.replaceChildren(...shown.map(opt));
+  sel.replaceChildren(...shown.map(d => new Option(d.name, d.id, false, d.id === docId)));
 }
 const currentDoc = () => docs.find(d => d.id === docId);
 function defaultDocName() {
@@ -220,35 +212,139 @@ async function newDocIn(folderId, ask = true) {
   return db.addDoc(doc);
 }
 
-$('#folder-select').onchange = async e => {
-  const v = e.target.value;
-  folderView = v === 'all' || v === 'none' ? v : Number(v);
-  docId = null;
+// 画面の切り替え（スマホの「戻る」でフォルダ一覧へ戻れるよう、履歴を1つ積む）
+function showScreen() {
+  const atFolders = screen === 'folders';
+  document.querySelector('.shell').classList.toggle('at-folders', atFolders);
+  $('#folder-home').hidden = !atFolders;
+}
+async function openFolder(view) {
+  if (selecting()) endSelect();
+  screen = 'folder'; folderView = view; docId = null;
+  $('#search').value = '';
+  prefs.set('folder', view);
+  try { if (!history.state?.scanliteFolder) history.pushState({ scanliteFolder: true }, ''); } catch {}
+  showScreen();
+  scrollTo(0, 0);
   await refresh();
-};
+}
+async function showFolders({ fromHistory = false } = {}) {
+  if (selecting()) endSelect({ fromHistory });
+  if (!fromHistory && history.state?.scanliteFolder) { history.back(); return; } // popstate からもう一度呼ばれる
+  screen = 'folders'; folderView = null;
+  showScreen();
+  scrollTo(0, 0);
+  await refresh();
+}
+window.addEventListener('popstate', () => {
+  if (screen === 'folder' && !history.state?.scanliteFolder && !history.state?.scanliteSelect) showFolders({ fromHistory: true });
+});
+
+// フォルダ一覧を描く。各フォルダに最新ページの小さな絵と、文書・ページの数を出す
+let folderUrls = [];
+async function drawFolders() {
+  folderUrls.forEach(u => URL.revokeObjectURL(u));
+  folderUrls = [];
+  const all = await db.allPages();
+  const pagesIn = view => { const ids = new Set(docs.filter(d => inFolder(d, view)).map(d => d.id)); return all.filter(p => ids.has(p.docId)); };
+  const card = (view, name) => {
+    const list = pagesIn(view), nDocs = docs.filter(d => inFolder(d, view)).length;
+    const row = document.createElement('div');
+    row.className = 'folder-card' + (view === 'none' ? ' unfiled' : '');
+    const open = document.createElement('button');
+    open.type = 'button'; open.className = 'folder-open';
+    open.onclick = () => openFolder(view);
+    const pic = document.createElement('span');
+    pic.className = 'folder-pic';
+    const last = [...list].reverse().find(p => p.thumb || p.blob);
+    if (last) { const u = URL.createObjectURL(last.thumb || last.blob); folderUrls.push(u); const img = new Image(); img.src = u; img.alt = ''; img.decoding = 'async'; pic.append(img); }
+    else pic.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6.5A1.5 1.5 0 014.5 5H9l2 2.5h8.5A1.5 1.5 0 0121 9v8.5a1.5 1.5 0 01-1.5 1.5h-15A1.5 1.5 0 013 17.5z"/></svg>';
+    const text = document.createElement('span');
+    text.className = 'folder-text';
+    const strong = document.createElement('strong'); strong.textContent = name;
+    const small = document.createElement('small');
+    small.textContent = list.length ? `${list.length} ページ` + (nDocs > 1 ? `・文書 ${nDocs}件` : '') : 'まだページがありません';
+    text.append(strong, small);
+    open.append(pic, text);
+    row.append(open);
+    if (view !== 'none') {
+      const more = document.createElement('button');
+      more.type = 'button'; more.className = 'folder-more'; more.textContent = '︙';
+      more.setAttribute('aria-label', `「${name}」の名前変更・削除`);
+      more.onclick = () => openFolderMenu(view);
+      row.append(more);
+    }
+    return row;
+  };
+  const items = folders.map(f => card(f.id, f.name));
+  // どのフォルダにも入っていない文書（以前のバージョンで撮ったものなど）は「未分類」にまとめて見せる
+  if (pagesIn('none').length) items.push(card('none', UNFILED));
+  if (!items.length) {
+    const p = document.createElement('p');
+    p.className = 'folder-empty';
+    p.textContent = '「＋ 新しいフォルダ」でフォルダを作り、その中で撮影・写真の取り込みをします。';
+    items.push(p);
+  }
+  $('#folder-list').replaceChildren(...items);
+}
+
 $('#folder-new').onclick = async () => {
   const id = await newFolder();
   if (id == null) return;
-  folderView = id; docId = null;
-  await refresh();
+  await openFolder(id);
 };
-$('#folder-rename').onclick = async () => {
-  const f = folders.find(x => x.id === folderView);
+$('#folder-back').onclick = () => showFolders();
+$('#folder-menu').onclick = () => openFolderMenu(folderView);
+
+// フォルダの名前変更・削除
+let menuFolder = null;
+function openFolderMenu(id) {
+  const f = folders.find(x => x.id === id);
+  if (!f) return;
+  menuFolder = f;
+  const n = docs.filter(d => d.folderId === f.id).length;
+  $('#folder-dialog-title').textContent = `📁 ${f.name}`;
+  $('#folder-dialog-info').textContent = `文書 ${n}件`;
+  $('#folder-dialog-main').hidden = false;
+  $('#folder-dialog-delete').hidden = true;
+  $('#folder-dialog').showModal();
+}
+$('#fd-rename').onclick = async () => {
+  const f = menuFolder;
   const name = f && prompt('フォルダの名前', f.name);
   if (!name || !name.trim()) return;
   f.name = name.trim();
   await db.putFolder(f);
+  $('#folder-dialog').close();
   await refresh();
 };
-$('#folder-delete').onclick = async () => {
-  const f = folders.find(x => x.id === folderView);
-  if (!f) return;
-  const n = docs.filter(d => d.folderId === f.id).length;
-  if (!confirm(`フォルダ「${f.name}」を削除しますか？\n中の文書（${n}件）とページは消さずに「フォルダなし」に移します。`)) return;
+$('#fd-delete').onclick = async () => {
+  const f = menuFolder;
+  const ids = new Set(docs.filter(d => d.folderId === f.id).map(d => d.id));
+  const n = (await db.allPages()).filter(p => ids.has(p.docId)).length;
+  if (!n) {
+    // 空のフォルダはそのまま消す
+    if (!confirm(`フォルダ「${f.name}」を削除しますか？`)) return;
+    await deleteFolder(f, true);
+    return;
+  }
+  $('#fd-delete-note').textContent = `「${f.name}」には ${n} ページあります。中身ごと削除すると、ページはゴミ箱に移り、30日間は戻せます。`;
+  $('#folder-dialog-main').hidden = true;
+  $('#folder-dialog-delete').hidden = false;
+};
+$('#fd-cancel').onclick = () => $('#folder-dialog').close();
+$('#fd-delete-all').onclick = () => deleteFolder(menuFolder, true);
+$('#fd-delete-keep').onclick = () => deleteFolder(menuFolder, false);
+async function deleteFolder(f, withPages) {
+  $('#folder-dialog').close();
+  const inside = docs.filter(d => d.folderId === f.id);
+  const trashed = [];
+  if (withPages) for (const d of inside) { trashed.push(...(await db.pagesOf(d.id)).map(p => p.id)); await db.removeDoc(d.id); }
   await db.removeFolder(f.id);
-  folderView = 'all';
-  await refresh();
-};
+  if (screen === 'folder' && folderView === f.id) await showFolders(); else await refresh();
+  if (trashed.length) toast(`フォルダ「${f.name}」を削除しました（ページはゴミ箱へ）`, 7000, { label: '元に戻す', run: () => restorePages(trashed) });
+  else toast(withPages ? `フォルダ「${f.name}」を削除しました` : `フォルダ「${f.name}」を削除しました。中身は「${UNFILED}」にあります`);
+}
 
 $('#doc-select').onchange = async e => { docId = Number(e.target.value); prefs.set('doc', docId); await refresh(); };
 $('#doc-new').onclick = async () => {
@@ -268,7 +364,7 @@ $('#doc-rename').onclick = async () => {
 $('#doc-move').onclick = () => openDest('move');
 $('#doc-delete').onclick = async () => {
   const doc = currentDoc();
-  if (!confirm(`「${doc.name}」とそのページ（${pages.length}枚）を削除しますか？`)) return;
+  if (!confirm(`「${doc.name}」を削除しますか？\nページ（${pages.length}枚）はゴミ箱に移し、30日間は戻せます。`)) return;
   await db.removeDoc(doc.id);
   docId = null;
   await refresh();
@@ -304,7 +400,7 @@ function drawDest() {
       if (folder == null) delete doc.folderId; else doc.folderId = folder;
       await db.putDoc(doc);
       // 移した先のフォルダを表示する（すべて表示中ならそのまま）
-      if (folderView !== 'all') folderView = folder ?? 'none';
+      folderView = folder ?? 'none';
       $('#dest-dialog').close();
       await refresh();
       return;
@@ -314,7 +410,7 @@ function drawDest() {
   };
   $('#dest-folders').replaceChildren(
     ...folders.map(f => item(f.name, dest.folder === f.id, () => pick(f.id))),
-    item('フォルダなし', dest.folder == null, () => pick(null)),
+    item(UNFILED, dest.folder == null, () => pick(null)),
     item('＋ 新しいフォルダ', false, async () => { const id = await newFolder(); if (id == null) return; folders = await db.allFolders(); await pick(id); }, 'add'),
   );
   if (dest.kind === 'move') return;
@@ -322,7 +418,7 @@ function drawDest() {
     if (dest.kind === 'pages') { await movePagesTo(id); return; }
     docId = id;
     // 撮影画面で選んだ保存先を、ホーム画面の表示にも合わせる
-    if (folderView !== 'all') folderView = dest.folder ?? 'none';
+    folderView = dest.folder ?? 'none';
     $('#dest-dialog').close();
     await refresh();
     syncCameraBar();
@@ -341,6 +437,14 @@ const ready = p => !p.waiting && !p.failed;
 
 async function refresh() {
   await loadDocs();
+  showScreen();
+  if (screen === 'folders') {
+    pages = [];
+    await drawFolders();
+    showStorage();
+    showTrashButton();
+    return;
+  }
   pages = await db.pagesOf(docId);
   thumbUrls.forEach(u => URL.revokeObjectURL(u));
   thumbUrls = [];
@@ -375,6 +479,14 @@ async function refresh() {
     const label = document.createElement('div');
     label.className = 'page-meta';
     label.textContent = `${index + 1}` + (p.half ? (p.half === 'right' ? '　右' : '　左') : '') + (p.ocr ? '　文字✓' : '') + (ready(p) ? '　' + (FILTERS[p.filter || 'none'] || '') : '');
+    if (p.blurry && ready(p)) {
+      // ぶれ・ピンぼけで文字がかすれそうなページには印を付ける（押すと拡大して「撮り直す」を選べる）
+      const warn = document.createElement('span');
+      warn.className = 'blur-badge';
+      warn.textContent = 'ぼけ';
+      warn.title = 'ぶれ・ピンぼけで文字がかすれているかもしれません。撮り直しをおすすめします';
+      card.append(warn);
+    }
     if (!ready(p)) {
       const ph = document.createElement('div');
       ph.className = 'page-placeholder';
@@ -411,6 +523,7 @@ async function refresh() {
   $('#pages-hint').hidden = !pages.length || selecting();
   showSelection();
   showStorage();
+  showTrashButton();
 }
 
 // 処理中は一覧の作り直しを間引く（大量撮影でも重くならないように）
@@ -511,10 +624,7 @@ function showSelection() {
   $('#sel-copy').disabled = !usable.length;
   $('#sel-copy').textContent = copyLabel();
   $('#sel-move').disabled = !list.length;
-  // 補正中のページも並べ替えられる（補正が終わっても、並べ替えた順番は保たれる）
-  const first = pages.findIndex(p => selected.has(p.id)), last = pages.length - 1 - [...pages].reverse().findIndex(p => selected.has(p.id));
-  $('#sel-up').disabled = !list.length || first <= 0 || list.length === pages.length;
-  $('#sel-down').disabled = !list.length || last >= pages.length - 1 || list.length === pages.length;
+  $('#sel-pdf').disabled = !usable.length;
   $('#sel-delete').disabled = !list.length;
 }
 
@@ -670,16 +780,6 @@ async function applyOrder(order) {
   }
   await refresh();
 }
-// 選んだページを前後へ1つずつ動かす
-async function moveSelected(delta) {
-  const order = [...pages];
-  const idx = order.map((_, i) => i);
-  if (delta < 0) idx.forEach(i => { if (i > 0 && selected.has(order[i].id) && !selected.has(order[i - 1].id)) [order[i - 1], order[i]] = [order[i], order[i - 1]]; });
-  else idx.reverse().forEach(i => { if (i < order.length - 1 && selected.has(order[i].id) && !selected.has(order[i + 1].id)) [order[i + 1], order[i]] = [order[i], order[i + 1]]; });
-  await applyOrder(order);
-}
-$('#sel-up').onclick = () => moveSelected(-1);
-$('#sel-down').onclick = () => moveSelected(1);
 
 // 選んだページの補正後の画像を、Claude などほかのアプリに貼る・渡す。
 // 1枚ならクリップボードにコピー（貼り付けで使える）。複数ならスマホの共有画面で渡す先のアプリを選ぶ。
@@ -760,9 +860,16 @@ $('#sel-copy').onclick = () => {
 
 // 画面下に短いお知らせを出す
 let toastTimer = null;
-function toast(text, ms = 4000) {
+// action: { label, run } を渡すと、お知らせの中にボタン（「元に戻す」など）を出す
+function toast(text, ms = 4000, action = null) {
   const el = $('#toast');
   el.textContent = text;
+  if (action) {
+    const b = document.createElement('button');
+    b.type = 'button'; b.textContent = action.label;
+    b.onclick = () => { el.hidden = true; action.run(); };
+    el.append(b);
+  }
   el.hidden = false;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { el.hidden = true; }, ms);
@@ -791,13 +898,109 @@ async function movePagesTo(targetId) {
   toast(`${list.length}枚を「${destLabel(doc)}」に移しました`);
 }
 
+// 削除したページはすぐには消さず、ゴミ箱に30日間残す（間違えて消しても戻せる）
 $('#sel-delete').onclick = async () => {
   const list = selectedPages();
-  if (!list.length || !confirm(`選んだ ${list.length} ページを削除しますか？（元に戻せません）`)) return;
-  for (const p of list) await db.removePage(p.id);
+  if (!list.length) return;
+  const doc = currentDoc();
+  for (const p of list) await db.trashPage(p.id, doc, folderName(doc?.folderId) ?? null);
   endSelect();
   await refresh();
+  toast(`${list.length}ページをゴミ箱に移しました`, 7000, { label: '元に戻す', run: () => restorePages(list.map(p => p.id)) });
 };
+
+// ---------- ゴミ箱 ----------
+const TRASH_DAYS = 30;
+let trashCount = 0;
+async function showTrashButton() {
+  trashCount = (await db.trashedPages()).length;
+  $('#trash-button').hidden = !trashCount;
+  $('#trash-button').textContent = `ゴミ箱（${trashCount}）`;
+}
+// 30日たったページは完全に消す（起動のたびに確かめる）
+async function purgeTrash() {
+  const limit = Date.now() - TRASH_DAYS * 864e5;
+  for (const p of await db.trashedPages()) if (p.trashed < limit) await db.removePage(p.id);
+}
+// 戻すときは元の文書へ。文書ごと消していたら、同じ名前の文書を作り直してそこへ戻す
+async function restorePages(ids) {
+  const docsNow = await db.allDocs(), remade = new Map();
+  for (const id of ids) {
+    const p = await db.getPage(id);
+    if (!p || !p.trashed) continue;
+    if (!docsNow.some(d => d.id === p.docId)) {
+      const key = JSON.stringify(p.trashDoc || {});
+      if (!remade.has(key)) {
+        const info = p.trashDoc || { name: '戻したページ', folderId: null };
+        const d = { name: info.name, created: Date.now() };
+        folders = await db.allFolders();
+        if (info.folderId != null && folders.some(f => f.id === info.folderId)) d.folderId = info.folderId;
+        else if (info.folderName) {
+          // フォルダごと消していたら、同じ名前のフォルダを作り直してそこへ戻す
+          d.folderId = folders.find(f => f.name === info.folderName)?.id ?? await db.addFolder({ name: info.folderName, created: Date.now() });
+          folders = await db.allFolders();
+        }
+        remade.set(key, await db.addDoc(d));
+      }
+      p.docId = remade.get(key);
+      await db.putPage(p);
+    }
+    await db.restorePage(id);
+  }
+  // 文書ごと戻したときは、その文書を開く
+  if (remade.size && screen === 'folder') {
+    docId = [...remade.values()].pop(); prefs.set('doc', docId);
+    folderView = (await db.allDocs()).find(d => d.id === docId)?.folderId ?? 'none';
+  }
+  await loadDocs();
+  await refresh();
+  processWaiting();
+  runBackgroundOcr();
+}
+let trashUrls = [];
+async function drawTrash() {
+  trashUrls.forEach(u => URL.revokeObjectURL(u));
+  trashUrls = [];
+  const list = await db.trashedPages(), docsNow = await db.allDocs(), box = $('#trash-list');
+  const frag = document.createDocumentFragment();
+  for (const p of list) {
+    const row = document.createElement('div');
+    row.className = 'trash-item';
+    const img = document.createElement('img');
+    if (p.thumb || p.blob || p.original) { const u = URL.createObjectURL(p.thumb || p.blob || p.original); trashUrls.push(u); img.src = u; }
+    img.alt = '';
+    const info = document.createElement('p');
+    const docName = docsNow.find(d => d.id === p.docId)?.name || p.trashDoc?.name || '';
+    const left = Math.max(1, Math.ceil((p.trashed + TRASH_DAYS * 864e5 - Date.now()) / 864e5));
+    info.innerHTML = '<strong></strong><small></small>';
+    info.firstChild.textContent = docName;
+    info.lastChild.textContent = `あと${left}日で完全に消えます`;
+    const back = document.createElement('button');
+    back.type = 'button'; back.textContent = '戻す';
+    back.onclick = async () => { await restorePages([p.id]); await drawTrash(); };
+    row.append(img, info, back);
+    frag.append(row);
+  }
+  box.replaceChildren(frag);
+  $('#trash-empty-note').hidden = !!list.length;
+  $('#trash-restore-all').disabled = !list.length;
+  $('#trash-clear').disabled = !list.length;
+}
+$('#trash-button').onclick = async () => { await drawTrash(); $('#trash-dialog').showModal(); };
+$('#trash-restore-all').onclick = async () => {
+  await restorePages((await db.trashedPages()).map(p => p.id));
+  $('#trash-dialog').close();
+  toast('ゴミ箱のページを元に戻しました');
+};
+$('#trash-clear').onclick = async () => {
+  const list = await db.trashedPages();
+  if (!list.length || !confirm(`ゴミ箱の ${list.length} ページを完全に削除しますか？（元に戻せません）`)) return;
+  for (const p of list) await db.removePage(p.id);
+  await drawTrash();
+  await showTrashButton();
+  showStorage();
+};
+$('#trash-dialog').addEventListener('close', () => { trashUrls.forEach(u => URL.revokeObjectURL(u)); trashUrls = []; });
 
 // 選んだページを順番に「範囲・補正」で直す
 let editQueue = [];
@@ -881,6 +1084,26 @@ async function preparePage(p) {
   await lines;
 }
 
+// ぶれ・ピンぼけの目安を元写真から求める（見開きの左右は同じ写真なので1回だけ）。画面撮影は対象外
+const sharpCache = new Map();
+async function checkBlur(p) {
+  if (p.sharp !== undefined || p.mode === 'screen' || !p.original) return;
+  const key = p.capture ?? p.id;
+  if (!sharpCache.has(key)) {
+    sharpCache.set(key, sharpness(p.original).catch(() => null));
+    if (sharpCache.size > 20) sharpCache.delete(sharpCache.keys().next().value);
+  }
+  p.sharp = await sharpCache.get(key);
+  p.blurry = p.sharp != null && p.sharp < BLURRY_BELOW;
+  if (p.blurry) blurNotice();
+}
+// 撮影中に何度も出ないよう、まとめて1回お知らせする
+let blurTimer = null;
+function blurNotice() {
+  clearTimeout(blurTimer);
+  blurTimer = setTimeout(() => toast('ぼけている写真がありました。「ぼけ」の印のページは撮り直すと文字がきれいになります', 6000), 800);
+}
+
 let working = false;
 async function processOne(p, ready = preparePage(p), run = () => processImage(p.original, optionsOf(p))) {
   try {
@@ -891,6 +1114,7 @@ async function processOne(p, ready = preparePage(p), run = () => processImage(p.
       if (v !== null) p.created = p.capture + ((p.half === 'left') === !v ? 0 : 1) / 2000;
     }
     Object.assign(p, await run());
+    await checkBlur(p);
   } catch (e) {
     console.error(e);
     p.failed = true;
@@ -899,6 +1123,7 @@ async function processOne(p, ready = preparePage(p), run = () => processImage(p.
   // 処理中に削除されたページは保存し直さない
   const now = await db.getPage(p.id);
   if (!now) return scheduleRefresh();
+  if (now.trashed) { p.trashed = now.trashed; p.trashDoc = now.trashDoc; }
   // 補正している間に並べ替え・別の文書へ移動されていたら、その順番と行き先を残す
   // （以前は補正前の内容で上書きしていたため、補正中に並べ替えても元に戻っていた）
   if (now.moved) { p.created = now.created; p.moved = true; }
@@ -958,8 +1183,25 @@ function applyMode() {
 document.querySelectorAll('.mode').forEach(b => b.addEventListener('click', () => { mode = b.dataset.mode; prefs.set('mode', mode); applyMode(); }));
 $('#opt-split').checked = prefs.get('split', false);
 $('#opt-order').value = prefs.get('order', 'rtl');
-$('#opt-split').onchange = e => prefs.set('split', e.target.checked);
-$('#opt-order').onchange = e => prefs.set('order', e.target.value);
+// ホームの「1ページ／見開き」切り替え（撮影画面の切り替えと同じ設定。写真を選んで取り込むときにも使う）
+function syncHomeSpread() {
+  const two = $('#opt-split').checked;
+  document.querySelectorAll('#spread-options button[data-split]').forEach(b => b.setAttribute('aria-checked', String((b.dataset.split === '1') === two)));
+  $('#home-order').hidden = !two;
+  $('#home-order').textContent = $('#opt-order').value === 'rtl' ? '順番: 右ページから' : '順番: 左ページから';
+}
+document.querySelectorAll('#spread-options button[data-split]').forEach(b => b.onclick = () => {
+  $('#opt-split').checked = b.dataset.split === '1';
+  prefs.set('split', $('#opt-split').checked);
+  syncHomeSpread();
+});
+$('#home-order').onclick = () => {
+  $('#opt-order').value = $('#opt-order').value === 'rtl' ? 'ltr' : 'rtl';
+  prefs.set('order', $('#opt-order').value);
+  syncHomeSpread();
+  toast(ORDER_SAY[$('#opt-order').value], 2500);
+};
+syncHomeSpread();
 
 // ---------- 連続撮影 ----------
 const camera = createCamera({
@@ -989,6 +1231,7 @@ function syncCameraBar() {
   nums[0].textContent = order === 'rtl' ? '2' : '1';
   nums[1].textContent = order === 'rtl' ? '1' : '2';
   $('#camera-order').setAttribute('aria-label', 'ページの順番: ' + ORDER_SAY[order]);
+  syncHomeSpread();
 }
 // 撮影中でも「1ページ」「2ページ（見開き）」をいつでも切り替えられる
 document.querySelectorAll('#camera-pages button[data-pages]').forEach(b => b.onclick = () => {
@@ -1111,8 +1354,8 @@ function syncBend() {
   $('#edit-bend').setAttribute('aria-pressed', String(on));
   $('#edit-bend').textContent = on ? '✓ 辺を曲げる' : '辺を曲げる';
   $('#edit-note').textContent = on
-    ? '黄色の丸を内側・外側へドラッグして、曲がった紙の端（本の上下の端の弓なりなど）に辺を合わせると、その曲がりを平らに直します。'
-    : '四隅の丸（辺は中央の丸）をドラッグして紙の角に合わせると、斜めから撮った紙も長方形に直します。紙の端が曲がっているときは「辺を曲げる」で辺を曲げられます。';
+    ? '黄色の丸を動かして、曲がった紙の端に辺を合わせると平らに直します。'
+    : '丸をドラッグして紙の角と辺に合わせます。端が曲がっているときは「辺を曲げる」。';
 }
 $('#edit-bend').onclick = () => {
   if (edit.curves) edit.curves = null;
@@ -1359,6 +1602,10 @@ async function showViewer(tab = viewer.tab) {
     viewer.url = URL.createObjectURL(tab === 'before' ? (page.original || page.blob) : page.blob);
     $('#view-img').src = viewer.url;
     $('#view-img').alt = tab === 'before' ? '元の写真' : '補正後の画像';
+    $('#view-hint').textContent = page.blurry
+      ? 'この写真はぶれ・ピンぼけで文字がかすれているかもしれません。「撮り直す」で撮り直せます。'
+      : 'ダブルタップで拡大・縮小。補正が気になるときは「範囲・補正」で直せます。';
+    $('#view-hint').classList.toggle('warn', !!page.blurry);
     $('#view-image').classList.remove('zoom');
     return;
   }
@@ -1482,6 +1729,10 @@ $('#retake-input').addEventListener('change', async e => {
   page.original = await limitOriginal(file);
   page.sized = true;
   page.crop = 'auto';
+  delete page.sharp; page.blurry = false;
+  sharpCache.delete(page.capture ?? page.id);
+  delete page.capture; // 撮り直した写真は別の写真なので、見開きの相方とは目安を分ける
+  await checkBlur(page);
   await reprocess(page, {});
   openViewer(page.id, 'after');
 });
@@ -1525,8 +1776,13 @@ async function guessTitle(page, whole = false) {
 let nameEdited = false, titleJob = 0;
 $('#pdf-name').addEventListener('input', () => { nameEdited = true; $('#pdf-name-note').textContent = ''; });
 
-$('#pdf-button').onclick = () => {
-  const usable = pages.filter(ready);
+// pdfList: PDFにするページ（null なら文書の全ページ）
+let pdfList = null;
+$('#sel-pdf').onclick = () => openPdf(selectedPages().filter(ready));
+$('#pdf-button').onclick = () => openPdf(null);
+function openPdf(list) {
+  pdfList = list;
+  const usable = list || pages.filter(ready);
   if (!usable.length) return;
   const doc = currentDoc();
   nameEdited = false;
@@ -1549,13 +1805,17 @@ $('#pdf-button').onclick = () => {
   $('#pdf-make').disabled = false;
   $('#pdf-make').textContent = '作成する';
   showOcrNote();
+  $('#pdf-scope').hidden = !list;
+  $('#pdf-scope').textContent = list ? `選んだ ${list.length} ページだけをPDFにします` : '';
   showSaveTarget();
   $('#pdf-dialog').showModal();
-};
+}
 
 // PDFの画面の「文字で検索できるPDFにする」の下に、文字認識の進み具合を出す
 function showOcrNote() {
-  const usable = pages.filter(ready), left = usable.filter(p => !(p.ocr && p.ocr.width === p.width)).length;
+  // 選んだページだけをPDFにするときは、そのページの最新の状態で数える
+  const usable = pdfList ? pdfList.map(p => pages.find(q => q.id === p.id) || p) : pages.filter(ready);
+  const left = usable.filter(p => !(p.ocr && p.ocr.width === p.width)).length;
   $('#pdf-ocr-note').textContent = !left ? '全ページの文字認識が済んでいます'
     : $('#pdf-ocr').checked && usable.some(p => p.wantOcr) ? `文字を読み取っています… 残り ${left} ページ${ocrLeft(left)}`
     : `未処理の ${left} ページを端末内でOCRします`;
@@ -1571,7 +1831,7 @@ async function readAhead(list) {
   runBackgroundOcr();
 }
 $('#pdf-ocr').addEventListener('change', () => {
-  if ($('#pdf-ocr').checked) readAhead(pages.filter(ready));
+  if ($('#pdf-ocr').checked) readAhead(pdfList || pages.filter(ready));
   showOcrNote();
 });
 
@@ -1584,7 +1844,7 @@ $('#pdf-make').onclick = async () => {
   const t0 = performance.now();
   try {
     titleJob++; // 題名の読み取りが後から名前を書き換えないように
-    const list = pages.filter(ready);
+    const list = pdfList || pages.filter(ready);
     // 1) OCR（済んでいるページは保存済みの結果を使う。残りは並行処理）
     if (searchable) {
       let done = list.filter(p => p.ocr && p.ocr.width === p.width).length;
@@ -1611,7 +1871,7 @@ $('#pdf-make').onclick = async () => {
     const doc = currentDoc();
     const title = cleanName($('#pdf-name').value.replace(/\.pdf$/i, '')) || doc.name;
     // 文書名が自動の名前のままなら、PDFの名前に合わせる
-    if (/^スキャン \d/.test(doc.name) && title !== doc.name) { doc.name = title; await db.putDoc(doc); }
+    if (!pdfList && /^スキャン \d/.test(doc.name) && title !== doc.name) { doc.name = title; await db.putDoc(doc); }
     const blob = await buildPdf(images.map((img, i) => ({ ...img, ocr: searchable ? list[i].ocr : null })), title);
     const name = `${title}.pdf`;
     console.log('pdf ms', Math.round(performance.now() - t0));
@@ -1633,7 +1893,7 @@ async function showPdfResult(blob, name, searchable) {
   const link = $('#pdf-download');
   link.href = pdfUrl;
   link.download = name;
-  $('#pdf-info').textContent = `${name}　${pages.filter(ready).length}ページ・${(blob.size / 1024 / 1024).toFixed(1)}MB` + (searchable ? '・文字検索できます' : '');
+  $('#pdf-info').textContent = `${name}　${(pdfList || pages.filter(ready)).length}ページ・${(blob.size / 1024 / 1024).toFixed(1)}MB` + (searchable ? '・文字検索できます' : '');
   const folder = await save.getFolder();
   $('#pdf-save-folder').hidden = !folder;
   $('#pdf-save-folder').textContent = folder ? `「${folder.name}」に保存` : '';
@@ -1675,12 +1935,18 @@ $('#save-reset').onclick = async () => { await save.clearFolder(); await showSav
 // ---------- 起動 ----------
 async function start() {
   applyMode();
+  // 起動はいつもフォルダ一覧から（再読み込み前の「フォルダを開いた」履歴は使わない）
+  try { if (history.state?.scanliteFolder || history.state?.scanliteSelect) history.replaceState(null, ''); } catch {}
   await loadDocs();
   // 以前のバージョンのページ: 文書に入れ、サイズ情報がなければ補正なしで変換する
   for (const p of await db.allPages()) {
     if (p.docId && p.width) continue;
     try {
-      if (!p.docId) p.docId = docId;
+      if (!p.docId) {
+        // 文書に入っていない古いページは「未分類」の文書に入れる
+        if (!docs.length) { await db.addDoc({ name: defaultDocName(), created: Date.now() }); docs = await db.allDocs(); }
+        p.docId = docs[docs.length - 1].id;
+      }
       if (!p.width) {
         p.original = p.blob;
         Object.assign(p, { rotation: 0, filter: 'none', crop: 'none', deskew: false, fingers: false, denoise: false });
@@ -1689,6 +1955,7 @@ async function start() {
       await db.putPage(p);
     } catch {}
   }
+  await purgeTrash().catch(e => console.error(e));
   await refresh();
   processWaiting(); // 前回の続き（補正待ちのページ）があれば処理する
   runBackgroundOcr();
