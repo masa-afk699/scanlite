@@ -1054,6 +1054,8 @@ async function enqueue(blobs, extra = {}) {
         original: blob, ...defaultsFor(mode), half: halves[i], wantOcr: autoOcr(),
         mode, docId: target, created: created + i / 2000, waiting: true,
         capture: created, autoRotate: mode !== 'screen', tilt: extra.tilt ?? null,
+        // 撮影画面で測ったぼけの目安（測っていれば、あとで測り直さない）
+        ...(extra.sharp != null ? { sharp: extra.sharp, blurry: extra.sharp < BLURRY_BELOW } : {}),
       });
     }
     pending++;

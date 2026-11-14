@@ -6,6 +6,7 @@ const STILL = 3.2;     // これ以下で「止まっている」とみなす
 const HOLD_MS = 900;   // 止まってから撮影するまでの時間
 
 import { detectPage } from './scan.js';
+import { sharpness as photoSharpness, BLURRY_BELOW } from './sharp.js';
 
 export function createCamera({ dialog, video, status, shutter, autoToggle, counter, onCapture, guide, torch, thumb, subject = () => 'paper', split = () => false, order = () => 'rtl', paused = () => false }) {
   let stream = null, timer = null, prev = null, stillSince = 0, needMotion = false, busy = false, shots = 0;
@@ -13,10 +14,19 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
   probe.width = 80; probe.height = 60;
   const pctx = probe.getContext('2d', { willReadFrequently: true });
 
-  const say = t => { status.textContent = t; };
+  // 注意（ぼけて撮り直し）は、すぐ次の案内で消えて見落とさないよう、しばらく残す
+  let warnUntil = 0;
+  const say = (t, warn = false) => {
+    const now = performance.now();
+    if (!warn && now < warnUntil) return;
+    warnUntil = warn ? now + 2500 : 0;
+    status.textContent = t; status.classList.toggle('warn', warn);
+  };
+  // 同じページで続けてぼけたときの撮り直し回数（2回までその場で撮り直し、3回目はそのまま残す）
+  let blurTries = 0;
 
   async function open() {
-    shots = 0; counter.textContent = '0';
+    shots = 0; blurTries = 0; counter.textContent = '0';
     if (thumb) { if (thumb.src) URL.revokeObjectURL(thumb.src); thumb.removeAttribute('src'); thumb.hidden = true; }
     dialog.showModal();
     say('カメラを起動しています…');
@@ -301,9 +311,27 @@ export function createCamera({ dialog, video, status, shutter, autoToggle, count
       dialog.classList.remove('flash'); void dialog.offsetWidth; dialog.classList.add('flash');
       const blob = await capture();
       if (!blob) { shots--; counter.textContent = String(shots); return; }
+      // ぶれ・ピンぼけの写真は、その場で知らせて撮り直す（あとで一覧の「ぼけ」の印で気づいても、
+      // ページをめくった後では撮り直しにくい）。文字の少ない写真（判定できない）と画面の撮影はそのまま
+      let sharp;
+      if (subject() !== 'screen' && blurTries < 2) {
+        sharp = await photoSharpness(blob).catch(() => null);
+        if (sharp != null && sharp < BLURRY_BELOW) {
+          blurTries++;
+          shots--; counter.textContent = String(shots);
+          navigator.vibrate?.(400);
+          dialog.classList.remove('blur-flash'); void dialog.offsetWidth; dialog.classList.add('blur-flash');
+          // 自動撮影は、もう一度手が止まったところで撮り直す（ページはめくらずにそのまま）
+          needMotion = false; stillSince = 0; sharpMax = 0;
+          say(autoToggle.checked ? 'ぼけていたので撮り直します。ページはそのままで、スマホを止めてください'
+            : 'ぼけていました。スマホを止めて、もう一度シャッターを押してください', true);
+          return;
+        }
+      }
+      blurTries = 0; warnUntil = 0;
       // 左下に今撮った写真を小さく出す
       if (thumb) { if (thumb.src) URL.revokeObjectURL(thumb.src); thumb.src = URL.createObjectURL(blob); thumb.hidden = false; }
-      onCapture(blob, { tilt: tiltX });
+      onCapture(blob, { tilt: tiltX, sharp });
       needMotion = true; stillSince = 0;
       say(autoToggle.checked ? '撮影しました。次のページをめくってください' : '撮影しました');
     } finally { busy = false; }
